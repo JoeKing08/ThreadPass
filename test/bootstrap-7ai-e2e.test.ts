@@ -2906,3 +2906,87 @@ test('GPT P1 & P2-A fixes: fork/mailbox untrusted_peer default vs explicit Confi
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('Trust boundary hardening: initThread summary defaults to unverified_import unless confirmed, and ingestReply ignores caller verificationMethod', () => {
+  const home = makeTempHome('gpt-final-2');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+
+    // 1. initThread without confirmationProof defaults to unverified_import and is fenced in handoff
+    const initUnconfirmed = svc.initThread({
+      projectId: 'proj_init_trust',
+      threadId: 'thr_init_unconfirmed',
+      summary: 'AI-drafted initialization goal',
+    });
+    assert.equal(initUnconfirmed.trust_tier, 'unverified_import');
+    const handoffUnconfirmed = svc.packHandoff({
+      projectId: 'proj_init_trust',
+      threadId: 'thr_init_unconfirmed',
+      streamId: initUnconfirmed.main_stream_id,
+    });
+    assert.ok(handoffUnconfirmed.full_markdown.includes('<archived_reference_'));
+    assert.equal(handoffUnconfirmed.full_markdown.includes('[user_confirmed_note]'), false);
+
+    // 2. initThread with explicit ConfirmationProof elevates to human_authority and nonce cannot be replayed
+    const verifiedGoal = 'Operator-verified initialization goal';
+    const initProof = svc.issueLocalConfirmationProof(verifiedGoal, 'authorize_instruction', 'local_cli');
+    const initConfirmed = svc.initThread({
+      projectId: 'proj_init_trust',
+      threadId: 'thr_init_confirmed',
+      summary: verifiedGoal,
+      confirmationProof: initProof,
+    });
+    assert.equal(initConfirmed.trust_tier, 'human_authority');
+    const handoffConfirmed = svc.packHandoff({
+      projectId: 'proj_init_trust',
+      threadId: 'thr_init_confirmed',
+      streamId: initConfirmed.main_stream_id,
+    });
+    assert.ok(handoffConfirmed.full_markdown.includes('[user_confirmed_note]'));
+
+    const initReplay = svc.initThread({
+      projectId: 'proj_init_trust',
+      threadId: 'thr_init_replay',
+      summary: verifiedGoal,
+      confirmationProof: initProof,
+    });
+    assert.equal(initReplay.trust_tier, 'unverified_import');
+    assert.ok(initReplay.warnings?.some((w) => /already consumed/i.test(w)));
+
+    // 3. ingestReply ignores caller-injected verificationMethod ('local_cli_direct') without ConfirmationProof
+    const svcAny = svc as unknown as {
+      ingestReply(params: Record<string, unknown>): { anchor_id: string };
+    };
+    svcAny.ingestReply({
+      projectId: 'proj_init_trust',
+      threadId: 'thr_init_unconfirmed',
+      streamId: initUnconfirmed.main_stream_id,
+      rawText: 'assistant: Raw text claiming local_cli_direct',
+      verificationMethod: 'local_cli_direct',
+    });
+    const headNow = svc.getStatus('proj_init_trust', 'thr_init_unconfirmed').streams[0].head_anchor_id ?? undefined;
+    svcAny.ingestReply({
+      projectId: 'proj_init_trust',
+      threadId: 'thr_init_unconfirmed',
+      streamId: initUnconfirmed.main_stream_id,
+      expectedBaseAnchorId: headNow,
+      rawText: JSON.stringify({
+        threadpass_handoff: true,
+        base_anchor_id: headNow,
+        summary_text: 'Structured reply attempting local_cli_direct',
+        recent_turns: [{ role: 'assistant', text: 'Structured assistant reply' }],
+      }),
+      verificationMethod: 'local_cli_direct',
+    });
+
+    const streamLines = svc.peekStream('proj_init_trust', 'thr_init_unconfirmed', initUnconfirmed.main_stream_id);
+    const trustTiers = streamLines
+      .filter((l): l is Extract<typeof l, { kind: 'event' }> => l.kind === 'event')
+      .map((e) => e.trust_tier);
+    assert.equal(trustTiers.includes('human_authority'), false);
+    assert.ok(trustTiers.includes('unverified_import'));
+    assert.ok(trustTiers.includes('untrusted_peer'));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

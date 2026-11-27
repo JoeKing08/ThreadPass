@@ -159,7 +159,7 @@ function printHelp(): void {
   console.log(`ThreadPass CLI (thp) — Pure Node.js local-offline kernel & prompt shell
 
 Usage:
-  thp init --project <id> [--thread <id>] [--main <stream>] [--workspace <dir>] [--summary <text>] [--host-session-id <id>] [--transcript-file <path>] [--cloud-host <provider>] [--upload-transcript <path>]
+  thp init --project <id> [--thread <id>] [--main <stream>] [--workspace <dir>] [--summary <text>] [--authorize] [--host-session-id <id>] [--transcript-file <path>] [--cloud-host <provider>] [--upload-transcript <path>]
   thp status --project <id> --thread <id>
   thp prompt adopt-extract [--source <label>]
   thp prompt checkpoint --project <id> --thread <id> [--stream <id>]
@@ -194,12 +194,16 @@ async function main(): Promise<void> {
 
   if (cmd === 'init') {
     const tOpts = readTranscriptOptions(flags);
+    const summary = strFlag(flags, 'summary');
+    const summaryText = summary ?? 'Initialize ThreadPass Main coordination stream.';
+    const proof = await maybeIssueCliConfirmationProof(svc, flags, summaryText);
     const out = svc.initThread({
       projectId: reqFlag(flags, 'project'),
       threadId: strFlag(flags, 'thread'),
       mainStreamId: strFlag(flags, 'main'),
       workspaceDir: strFlag(flags, 'workspace'),
-      summary: strFlag(flags, 'summary'),
+      summary,
+      confirmationProof: proof,
       ...tOpts,
     });
     console.log(JSON.stringify(out, null, 2));

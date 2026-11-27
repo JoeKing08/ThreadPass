@@ -209,7 +209,7 @@ export class ThreadPassService {
   }
 
   private evaluateConfirmationProof(
-    store: StateStore,
+    store: StateStore | undefined,
     projectId: string,
     threadId: string,
     proof: ConfirmationProof | undefined,
@@ -220,7 +220,7 @@ export class ThreadPassService {
       return { trustTier: computeTrustTier(provenance, exactSha), proofAccepted: false };
     }
     if (
-      store.hasConsumedConfirmationNonce(proof.nonce) ||
+      (store?.hasConsumedConfirmationNonce(proof.nonce) ?? false) ||
       this.engine.hasGlobalConsumedConfirmationNonce(proof.nonce)
     ) {
       const stripped = { ...provenance, confirmation_proof: undefined };
@@ -442,6 +442,7 @@ export class ThreadPassService {
     mainStreamId?: string;
     workspaceDir?: string;
     summary?: string;
+    confirmationProof?: ConfirmationProof;
     hostSessionId?: string;
   } & TranscriptInputOptions): {
     project_id: string;
@@ -449,6 +450,8 @@ export class ThreadPassService {
     main_stream_id: string;
     anchor_id: string;
     txn_id: string;
+    trust_tier: TrustTier;
+    warnings?: string[];
   } {
     assertSafeIdentifier('project_id', params.projectId);
     const threadId = assertSafeIdentifier('thread_id', params.threadId ?? newId('thr', 8));
@@ -460,6 +463,23 @@ export class ThreadPassService {
     const nowIso = this.engine.clock.wallIso();
     const ws = captureWorkspaceManifest(params.workspaceDir);
     const initEventId = deterministicEventId(mainStreamId, `init|${threadId}|${anchorId}`);
+    const summaryText = params.summary ?? 'Initialize ThreadPass Main coordination stream.';
+    const exactSummarySha = sha256Hex(normalizeConfirmationText(summaryText));
+    const rawInitProvenance: ProvenanceChain = {
+      capture_origin: 'thp_init',
+      verification_method: 'unverified_text_import',
+      source_event_ref: 'init',
+      adapter_version: TRUST_ADAPTER_VERSION,
+      confirmation_proof: params.confirmationProof,
+    };
+    const initProofEval = this.evaluateConfirmationProof(
+      undefined,
+      params.projectId,
+      threadId,
+      params.confirmationProof,
+      rawInitProvenance,
+      exactSummarySha,
+    );
 
     const anchor: LineageAnchor = {
       anchor_id: anchorId,
@@ -479,17 +499,20 @@ export class ThreadPassService {
       stream_id: mainStreamId,
       seq: 1,
       commit_txn_id: 'pending',
-      trust_tier: 'human_authority',
+      trust_tier: initProofEval.trustTier,
       provenance: {
-        capture_origin: 'thp_cli',
-        verification_method: 'local_cli_direct',
+        capture_origin: 'thp_init',
+        verification_method: 'unverified_text_import',
         source_event_ref: 'init',
         adapter_version: TRUST_ADAPTER_VERSION,
+        ...(initProofEval.proofAccepted && params.confirmationProof
+          ? { confirmation_proof: params.confirmationProof }
+          : {}),
       },
       created_at: nowIso,
       payload: {
         type: 'human_message',
-        text: params.summary ?? 'Initialize ThreadPass Main coordination stream.',
+        text: summaryText,
       },
     };
 
@@ -544,6 +567,8 @@ export class ThreadPassService {
       main_stream_id: mainStreamId,
       anchor_id: anchorId,
       txn_id: res.txn_id,
+      trust_tier: initProofEval.trustTier,
+      ...(initProofEval.warning ? { warnings: [initProofEval.warning] } : {}),
     };
   }
 
@@ -1772,7 +1797,6 @@ export class ThreadPassService {
     streamId: string;
     rawText: string;
     expectedBaseAnchorId?: string;
-    verificationMethod?: 'local_cli_direct' | 'unverified_text_import' | 'model_reported';
     confirmationProof?: ConfirmationProof;
     ackBatchId?: string;
     ackMessageIds?: string[];
@@ -1800,9 +1824,11 @@ export class ThreadPassService {
     const effectiveBaseAnchor = paramBase ?? pkg.base_anchor_id;
 
     const exactSha = sha256Hex(normalizeConfirmationText(params.rawText));
+    const verificationMethod =
+      pkg.mode === 'model_authored' ? 'model_reported' : 'unverified_text_import';
     const rawProvenance: ProvenanceChain = {
       capture_origin: 'thp_ingest',
-      verification_method: params.verificationMethod ?? 'model_reported',
+      verification_method: verificationMethod,
       source_event_ref: `ingest:${params.streamId}`,
       adapter_version: TRUST_ADAPTER_VERSION,
       confirmation_proof: params.confirmationProof,

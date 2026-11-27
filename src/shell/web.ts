@@ -800,6 +800,10 @@ export async function startThreadPassWeb(
         const svc = options.service;
 
         if (reqUrl.pathname === '/api/init') {
+          const summary =
+            typeof body.summary === 'string' && body.summary.trim() ? body.summary.trim() : undefined;
+          const summaryText = summary ?? 'Initialize ThreadPass Main coordination stream.';
+          const proof = consumeWebChallengeProof(svc, body, summaryText);
           sendJson(
             res,
             200,
@@ -809,6 +813,8 @@ export async function startThreadPassWeb(
                   ? body.projectId.trim()
                   : 'threadpass-bootstrap',
               threadId: typeof body.threadId === 'string' && body.threadId.trim() ? body.threadId.trim() : undefined,
+              summary,
+              confirmationProof: proof,
               workspaceDir:
                 typeof body.workspaceDir === 'string' && body.workspaceDir.trim()
                   ? body.workspaceDir.trim()
