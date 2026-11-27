@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -594,6 +595,131 @@ test('Full 3-phase user drill via thp web API: 7-AI merge -> Main checkpoint -> 
     assert.equal(finalFsck.stream_health[init.main_stream_id], 'complete');
     assert.equal(finalFsck.stream_health['sub_a'], 'complete');
     assert.equal(finalFsck.stream_health['sub_b'], 'complete');
+  } finally {
+    await web.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Security regressions: unsafe identifiers blocked (XSS/traversal), Web UI avoids innerHTML, CLI reconcile --authorize requires interactive confirmation', async () => {
+  const home = makeTempHome('sec-reg');
+  const svc = new ThreadPassService({ homeDir: home });
+  const web = await startThreadPassWeb({ service: svc, idleTimeoutMs: 60_000 });
+  try {
+    // 1. Safe identifier checks reject XSS payloads & path traversal
+    assert.throws(
+      () => svc.initThread({ projectId: '../escape', threadId: 'thr_1' }),
+      /Invalid project_id/,
+    );
+    assert.throws(
+      () => svc.initThread({ projectId: 'proj_ok', threadId: 'thr/bad' }),
+      /Invalid thread_id/,
+    );
+    svc.initThread({ projectId: 'proj_sec', threadId: 'thr_sec' });
+    assert.throws(
+      () =>
+        svc.adoptExternal({
+          projectId: 'proj_sec',
+          threadId: 'thr_sec',
+          rawText: 'assistant: hi',
+          streamId: 'sub"><img src=x>',
+        }),
+      /Invalid stream_id/,
+    );
+    assert.throws(
+      () =>
+        svc.forkDispatch({
+          projectId: 'proj_sec',
+          threadId: 'thr_sec',
+          workerStreamId: 'bad<script>',
+          taskBrief: 'test',
+        }),
+      /Invalid worker_stream_id/,
+    );
+
+    const forkRes = await fetch(`http://127.0.0.1:${web.port}/api/fork`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-ThreadPass-Token': web.token,
+      },
+      body: JSON.stringify({
+        projectId: 'proj_sec',
+        threadId: 'thr_sec',
+        workerStreamId: 'bad"><svg onload=alert(1)>',
+        taskBrief: 'xss check',
+      }),
+    });
+    assert.equal(forkRes.status, 400);
+
+    // 2. Verify served HTML does not construct stream DOM nodes with innerHTML
+    const htmlRes = await fetch(web.url);
+    assert.equal(htmlRes.status, 200);
+    const htmlText = await htmlRes.text();
+    assert.equal(htmlText.includes('div.innerHTML ='), false);
+
+    // 3. Non-TTY CLI `reconcile commit --authorize` without `--confirm-interactive` MUST exit non-zero
+    const adopted = svc.adoptExternal({
+      projectId: 'proj_sec',
+      threadId: 'thr_sec',
+      streamId: 'strm_ext_1',
+      rawText: 'assistant: opinion 1',
+    });
+    const receiptJson = JSON.stringify({
+      reconciliation_receipt: true,
+      adopted_items: [adopted.stream_id],
+      conflicts: [],
+      synthesis_summary: 'Attempt non-interactive escalation',
+    });
+    const cliPath = path.resolve(process.cwd(), 'dist', 'src', 'shell', 'cli.js');
+    const cliRun = spawnSync(
+      process.execPath,
+      [
+        cliPath,
+        'reconcile',
+        'commit',
+        '--project',
+        'proj_sec',
+        '--thread',
+        'thr_sec',
+        '--sources',
+        adopted.stream_id,
+        '--text',
+        receiptJson,
+        '--authorize',
+      ],
+      {
+        env: { ...process.env, THREADPASS_HOME: home },
+        encoding: 'utf8',
+      },
+    );
+    assert.notEqual(cliRun.status, 0);
+    assert.match(cliRun.stderr, /authorize_instruction requires interactive confirmation/);
+
+    // Passing explicit --confirm-interactive succeeds cleanly
+    const cliAllowed = spawnSync(
+      process.execPath,
+      [
+        cliPath,
+        'reconcile',
+        'commit',
+        '--project',
+        'proj_sec',
+        '--thread',
+        'thr_sec',
+        '--sources',
+        adopted.stream_id,
+        '--text',
+        receiptJson,
+        '--authorize',
+        '--confirm-interactive',
+      ],
+      {
+        env: { ...process.env, THREADPASS_HOME: home },
+        encoding: 'utf8',
+      },
+    );
+    assert.equal(cliAllowed.status, 0);
   } finally {
     await web.close();
     fs.rmSync(home, { recursive: true, force: true });

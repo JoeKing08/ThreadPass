@@ -264,13 +264,26 @@ async function refreshStatus() {
   const st = await api('/api/status', { projectId, threadId });
   latestStreams = st.streams || [];
   const box = document.getElementById('streamsChecklist');
-  box.innerHTML = '';
+  box.textContent = '';
   for (const s of latestStreams) {
     const div = document.createElement('div');
     div.className = 'stream-item';
-    const chk = s.is_main ? '' : 'checked';
-    div.innerHTML = '<label style="color:var(--fg);margin:0;"><input type="checkbox" class="rec-src" value="' + s.stream_id + '" ' + chk + '> <strong>' + s.stream_id + '</strong></label>'
-      + '<div>anchor: ' + (s.head_anchor_id || '-') + ' | health: ' + s.health + (s.is_main ? ' (MAIN)' : '') + '</div>';
+    const label = document.createElement('label');
+    label.style.color = 'var(--fg)';
+    label.style.margin = '0';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'rec-src';
+    cb.value = String(s.stream_id || '');
+    cb.checked = !s.is_main;
+    const strong = document.createElement('strong');
+    strong.textContent = ' ' + String(s.stream_id || '');
+    label.appendChild(cb);
+    label.appendChild(strong);
+    const meta = document.createElement('div');
+    meta.textContent = 'anchor: ' + (s.head_anchor_id || '-') + ' | health: ' + String(s.health || '') + (s.is_main ? ' (MAIN)' : '');
+    div.appendChild(label);
+    div.appendChild(meta);
     box.appendChild(div);
   }
   document.getElementById('fsckOut').textContent = JSON.stringify(st, null, 2);

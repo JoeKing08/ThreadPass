@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
+  assertSafeIdentifier,
   canonicalJson,
   canonicalSha256,
   newId,
@@ -171,6 +172,8 @@ export class ThreadDirLayout {
     public readonly projectId: string,
     public readonly threadId: string,
   ) {
+    assertSafeIdentifier('project_id', projectId);
+    assertSafeIdentifier('thread_id', threadId);
     this.rootDir = path.join(homeDir, 'projects', projectId, 'threads', threadId);
   }
 
@@ -299,7 +302,7 @@ export class LocalOfflineEngine {
     const sortedStreams = [...spec.affected_streams].sort((a, b) =>
       a.stream_id.localeCompare(b.stream_id),
     );
-    const streamIds = sortedStreams.map((s) => s.stream_id);
+    const streamIds = sortedStreams.map((s) => assertSafeIdentifier('stream_id', s.stream_id));
     const expectedHeads: Record<string, string | null> = {};
     for (const s of sortedStreams) {
       expectedHeads[s.stream_id] = s.expected_parent_head;

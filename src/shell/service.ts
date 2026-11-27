@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
+  assertSafeIdentifier,
   canonicalJson,
   canonicalSha256,
   deterministicEventId,
@@ -101,8 +102,12 @@ export class ThreadPassService {
     anchor_id: string;
     txn_id: string;
   } {
-    const threadId = params.threadId ?? newId('thr', 8);
-    const mainStreamId = params.mainStreamId ?? newId('main', 6);
+    assertSafeIdentifier('project_id', params.projectId);
+    const threadId = assertSafeIdentifier('thread_id', params.threadId ?? newId('thr', 8));
+    const mainStreamId = assertSafeIdentifier(
+      'main_stream_id',
+      params.mainStreamId ?? newId('main', 6),
+    );
     const anchorId = newId('anc', 8);
     const nowIso = this.engine.clock.wallIso();
     const ws = captureWorkspaceManifest(params.workspaceDir);
@@ -307,12 +312,16 @@ export class ThreadPassService {
     warnings: string[];
     redacted_count: number;
   } {
+    assertSafeIdentifier('project_id', params.projectId);
+    assertSafeIdentifier('thread_id', params.threadId);
     const warnings: string[] = [];
     const label = params.sourceLabel ?? 'external_ai';
     const pkg = parseExternalConversationInput(params.rawText, label);
-    const streamId =
+    const streamId = assertSafeIdentifier(
+      'stream_id',
       params.streamId ??
-      `adopt_${label.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 20)}_${sha256Hex(params.rawText).slice(0, 8)}`;
+        `adopt_${label.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 20)}_${sha256Hex(params.rawText).slice(0, 8)}`,
+    );
 
     const sanitizedRawRes = this.engine.redactor.sanitizeText(pkg.raw_text);
     const sanitizedPkgText = sanitizedRawRes.sanitized;
@@ -1205,12 +1214,17 @@ export class ThreadPassService {
     release_gated: boolean;
     worker_prompt?: string;
   } {
+    assertSafeIdentifier('project_id', params.projectId);
+    assertSafeIdentifier('thread_id', params.threadId);
+    const workerStreamId = assertSafeIdentifier(
+      'worker_stream_id',
+      params.workerStreamId ?? newId('wrk', 6),
+    );
     const store = this.engine.openStore(params.projectId, params.threadId);
     let threadRow: ReturnType<typeof store.getThread>;
     let sourceAnchor: LineageAnchor;
     let coordSnapshotText: string;
 
-    const workerStreamId = params.workerStreamId ?? newId('wrk', 6);
     try {
       threadRow = store.getThread(params.threadId);
       if (!threadRow) throw new Error(`Thread ${params.threadId} not found`);
@@ -1439,6 +1453,10 @@ export class ThreadPassService {
     targetStreamId: string;
     text: string;
   }): { message_id: string; txn_id: string } {
+    assertSafeIdentifier('project_id', params.projectId);
+    assertSafeIdentifier('thread_id', params.threadId);
+    assertSafeIdentifier('from_stream_id', params.fromStreamId);
+    assertSafeIdentifier('target_stream_id', params.targetStreamId);
     const store = this.engine.openStore(params.projectId, params.threadId);
     let headAnchor: LineageAnchor;
     let lastSeq: number;

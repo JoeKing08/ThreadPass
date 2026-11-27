@@ -58,6 +58,25 @@ function readInputText(flags: Record<string, string | boolean>): string {
   throw new Error('Provide input via --file <path>, --text <string>, or stdin');
 }
 
+function maybeIssueCliConfirmationProof(
+  flags: Record<string, string | boolean>,
+  rawText: string,
+) {
+  if (flags.authorize !== true) {
+    return undefined;
+  }
+  if (!process.stdin.isTTY && flags['confirm-interactive'] !== true) {
+    throw new Error(
+      'authorize_instruction requires interactive confirmation or explicit --confirm-interactive review of exact content',
+    );
+  }
+  return issueConfirmationProof(
+    normalizeConfirmationText(rawText),
+    'authorize_instruction',
+    'local_cli',
+  );
+}
+
 function printHelp(): void {
   console.log(`ThreadPass CLI (thp) — Pure Node.js local-offline kernel & prompt shell
 
@@ -126,19 +145,7 @@ async function main(): Promise<void> {
 
   if (cmd === 'adopt') {
     const rawText = readInputText(flags);
-    const authorize = flags.authorize === true;
-    if (authorize && !process.stdin.isTTY && flags['confirm-interactive'] !== true) {
-      throw new Error(
-        'local_cli_direct / authorize_instruction requires interactive confirmation or explicit --confirm-interactive review of exact content',
-      );
-    }
-    const proof = authorize
-      ? issueConfirmationProof(
-          normalizeConfirmationText(rawText),
-          'authorize_instruction',
-          'local_cli',
-        )
-      : undefined;
+    const proof = maybeIssueCliConfirmationProof(flags, rawText);
     const out = svc.adoptExternal({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
@@ -168,14 +175,7 @@ async function main(): Promise<void> {
 
   if (cmd === 'reconcile' && sub === 'commit') {
     const rawText = readInputText(flags);
-    const proof =
-      flags.authorize === true
-        ? issueConfirmationProof(
-            normalizeConfirmationText(rawText),
-            'authorize_instruction',
-            'local_cli',
-          )
-        : undefined;
+    const proof = maybeIssueCliConfirmationProof(flags, rawText);
     const out = svc.commitReconcile({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
@@ -203,19 +203,7 @@ async function main(): Promise<void> {
 
   if (cmd === 'ingest') {
     const rawText = readInputText(flags);
-    const authorize = flags.authorize === true;
-    if (authorize && !process.stdin.isTTY && flags['confirm-interactive'] !== true) {
-      throw new Error(
-        'authorize_instruction requires interactive confirmation or explicit --confirm-interactive review of exact content',
-      );
-    }
-    const proof = authorize
-      ? issueConfirmationProof(
-          normalizeConfirmationText(rawText),
-          'authorize_instruction',
-          'local_cli',
-        )
-      : undefined;
+    const proof = maybeIssueCliConfirmationProof(flags, rawText);
     const ackBatch = strFlag(flags, 'ack-batch');
     const ackMsgs = strFlag(flags, 'ack-msgs');
     const out = svc.ingestReply({

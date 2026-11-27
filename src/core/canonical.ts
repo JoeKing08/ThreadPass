@@ -50,3 +50,25 @@ export function deterministicEventId(
 ): string {
   return `evt_${sha256Hex(`${streamId}\n${sourceFingerprint}`).slice(0, 24)}`;
 }
+
+export class InvalidIdentifierError extends Error {
+  constructor(fieldName: string, value: string) {
+    super(
+      `Invalid ${fieldName} (${JSON.stringify(value)}): must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ and must not contain '..'`,
+    );
+    this.name = 'InvalidIdentifierError';
+  }
+}
+
+const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * Enforces strict safe identifier syntax across filesystem-mapped and UI-rendered IDs
+ * (`project_id`, `thread_id`, `stream_id`), preventing path traversal and DOM injection.
+ */
+export function assertSafeIdentifier(fieldName: string, value: string): string {
+  if (typeof value !== 'string' || !SAFE_ID_RE.test(value) || value.includes('..')) {
+    throw new InvalidIdentifierError(fieldName, String(value));
+  }
+  return value;
+}
