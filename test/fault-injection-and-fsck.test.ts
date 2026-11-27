@@ -1113,11 +1113,12 @@ test('upsertTranscriptLocator preserves optional locator_json metadata on partia
         cloud_provider: 'claude_web',
         host_session_id: 'sess_preserve_123',
         remote_uri: 'https://claude.ai/chat/preserve-123',
+        note: 'Initial verified note',
         recorded_at: '2026-01-01T00:00:00.000Z',
         locator_origin: 'operator_verified',
       });
 
-      // Partial re-upsert omitting optional metadata (same cloud_provider + host_session_id so locator_key matches, remote_uri omitted)
+      // Partial re-upsert omitting optional metadata (same cloud_provider + host_session_id so locator_key matches, remote_uri & note omitted)
       store.upsertTranscriptLocator('thr_loc', {
         locator_id: 'loc_2',
         stream_id: 'strm_cloud_1',
@@ -1129,14 +1130,64 @@ test('upsertTranscriptLocator preserves optional locator_json metadata on partia
         locator_origin: 'operator_verified',
       });
 
+      // Out-of-order older record replay MUST NOT overwrite newer locator_id / source_label
+      store.upsertTranscriptLocator('thr_loc', {
+        locator_id: 'loc_stale_0',
+        stream_id: 'strm_cloud_1',
+        source_label: 'claude_stale',
+        host_kind: 'cloud_remote',
+        cloud_provider: 'claude_web',
+        host_session_id: 'sess_preserve_123',
+        recorded_at: '2025-12-31T00:00:00.000Z',
+        locator_origin: 'operator_verified',
+      });
+
+      // Out-of-order older record with non-UTC offset (2026-01-02T01:00:00+08:00 == 2026-01-01T17:00:00Z < 2026-01-02T00:00:00.000Z)
+      // must NOT win chronologically over the UTC midnight record
+      store.upsertTranscriptLocator('thr_loc', {
+        locator_id: 'loc_tz_older',
+        stream_id: 'strm_cloud_1',
+        source_label: 'claude_tz_older',
+        host_kind: 'cloud_remote',
+        cloud_provider: 'claude_web',
+        host_session_id: 'sess_preserve_123',
+        recorded_at: '2026-01-02T01:00:00+08:00',
+        locator_origin: 'operator_verified',
+      });
+
       const locators = store.listTranscriptLocators('thr_loc');
       assert.equal(locators.length, 1);
       assert.equal(locators[0].locator_id, 'loc_2');
+      assert.equal(locators[0].source_label, 'claude_cloud');
       assert.equal(locators[0].anchor_id, 'anc_1');
       assert.equal(locators[0].cloud_provider, 'claude_web');
       assert.equal(locators[0].host_session_id, 'sess_preserve_123');
       assert.equal(locators[0].remote_uri, 'https://claude.ai/chat/preserve-123');
+      assert.equal(locators[0].note, 'Initial verified note');
       assert.equal(locators[0].recorded_at, '2026-01-02T00:00:00.000Z');
+
+      // Newer model_reported placeholder must not downgrade operator_verified origin
+      store.upsertTranscriptLocator('thr_loc', {
+        locator_id: 'loc_ph_verified',
+        stream_id: 'strm_ph_1',
+        source_label: 'ph_source',
+        host_kind: 'placeholder_unavailable',
+        note: 'Verified placeholder',
+        recorded_at: '2026-01-01T00:00:00.000Z',
+        locator_origin: 'operator_verified',
+      });
+      store.upsertTranscriptLocator('thr_loc', {
+        locator_id: 'loc_ph_model',
+        stream_id: 'strm_ph_1',
+        source_label: 'ph_source',
+        host_kind: 'placeholder_unavailable',
+        recorded_at: '2026-01-03T00:00:00.000Z',
+        locator_origin: 'model_reported',
+      });
+      const phLocs = store.listTranscriptLocators('thr_loc').filter((l) => l.stream_id === 'strm_ph_1');
+      assert.equal(phLocs.length, 1);
+      assert.equal(phLocs[0].locator_origin, 'operator_verified');
+      assert.equal(phLocs[0].note, 'Verified placeholder');
     } finally {
       store.close();
     }

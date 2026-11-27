@@ -2543,6 +2543,195 @@ test('Regression checks for continuation filter, adversarial XML attr escaping, 
 
     const uiHtml = await (await fetch(`http://127.0.0.1:${web.port}/?token=${web.token}`)).text();
     assert.ok(uiHtml.includes('id="recConfirmTopics"'));
+
+    // 5. Full ASCII 50/60-char sourceLabel + anchorOrRef at floor per_turn_input_limit=676 preserves balanced XML tags
+    const asciiMaxFenced = renderNonInstructionFence({
+      sourceLabel: 'S'.repeat(60),
+      trustTier: 'untrusted_unknown',
+      anchorOrRef: 'R'.repeat(70),
+      bodyText: Array.from({ length: 16 }, (_, idx) => `ASCII floor line ${idx + 1}: keep balanced`).join('\n'),
+    });
+    const packedAsciiFloor = packBudgetedEnvelope(
+      'env_ascii_floor',
+      [
+        {
+          key: 'ascii_floor',
+          priority: 2,
+          title: 'ASCII Floor Fence',
+          body: asciiMaxFenced,
+          content_hash: sha256Hex(asciiMaxFenced),
+        },
+      ],
+      {
+        effective_context_budget: 24_000,
+        per_turn_input_limit: 676,
+        budget_confidence: 'exact',
+        supports_attachments: false,
+      },
+    );
+    assert.ok(packedAsciiFloor.parts.length >= 2);
+    for (const part of packedAsciiFloor.parts) {
+      assert.ok(part.text.length <= 676);
+      const opens = [...part.text.matchAll(/<(archived_reference_[a-f0-9]+)\b/g)].map((m) => m[1]);
+      const closes = [...part.text.matchAll(/<\/(archived_reference_[a-f0-9]+)>/g)].map((m) => m[1]);
+      assert.deepEqual(opens, closes, `Unbalanced XML reference tags on 50/60 ASCII floor part ${part.part_index}`);
+    }
+
+    // 6. Mixed fenced ```json (with leading label) + bare top-level JSON multipart parts assemble together
+    const mixedMultipart = [
+      '```json\nPart 1:\n' +
+        JSON.stringify({
+          threadpass_handoff: true,
+          part_group_id: 'grp_mixed_fmt',
+          part_index: 1,
+          total_parts: 2,
+          is_final: false,
+          summary_text: 'Fenced part 1 with label prefix',
+        }) +
+        '\n```',
+      JSON.stringify({
+        part_group_id: 'grp_mixed_fmt',
+        part_index: 2,
+        total_parts: 2,
+        is_final: true,
+        pending_tasks: ['Bare part 2 combined seamlessly'],
+      }),
+    ].join('\n\n');
+    const parsedMixed = parseExternalConversationInput(mixedMultipart, 'mixed_fmt');
+    assert.deepEqual(parsedMixed.assembled_parts, { group_id: 'grp_mixed_fmt', total_parts: 2 });
+    assert.deepEqual(parsedMixed.pending_tasks, ['Bare part 2 combined seamlessly']);
+
+    // 7. forkDispatch rejects nonexistent originStreamId and rejects cross-stream sourceAnchorId spoofing
+    const stAfter = svc.getStatus('proj_topics_guard', 'thr_topics_guard');
+    assert.ok(stAfter.thread);
+    const mainStreamId = stAfter.thread.main_stream_id;
+    const branchHead = stAfter.streams.find((s) => s.stream_id === strm.stream_id)?.head_anchor_id;
+    assert.ok(branchHead);
+    assert.throws(
+      () =>
+        svc.forkDispatch({
+          projectId: 'proj_topics_guard',
+          threadId: 'thr_topics_guard',
+          originStreamId: 'strm_does_not_exist',
+          sourceAnchorId: branchHead,
+          taskBrief: 'Should reject missing origin stream',
+        }),
+      /Origin stream strm_does_not_exist not found/,
+    );
+    assert.throws(
+      () =>
+        svc.forkDispatch({
+          projectId: 'proj_topics_guard',
+          threadId: 'thr_topics_guard',
+          originStreamId: mainStreamId,
+          sourceAnchorId: branchHead,
+          taskBrief: 'Should reject cross-stream anchor',
+        }),
+      /belongs to stream/,
+    );
+
+    // 8. Unrelated {summary, is_final} JSON beside single-part adopt payload does not trigger mixed multipart error
+    const withUnrelatedSummary = [
+      'Unrelated API example:\n```json\n{"summary": "API response", "is_final": true}\n```',
+      'Actual handoff:\n```json\n' +
+        JSON.stringify({
+          threadpass_handoff: true,
+          summary_text: 'Clean adopt beside unrelated summary+is_final JSON',
+        }) +
+        '\n```',
+    ].join('\n\n');
+    const parsedWithSummary = parseExternalConversationInput(withUnrelatedSummary, 'unrelated_summary');
+    assert.equal(parsedWithSummary.mode, 'model_authored');
+    assert.equal(parsedWithSummary.summary_text, 'Clean adopt beside unrelated summary+is_final JSON');
+
+    // 9. Empty closing multipart final part with explicit part_group_id assembles cleanly
+    const withEmptyFinalPart = [
+      JSON.stringify({
+        threadpass_handoff: true,
+        part_group_id: 'grp_empty_fin',
+        part_index: 1,
+        total_parts: 2,
+        is_final: false,
+        summary_text: 'Main chunk before empty closing marker',
+      }),
+      JSON.stringify({
+        part_group_id: 'grp_empty_fin',
+        part_index: 2,
+        total_parts: 2,
+        is_final: true,
+      }),
+    ].join('\n\n');
+    const parsedEmptyFinal = parseExternalConversationInput(withEmptyFinalPart, 'empty_final');
+    assert.deepEqual(parsedEmptyFinal.assembled_parts, { group_id: 'grp_empty_fin', total_parts: 2 });
+    assert.equal(parsedEmptyFinal.summary_text, 'Main chunk before empty closing marker');
+
+    // 10. Mixed fenced + bare outside continuation with conflicting part_group_id fails closed
+    const conflictingMixedGroups = [
+      '```json\n' +
+        JSON.stringify({
+          threadpass_handoff: true,
+          part_group_id: 'grp_a',
+          part_index: 1,
+          total_parts: 2,
+          is_final: false,
+          summary_text: 'Part 1 in grp_a',
+        }) +
+        '\n```',
+      JSON.stringify({
+        part_group_id: 'grp_b',
+        part_index: 2,
+        total_parts: 2,
+        is_final: true,
+        pending_tasks: ['Mismatched group bare part'],
+      }),
+    ].join('\n\n');
+    assert.throws(
+      () => parseExternalConversationInput(conflictingMixedGroups, 'conflicting_groups'),
+      (err: unknown) => err instanceof IncompleteMultipartOutputError && /Conflicting part_group_id/.test(String(err)),
+    );
+
+    // 11. confirmAllConflicts=true without ConfirmationProof fails, whitespace confirmedConflictTopics fails, padded topic matches with proof
+    assert.throws(
+      () =>
+        svc.commitReconcile({
+          projectId: 'proj_topics_guard',
+          threadId: 'thr_topics_guard',
+          sourceStreamIds: [strm.stream_id],
+          packEnvelopeId: pack.envelope_id,
+          receiptRawText: recText,
+          confirmAllConflicts: true,
+        }),
+      /without a valid human_authority ConfirmationProof/,
+    );
+    const recProof = svc.issueLocalConfirmationProof(recText, 'authorize_instruction', 'local_cli');
+    assert.throws(
+      () =>
+        svc.commitReconcile({
+          projectId: 'proj_topics_guard',
+          threadId: 'thr_topics_guard',
+          sourceStreamIds: [strm.stream_id],
+          packEnvelopeId: pack.envelope_id,
+          receiptRawText: recText,
+          confirmedConflictTopics: ['   '],
+          confirmationProof: recProof,
+        }),
+      /confirmedConflictTopics must contain at least one non-empty topic name/,
+    );
+    svc.commitReconcile({
+      projectId: 'proj_topics_guard',
+      threadId: 'thr_topics_guard',
+      sourceStreamIds: [strm.stream_id],
+      packEnvelopeId: pack.envelope_id,
+      receiptRawText: recText,
+      confirmedConflictTopics: [' Topic A '],
+      confirmationProof: recProof,
+    });
+    const guardMainLines = svc.peekStream('proj_topics_guard', 'thr_topics_guard', mainStreamId);
+    const guardRec = guardMainLines
+      .filter((l) => l.kind === 'control' && l.payload.type === 'reconciliation_record')
+      .pop();
+    assert.ok(guardRec && guardRec.kind === 'control' && guardRec.payload.type === 'reconciliation_record');
+    assert.equal(guardRec.payload.record.conflicts[0].human_confirmed, true);
   } finally {
     await web.close();
     fs.rmSync(home, { recursive: true, force: true });

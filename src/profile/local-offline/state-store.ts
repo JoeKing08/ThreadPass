@@ -507,21 +507,35 @@ export class StateStore {
     if (existingRow) {
       try {
         const existing = JSON.parse(existingRow.locator_json) as HostTranscriptLocator;
+        const locMs = Date.parse(loc.recorded_at);
+        const exMs = Date.parse(existing.recorded_at);
+        const isLocNewerOrEqual =
+          Number.isFinite(locMs) && Number.isFinite(exMs)
+            ? locMs >= exMs
+            : loc.recorded_at >= existing.recorded_at;
+        const newer = isLocNewerOrEqual ? loc : existing;
+        const older = newer === loc ? existing : loc;
+        const resolvedOrigin =
+          newer.locator_origin === 'operator_verified' ||
+          older.locator_origin === 'operator_verified'
+            ? ('operator_verified' as const)
+            : (newer.locator_origin ?? older.locator_origin);
         merged = {
-          ...existing,
-          ...loc,
-          anchor_id: loc.anchor_id ?? existing.anchor_id,
-          machine_hostname: loc.machine_hostname ?? existing.machine_hostname,
-          machine_device_id: loc.machine_device_id ?? existing.machine_device_id,
-          file_path: loc.file_path ?? existing.file_path,
-          cloud_provider: loc.cloud_provider ?? existing.cloud_provider,
-          host_session_id: loc.host_session_id ?? existing.host_session_id,
-          remote_uri: loc.remote_uri ?? existing.remote_uri,
-          uploaded_blob_sha256: loc.uploaded_blob_sha256 ?? existing.uploaded_blob_sha256,
-          uploaded_blob_rel: loc.uploaded_blob_rel ?? existing.uploaded_blob_rel,
-          uploaded_filename: loc.uploaded_filename ?? existing.uploaded_filename,
-          recorded_at:
-            loc.recorded_at >= existing.recorded_at ? loc.recorded_at : existing.recorded_at,
+          ...older,
+          ...newer,
+          locator_origin: resolvedOrigin,
+          anchor_id: newer.anchor_id ?? older.anchor_id,
+          machine_hostname: newer.machine_hostname ?? older.machine_hostname,
+          machine_device_id: newer.machine_device_id ?? older.machine_device_id,
+          file_path: newer.file_path ?? older.file_path,
+          cloud_provider: newer.cloud_provider ?? older.cloud_provider,
+          host_session_id: newer.host_session_id ?? older.host_session_id,
+          remote_uri: newer.remote_uri ?? older.remote_uri,
+          uploaded_blob_sha256: newer.uploaded_blob_sha256 ?? older.uploaded_blob_sha256,
+          uploaded_blob_rel: newer.uploaded_blob_rel ?? older.uploaded_blob_rel,
+          uploaded_filename: newer.uploaded_filename ?? older.uploaded_filename,
+          note: newer.note ?? older.note,
+          recorded_at: newer.recorded_at,
         };
       } catch {
         merged = loc;
@@ -550,7 +564,7 @@ export class StateStore {
           uploaded_blob_rel = COALESCE(excluded.uploaded_blob_rel, transcript_locators.uploaded_blob_rel),
           uploaded_filename = COALESCE(excluded.uploaded_filename, transcript_locators.uploaded_filename),
           locator_json = excluded.locator_json,
-          recorded_at = MAX(transcript_locators.recorded_at, excluded.recorded_at)`,
+          recorded_at = excluded.recorded_at`,
       )
       .run(
         key,

@@ -124,7 +124,7 @@ function scanBalancedJsonObjects(text: string): Record<string, unknown>[] {
   return results;
 }
 
-const CONTINUATION_PAYLOAD_KEYS = new Set<string>([
+export const ADOPT_CONTINUATION_KEYS: readonly string[] = [
   'summary_text',
   'summary',
   'recent_turns',
@@ -144,6 +144,9 @@ const CONTINUATION_PAYLOAD_KEYS = new Set<string>([
   'cloud_provider',
   'remote_uri',
   'source_label',
+];
+
+export const RECONCILE_CONTINUATION_KEYS: readonly string[] = [
   'pack_envelope_id',
   'adopted_items',
   'partial_items',
@@ -152,6 +155,11 @@ const CONTINUATION_PAYLOAD_KEYS = new Set<string>([
   'next_actions',
   'conflicts',
   'synthesis_summary',
+];
+
+const CONTINUATION_PAYLOAD_KEYS = new Set<string>([
+  ...ADOPT_CONTINUATION_KEYS,
+  ...RECONCILE_CONTINUATION_KEYS,
 ]);
 
 /**
@@ -162,6 +170,7 @@ const CONTINUATION_PAYLOAD_KEYS = new Set<string>([
 export function extractStructuredJsonObjects(
   rawText: string,
   expectedKeys: readonly string[],
+  continuationKeys: readonly string[] = [...CONTINUATION_PAYLOAD_KEYS],
 ): ExtractedJsonObjectsResult {
   if (Buffer.byteLength(rawText, 'utf8') > MAX_MULTIPART_INPUT_BYTES) {
     throw new IncompleteMultipartOutputError(
@@ -173,21 +182,32 @@ export function extractStructuredJsonObjects(
     return { objects: [], looksLikeJson: false };
   }
 
+  const continuationKeySet = new Set<string>(continuationKeys);
+
   const hasExpectedKey = (obj: Record<string, unknown>): boolean =>
     expectedKeys.length === 0 ||
     expectedKeys.some((k) => Object.prototype.hasOwnProperty.call(obj, k));
 
+  const hasExplicitPartGroupId = (obj: Record<string, unknown>): boolean =>
+    typeof obj.part_group_id === 'string' && obj.part_group_id.trim().length > 0;
+
+  const hasExplicitPartIndexOrTotal = (obj: Record<string, unknown>): boolean =>
+    (obj.part_index !== undefined && obj.part_index !== null) ||
+    (obj.total_parts !== undefined && obj.total_parts !== null);
+
   const hasContinuationPayloadKey = (obj: Record<string, unknown>): boolean =>
-    Object.keys(obj).some((k) => CONTINUATION_PAYLOAD_KEYS.has(k));
+    Object.keys(obj).some((k) => continuationKeySet.has(k));
 
   const isThreadPassDomainOrContinuation = (obj: Record<string, unknown>): boolean =>
-    hasExpectedKey(obj) || (hasMultipartFields(obj) && hasContinuationPayloadKey(obj));
+    hasExpectedKey(obj) ||
+    hasExplicitPartGroupId(obj) ||
+    (hasExplicitPartIndexOrTotal(obj) && hasContinuationPayloadKey(obj));
 
   const filterDomainOrContinuation = (
     candidates: readonly Record<string, unknown>[],
   ): Record<string, unknown>[] => candidates.filter(isThreadPassDomainOrContinuation);
 
-  const looksLikeJson = expectedKeys.some((k) =>
+  const looksLikeJson = [...expectedKeys, 'part_group_id'].some((k) =>
     new RegExp(`"${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s*:`).test(trimmed),
   );
 
@@ -212,19 +232,34 @@ export function extractStructuredJsonObjects(
     }
   }
 
-  // 2. Scan inside tagged ```json or bare ``` code fence blocks using a line state machine
-  // so closing ``` fences of ```ts blocks are never mistaken for opening JSON fences.
+  // 2. Scan inside tagged ```json / bare ``` code fences AND outside-fence text
+  // (excluding non-JSON fences such as ```ts) in source order:
+  // - Prefer fenced ```json/``` blocks over bare prose JSON.
+  // - When a fenced block contains multipart chunks with `part_group_id`, also include
+  //   bare outside-fence continuation chunks sharing the same `part_group_id` in order.
   const lines = trimmed.split(/\r?\n/);
-  const fencedCandidates: Record<string, unknown>[] = [];
+  const taggedCandidates: Array<{ source: 'fenced' | 'outside'; obj: Record<string, unknown> }> = [];
   let inFence = false;
   let fenceLang = '';
   let fenceBuf: string[] = [];
+  let outsideBuf: string[] = [];
+
+  const flushOutside = () => {
+    if (outsideBuf.length > 0) {
+      for (const obj of scanBalancedJsonObjects(outsideBuf.join('\n'))) {
+        taggedCandidates.push({ source: 'outside', obj });
+      }
+      outsideBuf = [];
+    }
+  };
 
   const collectFromFence = () => {
     if (fenceLang === '' || fenceLang === 'json') {
-      const inner = fenceBuf.join('\n').trimStart();
-      if (inner.startsWith('{') || inner.startsWith('[')) {
-        fencedCandidates.push(...scanBalancedJsonObjects(inner));
+      const inner = fenceBuf.join('\n').trim();
+      if (inner.length > 0) {
+        for (const obj of scanBalancedJsonObjects(inner)) {
+          taggedCandidates.push({ source: 'fenced', obj });
+        }
       }
     }
     fenceLang = '';
@@ -235,9 +270,12 @@ export function extractStructuredJsonObjects(
     if (!inFence) {
       const openMatch = line.match(/^[ \t]*```([a-zA-Z0-9_-]*)[ \t]*$/);
       if (openMatch) {
+        flushOutside();
         inFence = true;
         fenceLang = openMatch[1].toLowerCase();
         fenceBuf = [];
+      } else {
+        outsideBuf.push(line);
       }
     } else if (/^[ \t]*```[ \t]*$/.test(line)) {
       inFence = false;
@@ -248,16 +286,41 @@ export function extractStructuredJsonObjects(
   }
   if (inFence) {
     collectFromFence();
-  }
-  const fencedMatches = filterDomainOrContinuation(fencedCandidates);
-  if (fencedMatches.length > 0) {
-    return { objects: fencedMatches, looksLikeJson: true };
+  } else {
+    flushOutside();
   }
 
-  // 3. Scan top-level balanced JSON objects anywhere in rawText
-  const topLevel = filterDomainOrContinuation(scanBalancedJsonObjects(trimmed));
-  if (topLevel.length > 0) {
-    return { objects: topLevel, looksLikeJson: true };
+  const fencedMatched = taggedCandidates.filter(
+    (c) => c.source === 'fenced' && isThreadPassDomainOrContinuation(c.obj),
+  );
+  if (fencedMatched.length > 0) {
+    const fencedGroupIds = new Set(
+      fencedMatched
+        .filter((c) => hasMultipartFields(c.obj) && typeof c.obj.part_group_id === 'string')
+        .map((c) => String(c.obj.part_group_id).trim())
+        .filter(Boolean),
+    );
+    if (fencedGroupIds.size > 0) {
+      const combined = taggedCandidates
+        .filter(
+          (c) =>
+            (c.source === 'fenced' && isThreadPassDomainOrContinuation(c.obj)) ||
+            (c.source === 'outside' &&
+              isThreadPassDomainOrContinuation(c.obj) &&
+              (hasExplicitPartGroupId(c.obj) || hasExplicitPartIndexOrTotal(c.obj))),
+        )
+        .map((c) => c.obj);
+      return { objects: combined, looksLikeJson: true };
+    }
+    return { objects: fencedMatched.map((c) => c.obj), looksLikeJson: true };
+  }
+
+  // 3. Fall back to outside-fence balanced JSON objects (non-JSON fences like ```ts stay excluded)
+  const outsideMatched = filterDomainOrContinuation(
+    taggedCandidates.filter((c) => c.source === 'outside').map((c) => c.obj),
+  );
+  if (outsideMatched.length > 0) {
+    return { objects: outsideMatched, looksLikeJson: true };
   }
 
   if (looksLikeJson) {
@@ -544,12 +607,11 @@ export function parseExternalConversationInput(
   sourceLabel = 'external_ai',
 ): ParsedAdoptPackage {
   const trimmed = rawText.trim();
-  const extracted = extractStructuredJsonObjects(trimmed, [
-    'threadpass_handoff',
-    'handoff_mode',
-    'summary_text',
-    'recent_turns',
-  ]);
+  const extracted = extractStructuredJsonObjects(
+    trimmed,
+    ['threadpass_handoff', 'handoff_mode', 'summary_text', 'recent_turns'],
+    ADOPT_CONTINUATION_KEYS,
+  );
   const parseWarnings: string[] = [];
   if (extracted.parseWarning) {
     parseWarnings.push(extracted.parseWarning);

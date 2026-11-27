@@ -1378,13 +1378,23 @@ export class ThreadPassService {
       items: depItems,
     };
 
+    const normalizedConfirmTopics = params.confirmedConflictTopics
+      ?.map((s) => s.trim())
+      .filter(Boolean);
     if (
       params.confirmedConflictTopics &&
       params.confirmedConflictTopics.length > 0 &&
+      (!normalizedConfirmTopics || normalizedConfirmTopics.length === 0)
+    ) {
+      throw new Error('confirmedConflictTopics must contain at least one non-empty topic name');
+    }
+    if (
+      ((normalizedConfirmTopics && normalizedConfirmTopics.length > 0) ||
+        params.confirmAllConflicts === true) &&
       (!proofAccepted || reconcileTrustTier !== 'human_authority')
     ) {
       throw new Error(
-        'Cannot confirm specific conflict topics (confirmedConflictTopics) without a valid human_authority ConfirmationProof',
+        'Cannot confirm conflicts (confirmedConflictTopics / confirmAllConflicts) without a valid human_authority ConfirmationProof',
       );
     }
 
@@ -1393,9 +1403,9 @@ export class ThreadPassService {
       const confirmedByHuman =
         proofAccepted &&
         reconcileTrustTier === 'human_authority' &&
-        (params.confirmedConflictTopics
-          ? params.confirmedConflictTopics.includes(c.topic) ||
-            params.confirmedConflictTopics.includes(topic)
+        (normalizedConfirmTopics
+          ? normalizedConfirmTopics.includes(c.topic) ||
+            normalizedConfirmTopics.includes(topic)
           : params.confirmAllConflicts !== false);
       return {
         ...c,
@@ -2024,10 +2034,10 @@ export class ThreadPassService {
       if (!threadRow) throw new Error(`Thread ${params.threadId} not found`);
       originSid = params.originStreamId ?? threadRow.main_stream_id;
       const originStream = store.getStream(originSid);
-      if (
-        originStream &&
-        (originStream.health === 'quarantined' || originStream.health === 'divergent_heads')
-      ) {
+      if (!originStream) {
+        throw new Error(`Origin stream ${originSid} not found in thread ${params.threadId}`);
+      }
+      if (originStream.health === 'quarantined' || originStream.health === 'divergent_heads') {
         throw new Error(
           `Origin stream ${originSid} has health=${originStream.health}; resolve before dispatching`,
         );
@@ -2035,10 +2045,15 @@ export class ThreadPassService {
       if (store.getStream(workerStreamId)) {
         throw new Error(`Target worker stream ${workerStreamId} already exists in thread ${params.threadId}`);
       }
-      const resolvedAnchorId = params.sourceAnchorId ?? originStream?.head_anchor_id;
+      const resolvedAnchorId = params.sourceAnchorId ?? originStream.head_anchor_id;
       if (!resolvedAnchorId) throw new Error(`Origin stream ${originSid} has no published anchor`);
       const anc = store.getAnchor(resolvedAnchorId);
       if (!anc) throw new Error(`Source anchor ${resolvedAnchorId} not found`);
+      if (anc.stream_id !== originSid) {
+        throw new Error(
+          `Source anchor ${resolvedAnchorId} belongs to stream ${anc.stream_id}, not origin stream ${originSid}`,
+        );
+      }
       sourceAnchor = anc;
 
       const journalEvents = store.listJournalEvents(params.threadId);

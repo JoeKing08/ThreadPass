@@ -296,7 +296,7 @@ export function renderNonInstructionFence(params: {
       '[escaped_marker]',
     );
   return [
-    `<${tagName} source="${sanitizeXmlAttr(params.sourceLabel, 50)}" origin="${formatOriginLabel(params.trustTier)}" ref="${sanitizeXmlAttr(params.anchorOrRef, 60)}">`,
+    `<${tagName} source="${sanitizeXmlAttr(params.sourceLabel, 50)}" origin="${formatOriginLabel(params.trustTier)}" ref="${sanitizeXmlAttr(params.anchorOrRef, 48)}">`,
     neutralized,
     `</${tagName}>`,
   ].join('\n');

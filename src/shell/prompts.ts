@@ -22,6 +22,7 @@ import {
   extractStructuredJsonObjects,
   IncompleteMultipartOutputError,
   normalizeOptionalMetaString,
+  RECONCILE_CONTINUATION_KEYS,
   type AssembledMultipartInfo,
 } from './ir.js';
 import {
@@ -506,12 +507,16 @@ function normalizeConflicts(raw: unknown): ReconciliationConflict[] {
 }
 
 export function parseReconcileReceipt(rawText: string): ParsedReconcileReceipt {
-  const extracted = extractStructuredJsonObjects(rawText, [
-    'reconciliation_receipt',
-    'synthesis_summary',
-    'adopted_items',
-    'conflicts',
-  ]);
+  const extracted = extractStructuredJsonObjects(
+    rawText,
+    [
+      'reconciliation_receipt',
+      'synthesis_summary',
+      'adopted_items',
+      'conflicts',
+    ],
+    RECONCILE_CONTINUATION_KEYS,
+  );
 
   if (extracted.objects.length > 0) {
     const assembled = assembleMultipartObjects(extracted.objects);
