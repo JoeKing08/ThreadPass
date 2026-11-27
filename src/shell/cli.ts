@@ -168,10 +168,10 @@ Usage:
   thp reconcile commit --project <id> --thread <id> [--pack <envelope_id>] [--sources s1,s2,...] (--file <path>... | --text <str>) [--authorize] [--confirm-topics <t1,t2>] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
   thp handoff pack --project <id> --thread <id> [--stream <id>] [--goal <text>] [--workspace <dir>] [--attachment]
   thp ingest --project <id> --thread <id> --stream <id> (--file <path>... | --text <str>) [--base-anchor <anchor_id>] [--authorize] [--ack-batch <batch_id> --ack-msgs m1,m2] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
-  thp fork --project <id> --thread <id> --task <brief> [--origin <stream>] [--source-anchor <anchor_id>] [--worker <stream>] [--workspace <dir>] [--act-as-main] [--transcript-file <path>] [--machine <host>] [--cloud-host <provider>] [--remote-uri <url>] [--host-session-id <id>] [--upload-transcript <path>]
+  thp fork --project <id> --thread <id> --task <brief> [--origin <stream>] [--source-anchor <anchor_id>] [--worker <stream>] [--authorize] [--workspace <dir>] [--act-as-main] [--transcript-file <path>] [--machine <host>] [--cloud-host <provider>] [--remote-uri <url>] [--host-session-id <id>] [--upload-transcript <path>]
   thp grant issue --project <id> --thread <id> --grantee <stream> --max-spawns <n> [--issuer <stream>] [--parent-grant <id>] [--max-depth <n>] [--can-redelegate]
   thp grant revoke --project <id> --thread <id> --grant <id> [--reason <text>]
-  thp mailbox send --project <id> --thread <id> --from <stream> --to <stream> --text <msg>
+  thp mailbox send --project <id> --thread <id> --from <stream> --to <stream> --text <msg> [--authorize]
   thp peek --project <id> --thread <id> --stream <id>
   thp fsck --project <id> --thread <id> [--rebuild]
   thp gc --project <id> --thread <id> [--grace-ms <ms>]
@@ -318,6 +318,8 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'fork') {
+    const taskBrief = reqFlag(flags, 'task');
+    const proof = await maybeIssueCliConfirmationProof(svc, flags, taskBrief);
     const tOpts = readTranscriptOptions(flags);
     const out = svc.forkDispatch({
       projectId: reqFlag(flags, 'project'),
@@ -325,7 +327,8 @@ async function main(): Promise<void> {
       originStreamId: strFlag(flags, 'origin'),
       sourceAnchorId: strFlag(flags, 'source-anchor'),
       workerStreamId: strFlag(flags, 'worker'),
-      taskBrief: reqFlag(flags, 'task'),
+      taskBrief,
+      confirmationProof: proof,
       workspaceDir: strFlag(flags, 'workspace'),
       requireDisasterRedundant: flags['require-disaster-redundant'] === true,
       disasterVerified: flags['disaster-verified'] === true,
@@ -381,12 +384,15 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'mailbox' && sub === 'send') {
+    const msgText = reqFlag(flags, 'text');
+    const proof = await maybeIssueCliConfirmationProof(svc, flags, msgText);
     const out = svc.sendMailboxMessage({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
       fromStreamId: reqFlag(flags, 'from'),
       targetStreamId: reqFlag(flags, 'to'),
-      text: reqFlag(flags, 'text'),
+      text: msgText,
+      confirmationProof: proof,
     });
     console.log(JSON.stringify(out, null, 2));
     return;

@@ -56,7 +56,7 @@ import {
   type LocalDeviceIdentity,
 } from './crypto-keys.js';
 import { isOpaqueBinary, redactRemoteUrlCredentials, SlidingWindowRedactor } from './redaction.js';
-import { StateStore, SystemClock } from './state-store.js';
+import { GlobalConfirmationNonceStore, StateStore, SystemClock } from './state-store.js';
 
 export class FencingViolationError extends Error {
   constructor(message: string) {
@@ -290,6 +290,7 @@ export class LocalOfflineEngine {
   public readonly redactor: SlidingWindowRedactor;
   private readonly verifiedAclDirs = new Set<string>();
   private readonly probedHardLinkDirs = new Set<string>();
+  private verifiedGlobalNonceDbAcl = false;
 
   constructor(options: {
     homeDir?: string;
@@ -309,6 +310,33 @@ export class LocalOfflineEngine {
     }
     ensureExclusiveAcl(dirPath, 'dir');
     this.verifiedAclDirs.add(dirPath);
+  }
+
+  get globalNonceDbPath(): string {
+    return path.join(this.homeDir, 'confirmation-nonces.sqlite');
+  }
+
+  private openGlobalNonceStore(): GlobalConfirmationNonceStore {
+    this.ensureDirAclCached(this.homeDir);
+    const dbPath = this.globalNonceDbPath;
+    const store = new GlobalConfirmationNonceStore(dbPath);
+    if (!this.verifiedGlobalNonceDbAcl) {
+      ensureExclusiveAcl(dbPath, 'file');
+      this.verifiedGlobalNonceDbAcl = true;
+    }
+    return store;
+  }
+
+  hasGlobalConsumedConfirmationNonce(nonce: string): boolean {
+    if (!fs.existsSync(this.globalNonceDbPath)) {
+      return false;
+    }
+    const gStore = this.openGlobalNonceStore();
+    try {
+      return gStore.hasConsumed(nonce);
+    } finally {
+      gStore.close();
+    }
   }
 
   ensureLayoutReady(layout: ThreadDirLayout): void {
@@ -1165,16 +1193,34 @@ export class LocalOfflineEngine {
         );
       }
 
-      // Atomically claim any single-use confirmation proof nonces inside SQLite BEGIN IMMEDIATE
-      // to eliminate concurrent replay TOCTOU races before entering committed_pending_publish.
+      // Atomically claim any single-use confirmation proof nonces inside BOTH thread-local SQLite
+      // (`BEGIN IMMEDIATE` + strict PK insert) AND device-wide `confirmation-nonces.sqlite`
+      // to eliminate both intra-thread concurrent TOCTOU races and cross-thread/project replays.
       const specProofs = collectSpecConfirmationProofs(ctx.spec);
       for (const cp of specProofs) {
-        if (store.hasConsumedConfirmationNonce(cp.nonce)) {
+        if (!store.claimConfirmationNonceStrict(cp, nowIso)) {
           throw new CommitConflictError(
             `Confirmation proof nonce ${cp.nonce} was already consumed (atomic replay guard)`,
           );
         }
-        store.consumeConfirmationNonce(cp, nowIso);
+      }
+      if (specProofs.length > 0) {
+        const globalNonceStore = this.openGlobalNonceStore();
+        try {
+          const claim = globalNonceStore.claimStrictBatch(specProofs, {
+            projectId: ctx.manifest.project_id,
+            threadId: ctx.thread_id,
+            txnId: ctx.txn_id,
+            consumedAt: nowIso,
+          });
+          if (!claim.ok) {
+            throw new CommitConflictError(
+              `Confirmation proof nonce ${claim.conflictingNonce} was already consumed globally across threads/projects (atomic replay guard)`,
+            );
+          }
+        } finally {
+          globalNonceStore.close();
+        }
       }
 
       store.db
@@ -1528,6 +1574,7 @@ export class LocalOfflineEngine {
     }
 
     // Process each stream shard
+    const shardConfirmationProofs: Array<{ proof: ConfirmationProof; consumedAt: string }> = [];
     for (const shard of manifest.shards) {
       const sp = path.join(layout.rootDir, ...shard.relative_path.split('/'));
       const lines = fs
@@ -1542,6 +1589,10 @@ export class LocalOfflineEngine {
         if (rec.kind === 'event') {
           if (rec.provenance.confirmation_proof?.nonce) {
             store.consumeConfirmationNonce(rec.provenance.confirmation_proof, rec.created_at);
+            shardConfirmationProofs.push({
+              proof: rec.provenance.confirmation_proof,
+              consumedAt: rec.created_at,
+            });
           }
           store.db
             .prepare(
@@ -1574,6 +1625,10 @@ export class LocalOfflineEngine {
                 rec.payload.record.confirmation_proof,
                 rec.created_at,
               );
+              shardConfirmationProofs.push({
+                proof: rec.payload.record.confirmation_proof,
+                consumedAt: rec.created_at,
+              });
             }
           } else if (rec.payload.type === 'notify_receipt') {
             this.applyNotifyReceiptProj(store, rec.payload.receipt);
@@ -1644,6 +1699,19 @@ export class LocalOfflineEngine {
             )
             .run(shardAnchor.anchor_id, parentId);
         }
+      }
+    }
+
+    if (shardConfirmationProofs.length > 0) {
+      const gStore = this.openGlobalNonceStore();
+      try {
+        gStore.recordIdempotentBatch(shardConfirmationProofs, {
+          projectId: manifest.project_id,
+          threadId: manifest.thread_id,
+          txnId: manifest.txn_id,
+        });
+      } finally {
+        gStore.close();
       }
     }
 

@@ -219,7 +219,10 @@ export class ThreadPassService {
     if (!proof) {
       return { trustTier: computeTrustTier(provenance, exactSha), proofAccepted: false };
     }
-    if (store.hasConsumedConfirmationNonce(proof.nonce)) {
+    if (
+      store.hasConsumedConfirmationNonce(proof.nonce) ||
+      this.engine.hasGlobalConsumedConfirmationNonce(proof.nonce)
+    ) {
       const stripped = { ...provenance, confirmation_proof: undefined };
       return {
         trustTier: computeTrustTier(stripped, exactSha),
@@ -1820,6 +1823,11 @@ export class ThreadPassService {
       }
       headAnchorId = sRow.head_anchor_id;
       lastSeq = sRow.last_seq;
+      if (headAnchorId && pkg.structured_json && !effectiveBaseAnchor) {
+        throw new StaleCheckpointBaselineError(
+          `Structured checkpoint ingest on stream ${params.streamId} requires base_anchor_id (in checkpoint JSON or via --base-anchor / expectedBaseAnchorId) matching current head ${headAnchorId}`,
+        );
+      }
       if (effectiveBaseAnchor && effectiveBaseAnchor !== headAnchorId) {
         throw new StaleCheckpointBaselineError(
           `Checkpoint base_anchor_id (${effectiveBaseAnchor}) does not match current stream ${params.streamId} head (${headAnchorId ?? 'none'}); stream has advanced — re-pack handoff or reconcile instead of appending stale context`,
@@ -1995,6 +2003,7 @@ export class ThreadPassService {
     sourceAnchorId?: string;
     workerStreamId?: string;
     taskBrief: string;
+    confirmationProof?: ConfirmationProof;
     workspaceDir?: string;
     permissionBoundary?: string[];
     expectedArtifacts?: string[];
@@ -2007,9 +2016,11 @@ export class ThreadPassService {
     worker_stream_id: string;
     worker_anchor_id: string;
     txn_id: string;
+    trust_tier: TrustTier;
     durability_state: 'local_committed' | 'disaster_redundant';
     release_gated: boolean;
     worker_prompt?: string;
+    warnings?: string[];
   } {
     assertSafeIdentifier('project_id', params.projectId);
     assertSafeIdentifier('thread_id', params.threadId);
@@ -2021,6 +2032,14 @@ export class ThreadPassService {
       params.workerStreamId ?? newId('wrk', 6),
     );
     const ws = captureWorkspaceManifest(params.workspaceDir);
+    const exactBriefSha = sha256Hex(normalizeConfirmationText(params.taskBrief));
+    const rawForkProvenance: ProvenanceChain = {
+      capture_origin: 'thp_dispatch',
+      verification_method: 'model_reported',
+      source_event_ref: 'dispatch_pending',
+      adapter_version: TRUST_ADAPTER_VERSION,
+      confirmation_proof: params.confirmationProof,
+    };
     const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let threadRow: ReturnType<typeof store.getThread>;
     let sourceAnchor: LineageAnchor;
@@ -2028,6 +2047,9 @@ export class ThreadPassService {
     let originSid: string;
     let matchedGrantId: string | undefined;
     let existingLocators: HostTranscriptLocator[] = [];
+    let forkTrustTier: TrustTier = 'untrusted_peer';
+    let forkProofAccepted = false;
+    let forkWarning: string | undefined;
 
     try {
       threadRow = store.getThread(params.threadId);
@@ -2104,6 +2126,17 @@ export class ThreadPassService {
         canonicalJson(snapshotObj),
       ).sanitized;
       existingLocators = store.listTranscriptLocators(params.threadId);
+      const proofEval = this.evaluateConfirmationProof(
+        store,
+        params.projectId,
+        params.threadId,
+        params.confirmationProof,
+        rawForkProvenance,
+        exactBriefSha,
+      );
+      forkTrustTier = proofEval.trustTier;
+      forkProofAccepted = proofEval.proofAccepted;
+      forkWarning = proofEval.warning;
     } finally {
       store.close();
     }
@@ -2124,7 +2157,7 @@ export class ThreadPassService {
       coordinator_epoch: nextCoordEpoch,
       coordinator_snapshot_ref: snapshotSha,
       task_brief: sanitizedBrief,
-      source_trust_tier: 'human_authority',
+      source_trust_tier: forkTrustTier,
       initial_context_refs: [sourceAnchor.anchor_id],
       target_workspace_id: ws.workspace_id,
       permission_boundary: params.permissionBoundary ?? ['read_workspace', 'propose_patch'],
@@ -2141,12 +2174,15 @@ export class ThreadPassService {
       stream_id: workerStreamId,
       seq: 1,
       commit_txn_id: 'pending',
-      trust_tier: 'human_authority',
+      trust_tier: forkTrustTier,
       provenance: {
         capture_origin: 'thp_dispatch',
-        verification_method: 'local_cli_direct',
+        verification_method: 'model_reported',
         source_event_ref: dispatchId,
         adapter_version: TRUST_ADAPTER_VERSION,
+        ...(forkProofAccepted && params.confirmationProof
+          ? { confirmation_proof: params.confirmationProof }
+          : {}),
       },
       created_at: nowIso,
       payload: {
@@ -2334,9 +2370,11 @@ export class ThreadPassService {
       worker_stream_id: workerStreamId,
       worker_anchor_id: workerAnchorId,
       txn_id: res.txn_id,
+      trust_tier: forkTrustTier,
       durability_state: durabilityState,
       release_gated: releaseGated,
       worker_prompt: workerPrompt,
+      ...(forkWarning ? { warnings: [forkWarning] } : {}),
     };
   }
 
@@ -2346,7 +2384,8 @@ export class ThreadPassService {
     fromStreamId: string;
     targetStreamId: string;
     text: string;
-  }): { message_id: string; txn_id: string } {
+    confirmationProof?: ConfirmationProof;
+  }): { message_id: string; txn_id: string; trust_tier: TrustTier; warnings?: string[] } {
     assertSafeIdentifier('project_id', params.projectId);
     assertSafeIdentifier('thread_id', params.threadId);
     assertSafeIdentifier('from_stream_id', params.fromStreamId);
@@ -2354,9 +2393,20 @@ export class ThreadPassService {
     if (!params.text.trim()) {
       throw new Error('sendMailboxMessage requires non-empty text');
     }
+    const exactTextSha = sha256Hex(normalizeConfirmationText(params.text));
+    const rawMailboxProvenance: ProvenanceChain = {
+      capture_origin: 'thp_mailbox',
+      verification_method: 'model_reported',
+      source_event_ref: 'mailbox_pending',
+      adapter_version: TRUST_ADAPTER_VERSION,
+      confirmation_proof: params.confirmationProof,
+    };
     const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let headAnchor: LineageAnchor;
     let lastSeq: number;
+    let mbTrustTier: TrustTier = 'untrusted_peer';
+    let mbProofAccepted = false;
+    let mbWarning: string | undefined;
     try {
       const sRow = store.getStream(params.fromStreamId);
       if (!sRow) {
@@ -2377,6 +2427,17 @@ export class ThreadPassService {
       if (!anc) throw new Error(`Sender anchor ${sRow.head_anchor_id} missing`);
       headAnchor = anc;
       lastSeq = sRow.last_seq;
+      const proofEval = this.evaluateConfirmationProof(
+        store,
+        params.projectId,
+        params.threadId,
+        params.confirmationProof,
+        rawMailboxProvenance,
+        exactTextSha,
+      );
+      mbTrustTier = proofEval.trustTier;
+      mbProofAccepted = proofEval.proofAccepted;
+      mbWarning = proofEval.warning;
     } finally {
       store.close();
     }
@@ -2391,12 +2452,15 @@ export class ThreadPassService {
       stream_id: params.fromStreamId,
       seq: lastSeq + 1,
       commit_txn_id: 'pending',
-      trust_tier: 'human_authority',
+      trust_tier: mbTrustTier,
       provenance: {
         capture_origin: 'thp_mailbox',
-        verification_method: 'local_cli_direct',
+        verification_method: 'model_reported',
         source_event_ref: messageId,
         adapter_version: TRUST_ADAPTER_VERSION,
+        ...(mbProofAccepted && params.confirmationProof
+          ? { confirmation_proof: params.confirmationProof }
+          : {}),
       },
       created_at: nowIso,
       payload: {
@@ -2431,7 +2495,12 @@ export class ThreadPassService {
       ],
     });
 
-    return { message_id: messageId, txn_id: res.txn_id };
+    return {
+      message_id: messageId,
+      txn_id: res.txn_id,
+      trust_tier: mbTrustTier,
+      ...(mbWarning ? { warnings: [mbWarning] } : {}),
+    };
   }
 
   issueDispatchGrant(params: {

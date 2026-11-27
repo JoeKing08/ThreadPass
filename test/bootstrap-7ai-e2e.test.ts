@@ -562,6 +562,7 @@ test('Full 3-phase user drill via thp web API: 7-AI merge -> Main checkpoint -> 
           projectId: 'p_drill',
           threadId: 'thr_drill',
           streamId: init.main_stream_id,
+          expectedBaseAnchorId: ckptPrompt.anchor_id,
           rawText: JSON.stringify({
             threadpass_handoff: true,
             handoff_mode: 'model_authored',
@@ -1118,12 +1119,14 @@ test('Audit regressions: Grant enforcement, small per_turn_input_limit, fence tr
       projectId: 'proj_grt',
       threadId: 'thr_grt',
       streamId: init.main_stream_id,
+      expectedBaseAnchorId: init.anchor_id,
       rawText: structuredRepeat,
     });
     const ing2 = svc.ingestReply({
       projectId: 'proj_grt',
       threadId: 'thr_grt',
       streamId: init.main_stream_id,
+      expectedBaseAnchorId: ing1.anchor_id,
       rawText: structuredRepeat,
     });
     assert.notEqual(ing1.anchor_id, ing2.anchor_id);
@@ -1498,6 +1501,7 @@ test('Multipart model output assembly: out-of-order adopt, open-ended ingest, re
       projectId: 'proj_mp',
       threadId: 'thr_mp',
       streamId: init.main_stream_id,
+      expectedBaseAnchorId: init.anchor_id,
       rawText: `${ingP1}\n\nplease continue\n\n${ingP2}`,
     });
     assert.deepEqual(ingRes.assembled_parts, { group_id: 'grp_ing_1', total_parts: 2 });
@@ -2753,6 +2757,150 @@ test('Regression checks for continuation filter, adversarial XML attr escaping, 
     );
     assert.notEqual(badGc.status, 0);
     assert.match(`${badGc.stderr}\n${badGc.stdout}`, /Invalid --grace-ms/);
+  } finally {
+    await web.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('GPT P1 & P2-A fixes: fork/mailbox untrusted_peer default vs explicit ConfirmationProof, and mandatory base_anchor_id on structured checkpoints', async () => {
+  const home = makeTempHome('gpt-p1-p2a');
+  const svc = new ThreadPassService({ homeDir: home });
+  const web = await startThreadPassWeb({ service: svc, idleTimeoutMs: 60_000 });
+  try {
+    const init = svc.initThread({
+      projectId: 'proj_gpt',
+      threadId: 'thr_gpt',
+      mainStreamId: 'strm_main',
+    });
+
+    // P1-A: Default forkDispatch (without ConfirmationProof) MUST mark task as untrusted_peer and fence it in handoff
+    const unconfirmedFork = svc.forkDispatch({
+      projectId: 'proj_gpt',
+      threadId: 'thr_gpt',
+      workerStreamId: 'wrk_unconfirmed',
+      taskBrief: 'AI-proposed subtask without human signature',
+    });
+    assert.equal(unconfirmedFork.trust_tier, 'untrusted_peer');
+    const wrkLines = svc.peekStream('proj_gpt', 'thr_gpt', 'wrk_unconfirmed');
+    const wrkEvent = wrkLines.find((l) => l.kind === 'event');
+    assert.ok(wrkEvent && wrkEvent.kind === 'event');
+    assert.equal(wrkEvent.trust_tier, 'untrusted_peer');
+    assert.equal(wrkEvent.provenance.verification_method, 'model_reported');
+    const wrkCapCtrl = wrkLines.find(
+      (l) => l.kind === 'control' && l.payload.type === 'dispatch_recovery_capsule',
+    );
+    assert.ok(wrkCapCtrl && wrkCapCtrl.kind === 'control' && wrkCapCtrl.payload.type === 'dispatch_recovery_capsule');
+    assert.equal(wrkCapCtrl.payload.capsule.source_trust_tier, 'untrusted_peer');
+
+    const wrkHandoffUnconfirmed = svc.packHandoff({
+      projectId: 'proj_gpt',
+      threadId: 'thr_gpt',
+      streamId: 'wrk_unconfirmed',
+    });
+    assert.ok(wrkHandoffUnconfirmed.full_markdown.includes('<archived_reference_'));
+    assert.equal(wrkHandoffUnconfirmed.full_markdown.includes('[user_confirmed_note]'), false);
+
+    // P1-B: Explicit Web 2-step ConfirmationProof on /api/fork elevates to human_authority and renders [user_confirmed_note]
+    const hdrs = { 'Content-Type': 'application/json', 'X-ThreadPass-Token': web.token };
+    const verifiedBrief = 'Operator-reviewed worker task directive';
+    const forkPrep = (await (
+      await fetch(`http://127.0.0.1:${web.port}/api/confirm/prepare`, {
+        method: 'POST',
+        headers: hdrs,
+        body: JSON.stringify({ contentText: verifiedBrief, purpose: 'authorize_instruction' }),
+      })
+    ).json()) as { challenge_id: string; content_sha256: string };
+    const forkRes = await fetch(`http://127.0.0.1:${web.port}/api/fork`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_gpt',
+        threadId: 'thr_gpt',
+        workerStreamId: 'wrk_confirmed',
+        taskBrief: verifiedBrief,
+        confirmChallengeId: forkPrep.challenge_id,
+        confirmContentSha256: forkPrep.content_sha256,
+      }),
+    });
+    assert.equal(forkRes.status, 200);
+    const forkJson = (await forkRes.json()) as { trust_tier: string };
+    assert.equal(forkJson.trust_tier, 'human_authority');
+    const wrkHandoffConfirmed = svc.packHandoff({
+      projectId: 'proj_gpt',
+      threadId: 'thr_gpt',
+      streamId: 'wrk_confirmed',
+    });
+    assert.ok(wrkHandoffConfirmed.full_markdown.includes('[user_confirmed_note]'));
+
+    // P1-C: sendMailboxMessage defaults to untrusted_peer and only becomes human_authority with ConfirmationProof
+    const mbUnconfirmed = svc.sendMailboxMessage({
+      projectId: 'proj_gpt',
+      threadId: 'thr_gpt',
+      fromStreamId: 'wrk_unconfirmed',
+      targetStreamId: init.main_stream_id,
+      text: 'AI peer message without human confirmation',
+    });
+    assert.equal(mbUnconfirmed.trust_tier, 'untrusted_peer');
+    const mbEvents = svc
+      .peekStream('proj_gpt', 'thr_gpt', 'wrk_unconfirmed')
+      .filter((l) => l.kind === 'event' && l.payload.type === 'cross_stream_message');
+    assert.equal(mbEvents.length, 1);
+    const firstMbEv = mbEvents[0];
+    assert.ok(firstMbEv && firstMbEv.kind === 'event');
+    assert.equal(firstMbEv.trust_tier, 'untrusted_peer');
+    assert.equal(firstMbEv.provenance.verification_method, 'model_reported');
+
+    const verifiedMsg = 'Human-reviewed peer approval';
+    const mbProof = svc.issueLocalConfirmationProof(verifiedMsg, 'authorize_instruction', 'local_cli');
+    const mbConfirmed = svc.sendMailboxMessage({
+      projectId: 'proj_gpt',
+      threadId: 'thr_gpt',
+      fromStreamId: 'wrk_confirmed',
+      targetStreamId: init.main_stream_id,
+      text: verifiedMsg,
+      confirmationProof: mbProof,
+    });
+    assert.equal(mbConfirmed.trust_tier, 'human_authority');
+
+    // P2-A: Structured JSON checkpoints WITHOUT base_anchor_id (even claiming evidence_based) MUST throw StaleCheckpointBaselineError,
+    // while raw plain-text evidence_based recovery pastes remain accepted.
+    assert.throws(
+      () =>
+        svc.ingestReply({
+          projectId: 'proj_gpt',
+          threadId: 'thr_gpt',
+          streamId: init.main_stream_id,
+          rawText: JSON.stringify({
+            threadpass_handoff: true,
+            handoff_mode: 'model_authored',
+            summary_text: 'Missing baseline anchor in structured JSON',
+            recent_turns: [{ role: 'assistant', text: 'Should be rejected' }],
+          }),
+        }),
+      StaleCheckpointBaselineError,
+    );
+    assert.throws(
+      () =>
+        svc.ingestReply({
+          projectId: 'proj_gpt',
+          threadId: 'thr_gpt',
+          streamId: init.main_stream_id,
+          rawText: JSON.stringify({
+            threadpass_handoff: true,
+            handoff_mode: 'evidence_based',
+            summary_text: 'Sneaky evidence_based flag in structured JSON without base_anchor_id',
+          }),
+        }),
+      StaleCheckpointBaselineError,
+    );
+    const rawFallbackIngest = svc.ingestReply({
+      projectId: 'proj_gpt',
+      threadId: 'thr_gpt',
+      streamId: init.main_stream_id,
+      rawText: 'assistant: Raw text crash recovery transcript line',
+    });
+    assert.ok(rawFallbackIngest.anchor_id);
   } finally {
     await web.close();
     fs.rmSync(home, { recursive: true, force: true });

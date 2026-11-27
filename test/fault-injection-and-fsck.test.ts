@@ -1424,3 +1424,105 @@ test('Archived invocations carry resolved commit_txn_id and fsck --rebuild prese
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('GPT P2-B fix: confirmation_proof nonce is globally single-use across threads/projects and survives deleted global/thread DB via fsck --rebuild', () => {
+  const home = makeTempHome('global-nonce-strict');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+    svc.initThread({ projectId: 'proj_a', threadId: 'thr_1', mainStreamId: 'strm_main' });
+    svc.initThread({ projectId: 'proj_a', threadId: 'thr_2', mainStreamId: 'strm_main' });
+    svc.initThread({ projectId: 'proj_b', threadId: 'thr_3', mainStreamId: 'strm_main' });
+
+    const text = 'assistant: Authorize this exact instruction once globally';
+    const proof = svc.issueLocalConfirmationProof(text, 'authorize_instruction', 'local_cli');
+
+    // 1. Consume in proj_a / thr_1
+    const first = svc.adoptExternal({
+      projectId: 'proj_a',
+      threadId: 'thr_1',
+      streamId: 'strm_first',
+      sourceLabel: 'origin_1',
+      rawText: text,
+      confirmationProof: proof,
+    });
+    assert.equal(first.trust_tier, 'human_authority');
+
+    // 2. Replaying SAME proof in another thread (proj_a / thr_2) downgrades via adoptExternal
+    const replaySameProj = svc.adoptExternal({
+      projectId: 'proj_a',
+      threadId: 'thr_2',
+      streamId: 'strm_replay_2',
+      sourceLabel: 'replay_2',
+      rawText: text,
+      confirmationProof: proof,
+    });
+    assert.equal(replaySameProj.trust_tier, 'unverified_import');
+    assert.ok(replaySameProj.warnings.some((w) => w.includes('replay rejected')));
+
+    // 3. Direct engine transaction replay into ANOTHER project (proj_b / thr_3) MUST fail closed with CommitConflictError
+    const makeDirectTxn = (projId: string, thrId: string, streamId: string) => {
+      const nowIso = new Date().toISOString();
+      const evId = deterministicEventId(streamId, sha256Hex(`${projId}|${thrId}|${streamId}|${text}`));
+      const ev: EventRecord = {
+        schema_version: SCHEMA_VERSION,
+        kind: 'event',
+        event_id: evId,
+        stream_id: streamId,
+        seq: 1,
+        commit_txn_id: 'pending',
+        trust_tier: 'human_authority',
+        provenance: {
+          capture_origin: 'test_cross_project',
+          verification_method: 'unverified_text_import',
+          source_event_ref: streamId,
+          adapter_version: '1.0.0',
+          confirmation_proof: proof,
+        },
+        created_at: nowIso,
+        payload: { type: 'human_message', text },
+      };
+      const anchor: LineageAnchor = {
+        anchor_id: newId('anc', 8),
+        thread_id: thrId,
+        stream_id: streamId,
+        parents: [],
+        workspace_manifest: captureWorkspaceManifest(),
+        summary: text,
+        head_event_ids: [evId],
+        created_at: nowIso,
+      };
+      return svc.engine.executeTransaction(projId, {
+        thread_id: thrId,
+        affected_streams: [
+          {
+            stream_id: streamId,
+            expected_parent_head: null,
+            anchor,
+            events: [ev],
+          },
+        ],
+      });
+    };
+    assert.throws(
+      () => makeDirectTxn('proj_b', 'thr_3', 'strm_direct_cross'),
+      (err: unknown) => err instanceof CommitConflictError && /already consumed globally/.test(String(err)),
+    );
+
+    // 4. Delete BOTH global nonce ledger AND thr_1 SQLite, rebuild thr_1 via fsck --rebuild -> global ledger is re-hydrated
+    for (const suf of ['', '-wal', '-shm']) {
+      const g = `${svc.engine.globalNonceDbPath}${suf}`;
+      if (fs.existsSync(g)) fs.unlinkSync(g);
+      const t = `${svc.engine.getLayout('proj_a', 'thr_1').dbPath}${suf}`;
+      if (fs.existsSync(t)) fs.unlinkSync(t);
+    }
+    const rebuilt = svc.runFsck('proj_a', 'thr_1', { rebuildSqlite: true });
+    assert.equal(rebuilt.ok, true);
+
+    assert.throws(
+      () => makeDirectTxn('proj_b', 'thr_3', 'strm_after_rebuild'),
+      (err: unknown) => err instanceof CommitConflictError && /already consumed globally/.test(String(err)),
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

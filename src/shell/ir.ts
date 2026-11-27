@@ -32,6 +32,7 @@ export class IncompleteMultipartOutputError extends Error {
 
 export interface ParsedAdoptPackage {
   mode: HandoffMode;
+  structured_json: boolean;
   continuity_level: ContinuityLevel;
   source_label: string;
   base_anchor_id?: string;
@@ -743,6 +744,7 @@ export function parseExternalConversationInput(
 
     return {
       mode,
+      structured_json: true,
       continuity_level:
         mode === 'evidence_based' ? 'Evidence Recovery' : 'Prompt Reconstruction',
       source_label: resolvedLabel ?? sourceLabel,
@@ -825,6 +827,7 @@ export function parseExternalConversationInput(
 
   return {
     mode: 'evidence_based',
+    structured_json: false,
     continuity_level: 'Evidence Recovery',
     source_label: sourceLabel,
     recent_turns: recent.length > 0 ? recent : [{ role: 'assistant', text: trimmed, source_ref: 'raw_1' }],

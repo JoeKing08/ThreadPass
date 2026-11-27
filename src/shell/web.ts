@@ -259,6 +259,11 @@ function renderHtmlPage(
       <div style="flex:1;"><label>派生子流任务描述 (Fork Task Brief)</label><input id="forkTask" type="text" placeholder="Implement sub-module X" /></div>
       <div style="align-self:flex-end;"><button onclick="runUiAction('hoOut', doFork)">原子派发 Fork</button></div>
     </div>
+    <div class="row" style="margin-top:6px;">
+      <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
+        <input id="forkConfirm" type="checkbox" /> 人工审阅任务说明并签发 human_authority 授权凭证
+      </label>
+    </div>
     <div class="row" style="margin-top:8px;">
       <div style="flex:2; min-width:200px;"><label>子流原生会话路径（可选）</label><input id="forkTranscriptPath" type="text" placeholder="可选本地日志路径" /></div>
       <div style="flex:1; min-width:140px;"><label>子流云端宿主（可选）</label><input id="forkCloudHost" type="text" placeholder="如 devin_cloud" /></div>
@@ -272,6 +277,11 @@ function renderHtmlPage(
       <div style="flex:1;"><label>To Stream ID</label><input id="mbTo" type="text" list="streamIdsList" placeholder="main" /></div>
       <div style="flex:2;"><label>Message</label><input id="mbText" type="text" placeholder="Async note for target stream..." /></div>
       <div style="align-self:flex-end;"><button class="sec" onclick="runUiAction('hoOut', doMailboxSend)">发送消息</button></div>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
+        <input id="mbConfirm" type="checkbox" /> 人工审阅消息并签发 human_authority 授权凭证
+      </label>
     </div>
 
     <pre id="hoOut" style="margin-top:12px;"></pre>
@@ -610,10 +620,12 @@ async function doFork() {
   const workerStreamId = document.getElementById('forkWorker').value.trim() || undefined;
   const workspaceDir = document.getElementById('forkWs').value.trim() || undefined;
   const taskBrief = document.getElementById('forkTask').value;
+  const confirmFork = document.getElementById('forkConfirm').checked;
+  const authFields = confirmFork ? await prepareWebAuthChallenge(taskBrief.trim() || 'Execute scoped subtask') : {};
   const transcriptFilePath = document.getElementById('forkTranscriptPath').value.trim() || undefined;
   const cloudProvider = document.getElementById('forkCloudHost').value.trim() || undefined;
   const res = await api('/api/fork', {
-    projectId, threadId, originStreamId, workerStreamId, workspaceDir, taskBrief,
+    projectId, threadId, originStreamId, workerStreamId, workspaceDir, taskBrief, ...authFields,
     transcriptFilePath, cloudProvider
   });
   const box = document.getElementById('forkPromptBox');
@@ -625,6 +637,7 @@ async function doFork() {
     dispatch_id: res.dispatch_id,
     worker_stream_id: res.worker_stream_id,
     worker_anchor_id: res.worker_anchor_id,
+    trust_tier: res.trust_tier,
     durability_state: res.durability_state,
     release_gated: res.release_gated
   }, null, 2);
@@ -637,8 +650,10 @@ async function doMailboxSend() {
   const fromStreamId = document.getElementById('mbFrom').value.trim();
   const targetStreamId = document.getElementById('mbTo').value.trim();
   const text = document.getElementById('mbText').value;
+  const confirmMb = document.getElementById('mbConfirm').checked;
+  const authFields = confirmMb ? await prepareWebAuthChallenge(text) : {};
   const res = await api('/api/mailbox/send', {
-    projectId, threadId, fromStreamId, targetStreamId, text
+    projectId, threadId, fromStreamId, targetStreamId, text, ...authFields
   });
   document.getElementById('hoOut').textContent = JSON.stringify(res, null, 2);
   showAlert('已发送异步消息 ' + res.message_id, 'ok');
@@ -946,6 +961,8 @@ export async function startThreadPassWeb(
           return;
         }
         if (reqUrl.pathname === '/api/mailbox/send') {
+          const text = String(body.text ?? '');
+          const proof = consumeWebChallengeProof(svc, body, text);
           sendJson(
             res,
             200,
@@ -954,7 +971,8 @@ export async function startThreadPassWeb(
               threadId: reqBodyStr(body, 'threadId'),
               fromStreamId: reqBodyStr(body, 'fromStreamId'),
               targetStreamId: reqBodyStr(body, 'targetStreamId'),
-              text: String(body.text ?? ''),
+              text,
+              confirmationProof: proof,
             }),
           );
           return;
@@ -1108,6 +1126,11 @@ export async function startThreadPassWeb(
           return;
         }
         if (reqUrl.pathname === '/api/fork') {
+          const taskBrief =
+            typeof body.taskBrief === 'string' && body.taskBrief.trim()
+              ? body.taskBrief.trim()
+              : 'Execute scoped subtask';
+          const proof = consumeWebChallengeProof(svc, body, taskBrief);
           sendJson(
             res,
             200,
@@ -1130,10 +1153,8 @@ export async function startThreadPassWeb(
                 typeof body.workspaceDir === 'string' && body.workspaceDir.trim()
                   ? body.workspaceDir.trim()
                   : undefined,
-              taskBrief:
-                typeof body.taskBrief === 'string' && body.taskBrief.trim()
-                  ? body.taskBrief.trim()
-                  : 'Execute scoped subtask',
+              taskBrief,
+              confirmationProof: proof,
               requireDisasterRedundant: Boolean(body.requireDisasterRedundant),
               disasterVerified: Boolean(body.disasterVerified),
               transcriptFilePath:

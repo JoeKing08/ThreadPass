@@ -633,4 +633,150 @@ export class StateStore {
       )
       .run(proof.nonce, proof.content_sha256, proof.purpose, proof.channel, consumedAt);
   }
+
+  /**
+   * Atomically claims a confirmation nonce via SQLite PRIMARY KEY enforcement.
+   * Returns `true` iff this statement inserted the nonce for the first time.
+   */
+  claimConfirmationNonceStrict(proof: ConfirmationProof, consumedAt: string): boolean {
+    const info = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO consumed_confirmation_nonces(
+          nonce, content_sha256, purpose, channel, consumed_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(proof.nonce, proof.content_sha256, proof.purpose, proof.channel, consumedAt);
+    return Number(info.changes) === 1;
+  }
+}
+
+/**
+ * Device-wide SQLite nonce ledger (`<homeDir>/confirmation-nonces.sqlite`) enforcing
+ * strict single-use ConfirmationProof consumption across ALL projects, threads, and concurrent processes.
+ */
+export class GlobalConfirmationNonceStore {
+  public readonly db: DatabaseSync;
+
+  constructor(dbPath: string) {
+    this.db = new DatabaseSync(dbPath);
+    this.db.exec('PRAGMA journal_mode = WAL;');
+    this.db.exec('PRAGMA synchronous = FULL;');
+    this.db.exec('PRAGMA busy_timeout = 5000;');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS global_consumed_confirmation_nonces (
+        nonce TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        txn_id TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        consumed_at TEXT NOT NULL
+      );
+    `);
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  hasConsumed(nonce: string): boolean {
+    const row = this.db
+      .prepare('SELECT 1 AS found FROM global_consumed_confirmation_nonces WHERE nonce = ?')
+      .get(nonce) as { found: number } | undefined;
+    return Boolean(row?.found);
+  }
+
+  /**
+   * Atomically claims every proof nonce in a single `BEGIN IMMEDIATE` transaction.
+   * Fails closed (rolling back all claims in this batch) if any nonce was already consumed
+   * by another transaction, thread, or project.
+   */
+  claimStrictBatch(
+    proofs: readonly ConfirmationProof[],
+    scope: { projectId: string; threadId: string; txnId: string; consumedAt: string },
+  ): { ok: true } | { ok: false; conflictingNonce: string } {
+    if (proofs.length === 0) return { ok: true };
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const insertStmt = this.db.prepare(
+        `INSERT OR IGNORE INTO global_consumed_confirmation_nonces(
+          nonce, project_id, thread_id, txn_id, content_sha256, purpose, channel, consumed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const ownerStmt = this.db.prepare(
+        `SELECT project_id, thread_id, txn_id FROM global_consumed_confirmation_nonces WHERE nonce = ?`,
+      );
+      for (const proof of proofs) {
+        const info = insertStmt.run(
+          proof.nonce,
+          scope.projectId,
+          scope.threadId,
+          scope.txnId,
+          proof.content_sha256,
+          proof.purpose,
+          proof.channel,
+          scope.consumedAt,
+        );
+        if (Number(info.changes) !== 1) {
+          const existing = ownerStmt.get(proof.nonce) as
+            | { project_id: string; thread_id: string; txn_id: string }
+            | undefined;
+          const sameTxn =
+            existing &&
+            existing.project_id === scope.projectId &&
+            existing.thread_id === scope.threadId &&
+            existing.txn_id === scope.txnId;
+          if (!sameTxn) {
+            this.db.exec('ROLLBACK;');
+            return { ok: false, conflictingNonce: proof.nonce };
+          }
+        }
+      }
+      this.db.exec('COMMIT;');
+      return { ok: true };
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+  }
+
+  recordIdempotentBatch(
+    entries: ReadonlyArray<{ proof: ConfirmationProof; consumedAt: string }>,
+    scope: { projectId: string; threadId: string; txnId: string },
+  ): void {
+    if (entries.length === 0) return;
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const insertStmt = this.db.prepare(
+        `INSERT OR IGNORE INTO global_consumed_confirmation_nonces(
+          nonce, project_id, thread_id, txn_id, content_sha256, purpose, channel, consumed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const { proof, consumedAt } of entries) {
+        insertStmt.run(
+          proof.nonce,
+          scope.projectId,
+          scope.threadId,
+          scope.txnId,
+          proof.content_sha256,
+          proof.purpose,
+          proof.channel,
+          consumedAt,
+        );
+      }
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  }
 }
