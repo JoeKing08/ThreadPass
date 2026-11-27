@@ -4,7 +4,7 @@ import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { sha256Hex } from '../core/canonical.js';
 import { ThreadPassService, type TranscriptInputOptions } from './service.js';
-import { issueConfirmationProof, normalizeConfirmationText } from './trust.js';
+import { normalizeConfirmationText } from './trust.js';
 import { startThreadPassWeb } from './web.js';
 
 interface ParsedArgs {
@@ -16,7 +16,6 @@ interface ParsedArgs {
 const BOOLEAN_FLAGS = new Set([
   'help',
   'authorize',
-  'confirm-interactive',
   'foreign-canonical',
   'attachment',
   'require-disaster-redundant',
@@ -81,43 +80,44 @@ function readInputText(parsed: ParsedArgs): string {
 }
 
 async function maybeIssueCliConfirmationProof(
+  svc: ThreadPassService,
   flags: Record<string, string | boolean>,
   rawText: string,
 ) {
   if (flags.authorize !== true) {
     return undefined;
   }
-  const normalized = normalizeConfirmationText(rawText);
-  if (flags['confirm-interactive'] !== true) {
-    if (!process.stdin.isTTY) {
-      throw new Error(
-        'authorize_instruction requires interactive confirmation or explicit --confirm-interactive review of exact content',
-      );
-    }
-    const contentHash = sha256Hex(normalized);
-    const preview = normalized.length > 200 ? `${normalized.slice(0, 200)}...` : normalized;
-    process.stderr.write(
-      `\n[ThreadPass Human Authorization Review]\n` +
-        `  purpose: authorize_instruction (grants human_authority)\n` +
-        `  sha256 : ${contentHash}\n` +
-        `  bytes  : ${Buffer.byteLength(normalized, 'utf8')}\n` +
-        `  preview: ${JSON.stringify(preview)}\n`,
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      'authorize_instruction requires an interactive terminal (TTY) human review; non-interactive invocations cannot grant human_authority',
     );
-    const rl = createInterface({ input: process.stdin, output: process.stderr });
-    try {
-      const ans = (await rl.question('Confirm authorizing this exact content? [y/N]: ')).trim().toLowerCase();
-      if (ans !== 'y' && ans !== 'yes') {
-        throw new Error('Human authorization declined by operator.');
-      }
-    } finally {
-      rl.close();
-    }
   }
-  return issueConfirmationProof(
-    normalized,
-    'authorize_instruction',
-    'local_cli',
+  const normalized = normalizeConfirmationText(rawText);
+  const contentHash = sha256Hex(normalized);
+  const shortCode = contentHash.slice(0, 8);
+  const preview = normalized.length > 240 ? `${normalized.slice(0, 240)}...` : normalized;
+  process.stderr.write(
+    `\n[ThreadPass Human Authorization Review]\n` +
+      `  purpose: authorize_instruction (grants Ed25519 signed human_authority)\n` +
+      `  sha256 : ${contentHash}\n` +
+      `  code   : ${shortCode}\n` +
+      `  bytes  : ${Buffer.byteLength(normalized, 'utf8')}\n` +
+      `  preview: ${JSON.stringify(preview)}\n`,
   );
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const ans = (
+      await rl.question(`Type "yes" or code "${shortCode}" to authorize this exact content: `)
+    )
+      .trim()
+      .toLowerCase();
+    if (ans !== 'y' && ans !== 'yes' && ans !== shortCode) {
+      throw new Error('Human authorization declined by operator.');
+    }
+  } finally {
+    rl.close();
+  }
+  return svc.issueLocalConfirmationProof(normalized, 'authorize_instruction', 'local_cli');
 }
 
 function readTranscriptOptions(
@@ -151,9 +151,9 @@ Usage:
   thp prompt checkpoint --project <id> --thread <id> [--stream <id>]
   thp adopt --project <id> --thread <id> --source <label> (--file <path>... | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--machine <host>] [--cloud-host <provider>] [--remote-uri <url>] [--host-session-id <id>] [--upload-transcript <path>]
   thp reconcile pack --project <id> --thread <id> [--sources s1,s2,...] [--goal <text>] [--workspace <dir>] [--attachment]
-  thp reconcile commit --project <id> --thread <id> --sources s1,s2,... (--file <path>... | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
+  thp reconcile commit --project <id> --thread <id> [--pack <envelope_id>] [--sources s1,s2,...] (--file <path>... | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
   thp handoff pack --project <id> --thread <id> [--stream <id>] [--goal <text>] [--workspace <dir>] [--attachment]
-  thp ingest --project <id> --thread <id> --stream <id> (--file <path>... | --text <str>) [--authorize] [--ack-batch <batch_id> --ack-msgs m1,m2] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
+  thp ingest --project <id> --thread <id> --stream <id> (--file <path>... | --text <str>) [--base-anchor <anchor_id>] [--authorize] [--ack-batch <batch_id> --ack-msgs m1,m2] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
   thp fork --project <id> --thread <id> --task <brief> [--origin <stream>] [--worker <stream>] [--workspace <dir>] [--act-as-main] [--transcript-file <path>] [--cloud-host <provider>]
   thp grant issue --project <id> --thread <id> --grantee <stream> --max-spawns <n> [--issuer <stream>] [--parent-grant <id>] [--max-depth <n>] [--can-redelegate]
   thp grant revoke --project <id> --thread <id> --grant <id> [--reason <text>]
@@ -213,7 +213,7 @@ async function main(): Promise<void> {
 
   if (cmd === 'adopt') {
     const rawText = readInputText(parsed);
-    const proof = await maybeIssueCliConfirmationProof(flags, rawText);
+    const proof = await maybeIssueCliConfirmationProof(svc, flags, rawText);
     const tOpts = readTranscriptOptions(flags);
     const out = svc.adoptExternal({
       projectId: reqFlag(flags, 'project'),
@@ -245,12 +245,14 @@ async function main(): Promise<void> {
 
   if (cmd === 'reconcile' && sub === 'commit') {
     const rawText = readInputText(parsed);
-    const proof = await maybeIssueCliConfirmationProof(flags, rawText);
+    const proof = await maybeIssueCliConfirmationProof(svc, flags, rawText);
     const tOpts = readTranscriptOptions(flags);
+    const sourcesStr = strFlag(flags, 'sources');
     const out = svc.commitReconcile({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
-      sourceStreamIds: reqFlag(flags, 'sources').split(',').filter(Boolean),
+      sourceStreamIds: sourcesStr ? sourcesStr.split(',').filter(Boolean) : [],
+      packEnvelopeId: strFlag(flags, 'pack'),
       receiptRawText: rawText,
       confirmationProof: proof,
       workspaceDir: strFlag(flags, 'workspace'),
@@ -275,7 +277,7 @@ async function main(): Promise<void> {
 
   if (cmd === 'ingest') {
     const rawText = readInputText(parsed);
-    const proof = await maybeIssueCliConfirmationProof(flags, rawText);
+    const proof = await maybeIssueCliConfirmationProof(svc, flags, rawText);
     const ackBatch = strFlag(flags, 'ack-batch');
     const ackMsgs = strFlag(flags, 'ack-msgs');
     const tOpts = readTranscriptOptions(flags);
@@ -284,6 +286,7 @@ async function main(): Promise<void> {
       threadId: reqFlag(flags, 'thread'),
       streamId: reqFlag(flags, 'stream'),
       rawText,
+      expectedBaseAnchorId: strFlag(flags, 'base-anchor'),
       confirmationProof: proof,
       ackBatchId: ackBatch,
       ackMessageIds: ackMsgs ? ackMsgs.split(',').filter(Boolean) : undefined,

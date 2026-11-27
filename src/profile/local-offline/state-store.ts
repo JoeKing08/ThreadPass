@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { sha256Hex } from '../../core/canonical.js';
 import type { ClockPort } from '../../core/ports.js';
 import type {
+  ConfirmationProof,
   FsckTxnStatus,
   HostTranscriptLocator,
   JournalEventRecord,
@@ -15,8 +16,9 @@ import type {
 export function computeTranscriptLocatorKey(loc: HostTranscriptLocator): string {
   if (loc.host_kind === 'local_file' && loc.file_path) {
     const normPath = loc.file_path.trim().replace(/\\/g, '/');
+    const origin = loc.locator_origin ?? 'operator_verified';
     return sha256Hex(
-      `local|${(loc.machine_device_id ?? '').trim()}|${(loc.machine_hostname ?? '').trim()}|${normPath}`,
+      `local|${origin}|${(loc.machine_device_id ?? '').trim()}|${(loc.machine_hostname ?? '').trim()}|${normPath}`,
     );
   }
   if (loc.host_kind === 'web_uploaded_blob' && loc.uploaded_blob_sha256) {
@@ -259,6 +261,14 @@ export class StateStore {
         uploaded_filename TEXT,
         locator_json TEXT NOT NULL,
         recorded_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS consumed_confirmation_nonces (
+        nonce TEXT PRIMARY KEY,
+        content_sha256 TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        consumed_at TEXT NOT NULL
       );
     `);
   }
@@ -536,5 +546,22 @@ export class StateStore {
           .prepare('SELECT locator_json FROM transcript_locators ORDER BY recorded_at DESC, locator_key ASC')
           .all()) as Array<{ locator_json: string }>;
     return rows.map((r) => JSON.parse(r.locator_json) as HostTranscriptLocator);
+  }
+
+  hasConsumedConfirmationNonce(nonce: string): boolean {
+    const row = this.db
+      .prepare('SELECT 1 AS found FROM consumed_confirmation_nonces WHERE nonce = ?')
+      .get(nonce) as { found: number } | undefined;
+    return Boolean(row?.found);
+  }
+
+  consumeConfirmationNonce(proof: ConfirmationProof, consumedAt: string): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO consumed_confirmation_nonces(
+          nonce, content_sha256, purpose, channel, consumed_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(proof.nonce, proof.content_sha256, proof.purpose, proof.channel, consumedAt);
   }
 }

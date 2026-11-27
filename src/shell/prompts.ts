@@ -21,9 +21,14 @@ import {
   assembleMultipartObjects,
   extractStructuredJsonObjects,
   IncompleteMultipartOutputError,
+  normalizeOptionalMetaString,
   type AssembledMultipartInfo,
 } from './ir.js';
-import { formatOriginLabel, renderNonInstructionFence } from './trust.js';
+import {
+  formatOriginLabel,
+  renderNonInstructionFence,
+  type ReferenceOriginSummary,
+} from './trust.js';
 
 export function buildCurrentRoleBriefing(params: {
   threadId: string;
@@ -143,12 +148,13 @@ export interface ReconcileSourceInput {
   streamId: string;
   anchor: LineageAnchor;
   events: EventRecord[];
-  trustTier: TrustTier;
+  trustTier: ReferenceOriginSummary;
   completeness: string;
   sourceLabel?: string;
 }
 
 export interface ParsedReconcileReceipt {
+  pack_envelope_id?: string;
   adopted_items: string[];
   partial_items: string[];
   excluded_items: string[];
@@ -162,17 +168,18 @@ export interface ParsedReconcileReceipt {
 
 function formatEventLineForEnvelope(e: EventRecord): string {
   const p = e.payload;
+  const originTag = `origin=${formatOriginLabel(e.trust_tier)}`;
   if (p.type === 'human_message') {
-    return `[${e.event_id}][archived_user_msg][origin=${formatOriginLabel(e.trust_tier)}] ${p.text}`;
+    return `[${e.event_id}][archived_user_msg][${originTag}] ${p.text}`;
   }
-  if (p.type === 'assistant_part') return `[${e.event_id}][prior_agent] ${p.text ?? ''}`;
+  if (p.type === 'assistant_part') return `[${e.event_id}][prior_agent][${originTag}] ${p.text ?? ''}`;
   if (p.type === 'tool_result') {
-    return `[${e.event_id}][tool_log:${p.status}${p.is_error ? ':err' : ''}] ${p.text ?? ''}`;
+    return `[${e.event_id}][tool_log:${p.status}${p.is_error ? ':err' : ''}][${originTag}] ${p.text ?? ''}`;
   }
   if (p.type === 'coordinator_inject') {
-    return `[${e.event_id}][handoff_note:${p.continuity_level}] ${p.summary_text}`;
+    return `[${e.event_id}][handoff_note:${p.continuity_level}][${originTag}] ${p.summary_text}`;
   }
-  return `[${e.event_id}][peer_note:${p.from_stream_id}->${p.target_stream_id}] ${p.text ?? ''}`;
+  return `[${e.event_id}][peer_note:${p.from_stream_id}->${p.target_stream_id}][${originTag}] ${p.text ?? ''}`;
 }
 
 export const MAX_INLINE_TRANSCRIPT_LOCATORS = 12;
@@ -212,24 +219,31 @@ export function formatTranscriptLocatorsSection(params: {
     let detail = '';
 
     if (loc.host_kind === 'local_file' && loc.file_path) {
-      const sameDevice =
-        (!loc.machine_device_id || loc.machine_device_id === context.currentDeviceId) &&
-        (!loc.machine_hostname ||
-          loc.machine_hostname.toLowerCase() === context.currentHostname.toLowerCase());
-      const hostTag = `${loc.machine_hostname ?? context.currentHostname} (${loc.machine_device_id ?? 'local'})`;
-      if (sameDevice) {
-        if (existsFn(loc.file_path)) {
-          localGreppable += 1;
-          tag = `LOCAL_GREPPABLE on ${hostTag}`;
-        } else {
-          localMissing += 1;
-          tag = `LOCAL_FILE_MISSING on ${hostTag}`;
-        }
+      if (loc.locator_origin === 'model_reported') {
+        placeholders += 1;
+        const reportedHost = loc.machine_hostname ?? 'unknown_host';
+        tag = `MODEL_REPORTED_PATH_UNVERIFIED (host=${reportedHost})`;
+        detail = `"${loc.file_path}" (reported by model; not verified on this machine)`;
       } else {
-        otherMachine += 1;
-        tag = `OTHER_MACHINE: ${hostTag}`;
+        const sameDevice =
+          (!loc.machine_device_id || loc.machine_device_id === context.currentDeviceId) &&
+          (!loc.machine_hostname ||
+            loc.machine_hostname.toLowerCase() === context.currentHostname.toLowerCase());
+        const hostTag = `${loc.machine_hostname ?? context.currentHostname} (${loc.machine_device_id ?? 'local'})`;
+        if (sameDevice) {
+          if (existsFn(loc.file_path)) {
+            localGreppable += 1;
+            tag = `LOCAL_GREPPABLE on ${hostTag}`;
+          } else {
+            localMissing += 1;
+            tag = `LOCAL_FILE_MISSING on ${hostTag}`;
+          }
+        } else {
+          otherMachine += 1;
+          tag = `OTHER_MACHINE: ${hostTag}`;
+        }
+        detail = `"${loc.file_path}"`;
       }
-      detail = `"${loc.file_path}"`;
     } else if (loc.host_kind === 'web_uploaded_blob' && loc.uploaded_blob_rel) {
       const absBlobPath = resolveRel(loc.uploaded_blob_rel);
       if (existsFn(absBlobPath)) {
@@ -247,6 +261,7 @@ export function formatTranscriptLocatorsSection(params: {
         loc.cloud_provider ? `provider=${loc.cloud_provider}` : 'provider=unknown_cloud',
         loc.host_session_id ? `session_id=${loc.host_session_id}` : '',
         loc.remote_uri ? `uri=${loc.remote_uri}` : '',
+        loc.locator_origin === 'model_reported' ? 'model_reported' : '',
       ].filter(Boolean);
       tag = `CLOUD_ONLY / NO_LOCAL_FILE | ${parts.join(' | ')}`;
       detail = loc.note ?? 'No local disk transcript file; reachable only via matching cloud host/provider';
@@ -410,12 +425,13 @@ export function packReconcileEnvelope(params: {
   }
 
   const outputTemplate = [
-    'Return ONE valid RFC-8259 ```json block with your explicit reconciliation decision (preserve source working language such as Chinese while keeping technical identifiers exact; avoid raw triple-backticks inside JSON strings). If the receipt approaches your single-turn output limit, emit multiple standalone valid ```json objects (never cut mid-JSON) using `"part_group_id"`, `"part_index"`, `"total_parts"` (or `null`), and `"is_final"`, asking the user to reply `continue` between parts:',
-    '- If there are real disagreements across streams, add objects to `conflicts` shaped as `{ "topic": "...", "kind": "semantic|structural|causal|unknown", "positions": ["stream_a: ...", "stream_b: ..."], "resolution": "...", "human_confirmed": false }`. Leave `conflicts: []` when none exist.',
+    `Return ONE valid RFC-8259 \`\`\`json block with your explicit reconciliation decision (preserve \`"pack_envelope_id": "${envelopeId}"\` and the source working language such as Chinese while keeping technical identifiers exact; avoid raw triple-backticks inside JSON strings). If the receipt approaches your single-turn output limit, emit multiple standalone valid \`\`\`json objects (never cut mid-JSON) using \`"part_group_id"\`, \`"part_index"\`, \`"total_parts"\` (or \`null\`), and \`"is_final"\`, asking the user to reply \`continue\` between parts:`,
+    '- If there are real disagreements across streams, add objects to `conflicts` shaped as `{ "topic": "...", "kind": "semantic|structural|causal|unknown", "positions": ["stream_a: ...", "stream_b: ..."], "resolution": "...", "needs_human_confirmation": true }`. Leave `conflicts: []` when none exist (final `human_confirmed` is set only by the local human confirmation flow).',
     '```json',
     JSON.stringify(
       {
         reconciliation_receipt: true,
+        pack_envelope_id: envelopeId,
         adopted_items: ['stream_id: accepted item or conclusion'],
         partial_items: [],
         excluded_items: [],
@@ -465,18 +481,24 @@ function normalizeConflicts(raw: unknown): ReconciliationConflict[] {
           positions: [],
           resolution: '',
           human_confirmed: false,
+          needs_human_confirmation: true,
         });
       }
       continue;
     }
     if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
       const rec = entry as Record<string, unknown>;
+      // Never honor self-declared `human_confirmed` from model output; system derives it solely from verified ConfirmationProof
       out.push({
         topic: String(rec.topic ?? 'unspecified_conflict'),
         kind: normalizeConflictKind(rec.kind),
         positions: Array.isArray(rec.positions) ? rec.positions.map(String) : [],
         resolution: String(rec.resolution ?? ''),
-        human_confirmed: Boolean(rec.human_confirmed),
+        human_confirmed: false,
+        needs_human_confirmation:
+          rec.needs_human_confirmation !== undefined
+            ? Boolean(rec.needs_human_confirmation)
+            : true,
       });
     }
   }
@@ -493,6 +515,7 @@ export function parseReconcileReceipt(rawText: string): ParsedReconcileReceipt {
 
   if (extracted.objects.length > 0) {
     const assembled = assembleMultipartObjects(extracted.objects);
+    let packEnvelopeId: string | undefined;
     const adopted: string[] = [];
     const partial: string[] = [];
     const excluded: string[] = [];
@@ -520,6 +543,15 @@ export function parseReconcileReceipt(rawText: string): ParsedReconcileReceipt {
     };
 
     for (const obj of assembled.parts) {
+      const partPackId = normalizeOptionalMetaString(obj.pack_envelope_id);
+      if (partPackId) {
+        if (packEnvelopeId && packEnvelopeId !== partPackId) {
+          throw new IncompleteMultipartOutputError(
+            `Conflicting pack_envelope_id across multipart receipt (${packEnvelopeId} vs ${partPackId})`,
+          );
+        }
+        packEnvelopeId = partPackId;
+      }
       pushUnique(adopted, seenAdopted, obj.adopted_items);
       pushUnique(partial, seenPartial, obj.partial_items);
       pushUnique(excluded, seenExcluded, obj.excluded_items);
@@ -542,6 +574,7 @@ export function parseReconcileReceipt(rawText: string): ParsedReconcileReceipt {
     }
 
     return {
+      ...(packEnvelopeId ? { pack_envelope_id: packEnvelopeId } : {}),
       adopted_items: adopted,
       partial_items: partial,
       excluded_items: excluded,

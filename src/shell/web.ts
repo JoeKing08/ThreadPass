@@ -2,7 +2,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { newHighEntropyToken, sha256Hex } from '../core/canonical.js';
 import type { ThreadPassService } from './service.js';
-import { issueConfirmationProof, normalizeConfirmationText } from './trust.js';
+import { normalizeConfirmationText } from './trust.js';
 
 export interface WebShellOptions {
   service: ThreadPassService;
@@ -196,6 +196,9 @@ function renderHtmlPage(
       <label class="file-label">可选：上传合并 AI 原始会话副本（自动脱敏）<input id="recUploadFile" type="file" accept=".md,.txt,.json,.jsonl,text/plain,text/markdown" /></label>
     </div>
     <div class="row" style="margin-top:8px;">
+      <div style="flex:1; min-width:220px;"><label>Bound Reconcile Pack ID（生成信封时自动填入，防止来源漂移）</label><input id="recPackId" type="text" placeholder="env_xxx" /></div>
+    </div>
+    <div class="row" style="margin-top:8px;">
       <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
         <input id="recConfirm" type="checkbox" /> 人工审阅确认合并裁决并绑定内容哈希
       </label>
@@ -208,6 +211,7 @@ function renderHtmlPage(
     <h3>A. 阶段备份回 Main / 子流 (Checkpoint Ingest)</h3>
     <div class="row">
       <div style="flex:1;"><label>Stream ID（留空默认 Main）</label><input id="ckptStream" type="text" list="streamIdsList" placeholder="例如 main 或 sub_a" /></div>
+      <div style="flex:1;"><label>Base Anchor ID（防过期提交校验，可选）</label><input id="ckptBaseAnchor" type="text" placeholder="anc_xxx（点击右侧按钮自动填入）" /></div>
       <div style="flex:1;"><label>工作区目录（可选）</label><input id="ckptWorkspace" type="text" placeholder="例如 C:\\Projects\\ThreadPass" /></div>
       <div style="align-self:flex-end;"><button class="sec" onclick="runUiAction('hoOut', () => copyCheckpointPrompt(this))">复制已纳管流备份 Prompt</button></div>
     </div>
@@ -440,17 +444,30 @@ async function readOptionalUpload(inputId) {
   return { uploadedTranscriptText: await file.text(), uploadedTranscriptFilename: file.name };
 }
 
+async function prepareWebAuthChallenge(rawText) {
+  const ch = await api('/api/confirm/prepare', { contentText: rawText, purpose: 'authorize_instruction' });
+  const ok = window.confirm(
+    '确认签发一次性 human_authority 授权凭证？\\n' +
+    'SHA-256: ' + ch.content_sha256 + '\\n' +
+    '字节数: ' + ch.byte_length + '\\n' +
+    '内容预览: ' + ch.preview
+  );
+  if (!ok) throw new Error('Operator declined human authorization review.');
+  return { confirmChallengeId: ch.challenge_id, confirmContentSha256: ch.content_sha256 };
+}
+
 async function doAdopt() {
   const { projectId, threadId } = getIds();
   const rawText = document.getElementById('adoptText').value;
   const sourceLabel = document.getElementById('adoptSource').value.trim();
   const confirm = document.getElementById('adoptConfirm').checked;
+  const authFields = confirm ? await prepareWebAuthChallenge(rawText) : {};
   const transcriptFilePath = document.getElementById('adoptTranscriptPath').value.trim() || undefined;
   const cloudProvider = document.getElementById('adoptCloudHost').value.trim() || undefined;
   const hostSessionId = document.getElementById('adoptHostSess').value.trim() || undefined;
   const upload = await readOptionalUpload('adoptUploadFile');
   const res = await api('/api/adopt', {
-    projectId, threadId, sourceLabel, rawText, confirmAuthorize: confirm,
+    projectId, threadId, sourceLabel, rawText, ...authFields,
     transcriptFilePath, cloudProvider, hostSessionId, ...upload
   });
   document.getElementById('adoptOut').textContent = JSON.stringify(res, null, 2);
@@ -488,6 +505,7 @@ async function packReconcile() {
     perTurnLimit
   });
   latestMarkdown = res.full_markdown;
+  document.getElementById('recPackId').value = res.envelope_id || '';
   renderParts('recParts', res.parts);
   document.getElementById('recOut').textContent = JSON.stringify({
     envelope_id: res.envelope_id,
@@ -517,12 +535,14 @@ async function commitReconcile() {
   const { projectId, threadId } = getIds();
   const selected = Array.from(document.querySelectorAll('.rec-src:checked')).map(c => c.value);
   const receiptRawText = document.getElementById('recReceipt').value;
+  const packEnvelopeId = document.getElementById('recPackId').value.trim() || undefined;
   const confirmAuthorize = document.getElementById('recConfirm').checked;
+  const authFields = confirmAuthorize ? await prepareWebAuthChallenge(receiptRawText) : {};
   const transcriptFilePath = document.getElementById('recTranscriptPath').value.trim() || undefined;
   const cloudProvider = document.getElementById('recCloudHost').value.trim() || undefined;
   const upload = await readOptionalUpload('recUploadFile');
   const res = await api('/api/reconcile/commit', {
-    projectId, threadId, sourceStreamIds: selected, receiptRawText, confirmAuthorize,
+    projectId, threadId, sourceStreamIds: selected, receiptRawText, packEnvelopeId, ...authFields,
     transcriptFilePath, cloudProvider, ...upload
   });
   document.getElementById('recOut').textContent = JSON.stringify(res, null, 2);
@@ -534,6 +554,7 @@ async function copyCheckpointPrompt(btn) {
   const { projectId, threadId } = getIds();
   const streamId = document.getElementById('ckptStream').value.trim() || undefined;
   const res = await api('/api/prompt/checkpoint', { projectId, threadId, streamId });
+  document.getElementById('ckptBaseAnchor').value = res.anchor_id || '';
   await copyTextWithFeedback(res.prompt, btn);
   document.getElementById('hoOut').textContent = res.prompt;
 }
@@ -546,13 +567,15 @@ async function doIngest() {
     streamId = st.thread && st.thread.main_stream_id;
   }
   const rawText = document.getElementById('ckptText').value;
+  const expectedBaseAnchorId = document.getElementById('ckptBaseAnchor').value.trim() || undefined;
   const workspaceDir = document.getElementById('ckptWorkspace').value.trim() || undefined;
   const confirmAuthorize = document.getElementById('ckptConfirm').checked;
+  const authFields = confirmAuthorize ? await prepareWebAuthChallenge(rawText) : {};
   const transcriptFilePath = document.getElementById('ckptTranscriptPath').value.trim() || undefined;
   const cloudProvider = document.getElementById('ckptCloudHost').value.trim() || undefined;
   const upload = await readOptionalUpload('ckptUploadFile');
   const res = await api('/api/ingest', {
-    projectId, threadId, streamId, rawText, workspaceDir, confirmAuthorize,
+    projectId, threadId, streamId, rawText, expectedBaseAnchorId, workspaceDir, ...authFields,
     transcriptFilePath, cloudProvider, ...upload
   });
   document.getElementById('hoOut').textContent = JSON.stringify(res, null, 2);
@@ -653,6 +676,46 @@ export async function startThreadPassWeb(
   const idleMs = options.idleTimeoutMs ?? 15 * 60 * 1000;
   let idleTimer: NodeJS.Timeout | undefined;
   let serverPort = 0;
+
+  const pendingChallenges = new Map<
+    string,
+    { content_sha256: string; purpose: 'authorize_instruction'; expires_at: number }
+  >();
+
+  const consumeWebChallengeProof = (
+    svc: ThreadPassService,
+    body: Record<string, unknown>,
+    rawText: string,
+  ) => {
+    const challengeId =
+      typeof body.confirmChallengeId === 'string' && body.confirmChallengeId.trim()
+        ? body.confirmChallengeId.trim()
+        : undefined;
+    if (challengeId) {
+      const entry = pendingChallenges.get(challengeId);
+      pendingChallenges.delete(challengeId);
+      if (!entry || entry.expires_at < Date.now()) {
+        throw new Error('Human confirmation challenge is missing, already used, or expired');
+      }
+      const actualSha = sha256Hex(normalizeConfirmationText(rawText));
+      if (entry.content_sha256 !== actualSha) {
+        throw new Error('Human confirmation challenge content SHA-256 mismatch');
+      }
+      if (
+        typeof body.confirmContentSha256 === 'string' &&
+        body.confirmContentSha256.trim() !== actualSha
+      ) {
+        throw new Error('Human confirmation confirmContentSha256 mismatch');
+      }
+      return svc.issueLocalConfirmationProof(rawText, entry.purpose, 'thp_web');
+    }
+    if (body.confirmAuthorize) {
+      throw new Error(
+        'confirmAuthorize requires a server-issued confirmChallengeId from /api/confirm/prepare bound to the reviewed content hash',
+      );
+    }
+    return undefined;
+  };
 
   const isAllowedOriginOrHost = (req: http.IncomingMessage): boolean => {
     const allowedHosts = new Set([
@@ -789,15 +852,42 @@ export async function startThreadPassWeb(
           );
           return;
         }
+        if (reqUrl.pathname === '/api/confirm/prepare') {
+          const contentText = String(body.contentText ?? '');
+          if (!contentText.trim()) {
+            throw new Error('confirm/prepare requires non-empty contentText');
+          }
+          const purpose =
+            body.purpose === 'authorize_instruction' || body.purpose === undefined
+              ? 'authorize_instruction'
+              : null;
+          if (!purpose) {
+            throw new Error('confirm/prepare only supports purpose=authorize_instruction');
+          }
+          const now = Date.now();
+          for (const [k, v] of pendingChallenges.entries()) {
+            if (v.expires_at < now) pendingChallenges.delete(k);
+          }
+          const normalized = normalizeConfirmationText(contentText);
+          const contentSha = sha256Hex(normalized);
+          const challengeId = `chk_${newHighEntropyToken(16)}`;
+          pendingChallenges.set(challengeId, {
+            content_sha256: contentSha,
+            purpose,
+            expires_at: now + 5 * 60 * 1000,
+          });
+          sendJson(res, 200, {
+            challenge_id: challengeId,
+            content_sha256: contentSha,
+            review_code: contentSha.slice(0, 8),
+            byte_length: Buffer.byteLength(normalized, 'utf8'),
+            preview: normalized.length > 240 ? `${normalized.slice(0, 240)}...` : normalized,
+          });
+          return;
+        }
         if (reqUrl.pathname === '/api/ingest') {
           const rawText = String(body.rawText ?? '');
-          const proof = body.confirmAuthorize
-            ? issueConfirmationProof(
-                normalizeConfirmationText(rawText),
-                'authorize_instruction',
-                'thp_web',
-              )
-            : undefined;
+          const proof = consumeWebChallengeProof(svc, body, rawText);
           sendJson(
             res,
             200,
@@ -806,6 +896,10 @@ export async function startThreadPassWeb(
               threadId: reqBodyStr(body, 'threadId'),
               streamId: reqBodyStr(body, 'streamId'),
               rawText,
+              expectedBaseAnchorId:
+                typeof body.expectedBaseAnchorId === 'string' && body.expectedBaseAnchorId.trim()
+                  ? body.expectedBaseAnchorId.trim()
+                  : undefined,
               confirmationProof: proof,
               ackBatchId: typeof body.ackBatchId === 'string' && body.ackBatchId.trim() ? body.ackBatchId.trim() : undefined,
               ackMessageIds: Array.isArray(body.ackMessageIds)
@@ -861,13 +955,7 @@ export async function startThreadPassWeb(
         }
         if (reqUrl.pathname === '/api/adopt') {
           const rawText = String(body.rawText ?? '');
-          const proof = body.confirmAuthorize
-            ? issueConfirmationProof(
-                normalizeConfirmationText(rawText),
-                'authorize_instruction',
-                'thp_web',
-              )
-            : undefined;
+          const proof = consumeWebChallengeProof(svc, body, rawText);
           sendJson(
             res,
             200,
@@ -941,13 +1029,7 @@ export async function startThreadPassWeb(
         }
         if (reqUrl.pathname === '/api/reconcile/commit') {
           const receiptRawText = String(body.receiptRawText ?? '');
-          const proof = body.confirmAuthorize
-            ? issueConfirmationProof(
-                normalizeConfirmationText(receiptRawText),
-                'authorize_instruction',
-                'thp_web',
-              )
-            : undefined;
+          const proof = consumeWebChallengeProof(svc, body, receiptRawText);
           sendJson(
             res,
             200,
@@ -958,6 +1040,10 @@ export async function startThreadPassWeb(
                 ? body.sourceStreamIds.map(String)
                 : [],
               receiptRawText,
+              packEnvelopeId:
+                typeof body.packEnvelopeId === 'string' && body.packEnvelopeId.trim()
+                  ? body.packEnvelopeId.trim()
+                  : undefined,
               confirmationProof: proof,
               transcriptFilePath:
                 typeof body.transcriptFilePath === 'string' && body.transcriptFilePath.trim()

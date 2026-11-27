@@ -21,6 +21,9 @@ export interface ConfirmationProof {
   purpose: ConfirmationPurpose;
   channel: 'local_cli' | 'thp_web';
   confirmed_at: string;
+  signer_device_id?: string;
+  public_key_spki_b64?: string;
+  signature_b64?: string;
   hmac_hex?: string;
 }
 
@@ -241,6 +244,28 @@ export interface ReconciliationConflict {
   positions: string[];
   resolution: string;
   human_confirmed: boolean;
+  needs_human_confirmation?: boolean;
+  confirmation_proof_nonce?: string;
+}
+
+export interface ReconcilePackSourceSnapshot {
+  stream_id: string;
+  anchor_id: string;
+  anchor_sha256: string;
+  completeness: string;
+}
+
+export interface ReconcilePackManifest {
+  schema_version: string;
+  envelope_id: string;
+  project_id: string;
+  thread_id: string;
+  main_stream_id: string;
+  main_base_anchor_id: string | null;
+  sources: ReconcilePackSourceSnapshot[];
+  prompt_manifest_hash: string;
+  pack_manifest_hash: string;
+  created_at: string;
 }
 
 export interface ReconciliationRecord {
@@ -262,6 +287,8 @@ export interface ReconciliationRecord {
   strategy_id: string;
   strategy_version: string;
   input_manifest_hash: string;
+  pack_envelope_id?: string;
+  pack_manifest_hash?: string;
   confirmation_proof?: ConfirmationProof;
   created_at: string;
 }
@@ -320,12 +347,15 @@ export type HostTranscriptKind =
   | 'cloud_remote'
   | 'placeholder_unavailable';
 
+export type HostTranscriptSourceOrigin = 'operator_verified' | 'model_reported';
+
 export interface HostTranscriptLocator {
   locator_id: string;
   stream_id: string;
   anchor_id?: string;
   source_label: string;
   host_kind: HostTranscriptKind;
+  locator_origin?: HostTranscriptSourceOrigin;
   machine_hostname?: string;
   machine_device_id?: string;
   file_path?: string;

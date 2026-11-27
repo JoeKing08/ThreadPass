@@ -7,7 +7,7 @@
   - **宿主原生会话**：IDE/CLI/Web 里的具体窗口或本地/云端对话记录，只是临时承载逻辑流的工作载体。
   - **当前主 Agent**：此时此刻正在替逻辑主会话值班干活的那一个 AI 实例（哪怕全场只有 1 个 AI，它也只是“当前主 Agent”，换窗口/换模型不换主会话）。
 - **宿主会话日志定位、Web 可选上传与可达性标记：** 支持在 `adopt` / `ingest` / `reconcile commit` / `fork` 时记录带机器归属（`hostname + device_id + file_path`）的原生会话文件路径（`--transcript-file`）、从 Web 上传并自动脱敏归档会话副本（`--upload-transcript`）或标注纯云端来源（`--cloud-host` / `--host-session-id`）。打包信封时会自动标注本机可 `grep`、异机、已上传或仅云端占位等可达性状态，溢出时写入 `transcript-index.json`。
-- **双向分片、身份保持与低误报 Prompt 封装：** 支持超大交棒信封按 `<handoff_chunk>` 自动分片输出，并支持模型回传**对象级多片 JSON**（`part_group_id` / `part_index` / `total_parts` / `is_final`，CLI 可重复传多个 `--file`、`thp web` 可追加分片文件，缺片或冲突自动 `fail-closed` 拒绝）；顶部 `Session Handoff Overview` 保留模型原生身份并清晰隔离前任历史归因，同时采用对高敏感模型友好的 XML `<archived_reference_...>` 参考围栏，避免触发防注入误拒。
+- **双向分片、身份保持与安全闭环强化：** 支持超大信封按完整 XML `<archived_reference_...>` 围栏与 `<handoff_chunk>` 分片输出，并支持模型回传**对象级多片 JSON**（强制每片携带 `part_group_id`、`part_index`、`is_final`，内置 64 片 / 4 MiB 上限）；`reconcile commit` 强制绑定 `packReconcile` 发布的不可变来源快照（`--pack`），`ingest` 强制核对 `base_anchor_id` 防过期基线覆盖；`human_authority` 与冲突确认（`human_confirmed`）必须经过本地 Ed25519 一次性挑战防重放签发，绝不采信模型自声明或未验证定位符路径。
 
 ## 三层目录结构
 

@@ -16,6 +16,8 @@ import { parseReconcileReceipt } from '../src/shell/prompts.js';
 import {
   DuplicateAdoptionError,
   ForeignCanonicalDetectedError,
+  ReconcileDriftError,
+  StaleCheckpointBaselineError,
   ThreadPassService,
 } from '../src/shell/service.js';
 import {
@@ -157,8 +159,8 @@ test('End-to-end 7-AI merge bootstrap drill + dedup + redaction + chunking + han
       synthesis_summary: 'Unified 7-AI architecture & next execution steps ready on Main.',
       next_actions: ['Start Pure Core tests', 'Run Local-Offline fault suite'],
     });
-    const confirmProof = issueConfirmationProof(
-      normalizeConfirmationText(receiptText),
+    const confirmProof = svc.issueLocalConfirmationProof(
+      receiptText,
       'authorize_instruction',
       'local_cli',
     );
@@ -166,6 +168,7 @@ test('End-to-end 7-AI merge bootstrap drill + dedup + redaction + chunking + han
       projectId: 'threadpass-bootstrap',
       threadId: 'thr_bootstrap',
       sourceStreamIds: adoptedStreams,
+      packEnvelopeId: recPack.envelope_id,
       receiptRawText: receiptText,
       confirmationProof: confirmProof,
     });
@@ -288,7 +291,7 @@ test('ForeignCanonicalDetectedError triggers on cross-thread host_session_id col
 
     // Validate ConfirmationProof tamper detection
     const raw = 'Authorize this exact step';
-    const proof = issueConfirmationProof(raw, 'authorize_instruction', 'local_cli');
+    const proof = svc.issueLocalConfirmationProof(raw, 'authorize_instruction', 'local_cli');
     assert.equal(
       sha256Hex(normalizeConfirmationText(raw)) === proof.content_sha256,
       true,
@@ -342,6 +345,15 @@ test('thp web enforces 127.0.0.1 binding, token & Host/Origin checks, and runs a
     });
     assert.equal(initRes.status, 200);
 
+    const adoptRaw = 'user: hello\nassistant: implemented module via web UI';
+    const prepRes = await fetch(`http://127.0.0.1:${web.port}/api/confirm/prepare`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({ contentText: adoptRaw, purpose: 'authorize_instruction' }),
+    });
+    assert.equal(prepRes.status, 200);
+    const prep = (await prepRes.json()) as { challenge_id: string; content_sha256: string };
+
     const adoptRes = await fetch(`http://127.0.0.1:${web.port}/api/adopt`, {
       method: 'POST',
       headers: hdrs,
@@ -349,8 +361,9 @@ test('thp web enforces 127.0.0.1 binding, token & Host/Origin checks, and runs a
         projectId: 'p_web',
         threadId: 'thr_web',
         sourceLabel: 'web_ai_1',
-        rawText: 'user: hello\nassistant: implemented module via web UI',
-        confirmAuthorize: true,
+        rawText: adoptRaw,
+        confirmChallengeId: prep.challenge_id,
+        confirmContentSha256: prep.content_sha256,
       }),
     });
     assert.equal(adoptRes.status, 200);
@@ -384,10 +397,15 @@ test('commitReconcile rejects mismatched confirmationProof hash and wrong purpos
       streamId: 'strm_1',
     });
 
+    const pack1 = svc.packReconcile({
+      projectId: 'proj_rp',
+      threadId: 'thr_rp',
+      sourceStreamIds: [a1.stream_id],
+    });
     const receiptText = '{"synthesis_summary":"Merged choice","adopted_items":["strm_1"]}';
     // 1) Wrong purpose: accept_import must NOT grant human_authority
-    const wrongPurposeProof = issueConfirmationProof(
-      normalizeConfirmationText(receiptText),
+    const wrongPurposeProof = svc.issueLocalConfirmationProof(
+      receiptText,
       'accept_import',
       'local_cli',
     );
@@ -395,13 +413,19 @@ test('commitReconcile rejects mismatched confirmationProof hash and wrong purpos
       projectId: 'proj_rp',
       threadId: 'thr_rp',
       sourceStreamIds: [a1.stream_id],
+      packEnvelopeId: pack1.envelope_id,
       receiptRawText: receiptText,
       confirmationProof: wrongPurposeProof,
     });
 
     // 2) Wrong content hash: tampered confirmationProof must NOT grant human_authority
-    const tamperedHashProof = issueConfirmationProof(
-      normalizeConfirmationText('totally different text'),
+    const pack2 = svc.packReconcile({
+      projectId: 'proj_rp',
+      threadId: 'thr_rp',
+      sourceStreamIds: [a1.stream_id],
+    });
+    const tamperedHashProof = svc.issueLocalConfirmationProof(
+      'totally different text',
       'authorize_instruction',
       'local_cli',
     );
@@ -409,6 +433,7 @@ test('commitReconcile rejects mismatched confirmationProof hash and wrong purpos
       projectId: 'proj_rp',
       threadId: 'thr_rp',
       sourceStreamIds: [a1.stream_id],
+      packEnvelopeId: pack2.envelope_id,
       receiptRawText: receiptText,
       confirmationProof: tamperedHashProof,
     });
@@ -442,6 +467,14 @@ test('Full 3-phase user drill via thp web API: 7-AI merge -> Main checkpoint -> 
   };
 
   try {
+    const prepConfirm = async (contentText: string) => {
+      const ch = await post<{ challenge_id: string; content_sha256: string }>('/api/confirm/prepare', {
+        contentText,
+        purpose: 'authorize_instruction',
+      });
+      return { confirmChallengeId: ch.challenge_id, confirmContentSha256: ch.content_sha256 };
+    };
+
     // Phase 0: init Main
     const init = await post<{ thread_id: string; main_stream_id: string }>('/api/init', {
       projectId: 'p_drill',
@@ -451,34 +484,39 @@ test('Full 3-phase user drill via thp web API: 7-AI merge -> Main checkpoint -> 
     // Phase 1: Adopt 7 AIs (with host_session_id bound on ai_1) & Reconcile into Main
     const sourceStreams: string[] = [];
     for (let i = 1; i <= 7; i++) {
+      const rawText = `assistant: Finding from AI-${i} on module ${i}`;
+      const auth = i === 1 ? await prepConfirm(rawText) : {};
       const adopted = await post<{ stream_id: string }>('/api/adopt', {
         projectId: 'p_drill',
         threadId: 'thr_drill',
         sourceLabel: `ai_${i}`,
-        rawText: `assistant: Finding from AI-${i} on module ${i}`,
-        confirmAuthorize: i === 1,
+        rawText,
+        ...auth,
       });
       sourceStreams.push(adopted.stream_id);
     }
 
-    await post('/api/reconcile/pack', {
+    const pack1 = await post<{ envelope_id: string }>('/api/reconcile/pack', {
       projectId: 'p_drill',
       threadId: 'thr_drill',
       sourceStreamIds: sourceStreams,
       mainGoal: 'Unify 7 AIs before phase-2 implementation',
     });
+    const rec1Text = JSON.stringify({
+      reconciliation_receipt: true,
+      pack_envelope_id: pack1.envelope_id,
+      adopted_items: sourceStreams,
+      conflicts: [],
+      synthesis_summary: 'Main consolidated all 7 AIs cleanly.',
+      next_actions: ['Build core prototype'],
+    });
     await post('/api/reconcile/commit', {
       projectId: 'p_drill',
       threadId: 'thr_drill',
       sourceStreamIds: sourceStreams,
-      receiptRawText: JSON.stringify({
-        reconciliation_receipt: true,
-        adopted_items: sourceStreams,
-        conflicts: [],
-        synthesis_summary: 'Main consolidated all 7 AIs cleanly.',
-        next_actions: ['Build core prototype'],
-      }),
-      confirmAuthorize: true,
+      packEnvelopeId: pack1.envelope_id,
+      receiptRawText: rec1Text,
+      ...(await prepConfirm(rec1Text)),
     });
 
     // Phase 2: Work on Main, send cross-stream message from source 1 -> Main, test handoff lease reuse,
@@ -534,20 +572,23 @@ test('Full 3-phase user drill via thp web API: 7-AI merge -> Main checkpoint -> 
       /Invalid mailbox acknowledgement/,
     );
 
+    const ingMainText = JSON.stringify({
+      threadpass_handoff: true,
+      handoff_mode: 'model_authored',
+      base_anchor_id: ckptPrompt.anchor_id,
+      summary_text: 'Phase 2 Main milestone completed and ready to split into 2 subagents.',
+      recent_turns: [
+        { role: 'assistant', text: 'Completed storage engine prototype & redaction checks.' },
+      ],
+      mailbox_ack: { batch_id: ho1.offered_batch_id, message_ids: [mbSent.message_id] },
+    });
     const ingMain = await post<{ anchor_id: string; accepted_mailbox_ids: string[] }>('/api/ingest', {
       projectId: 'p_drill',
       threadId: 'thr_drill',
       streamId: init.main_stream_id,
-      rawText: JSON.stringify({
-        threadpass_handoff: true,
-        handoff_mode: 'model_authored',
-        summary_text: 'Phase 2 Main milestone completed and ready to split into 2 subagents.',
-        recent_turns: [
-          { role: 'assistant', text: 'Completed storage engine prototype & redaction checks.' },
-        ],
-        mailbox_ack: { batch_id: ho1.offered_batch_id, message_ids: [mbSent.message_id] },
-      }),
-      confirmAuthorize: true,
+      rawText: ingMainText,
+      expectedBaseAnchorId: ckptPrompt.anchor_id,
+      ...(await prepConfirm(ingMainText)),
     });
     assert.deepEqual(ingMain.accepted_mailbox_ids, [mbSent.message_id]);
 
@@ -584,17 +625,25 @@ test('Full 3-phase user drill via thp web API: 7-AI merge -> Main checkpoint -> 
       rawText: 'assistant: Subagent B finished web UI polish.',
     });
 
+    const pack2 = await post<{ envelope_id: string }>('/api/reconcile/pack', {
+      projectId: 'p_drill',
+      threadId: 'thr_drill',
+      sourceStreamIds: ['sub_a', 'sub_b'],
+    });
+    const rec2Text = JSON.stringify({
+      reconciliation_receipt: true,
+      pack_envelope_id: pack2.envelope_id,
+      adopted_items: ['sub_a: parser tests', 'sub_b: web UI polish'],
+      conflicts: [],
+      synthesis_summary: 'Both subagent deliverables integrated into Main.',
+    });
     await post('/api/reconcile/commit', {
       projectId: 'p_drill',
       threadId: 'thr_drill',
       sourceStreamIds: ['sub_a', 'sub_b'],
-      receiptRawText: JSON.stringify({
-        reconciliation_receipt: true,
-        adopted_items: ['sub_a: parser tests', 'sub_b: web UI polish'],
-        conflicts: [],
-        synthesis_summary: 'Both subagent deliverables integrated into Main.',
-      }),
-      confirmAuthorize: true,
+      packEnvelopeId: pack2.envelope_id,
+      receiptRawText: rec2Text,
+      ...(await prepConfirm(rec2Text)),
     });
 
     const finalFsck = await post<{ ok: boolean; stream_health: Record<string, string> }>('/api/fsck', {
@@ -669,15 +718,21 @@ test('Security regressions: unsafe identifiers blocked (XSS/traversal), Web UI a
     const htmlText = await htmlRes.text();
     assert.equal(htmlText.includes('div.innerHTML ='), false);
 
-    // 3. Non-TTY CLI `reconcile commit --authorize` without `--confirm-interactive` MUST exit non-zero
+    // 3. Non-TTY CLI `reconcile commit --authorize` MUST exit non-zero (even with legacy --confirm-interactive)
     const adopted = svc.adoptExternal({
       projectId: 'proj_sec',
       threadId: 'thr_sec',
       streamId: 'strm_ext_1',
       rawText: 'assistant: opinion 1',
     });
+    const secPack = svc.packReconcile({
+      projectId: 'proj_sec',
+      threadId: 'thr_sec',
+      sourceStreamIds: [adopted.stream_id],
+    });
     const receiptJson = JSON.stringify({
       reconciliation_receipt: true,
+      pack_envelope_id: secPack.envelope_id,
       adopted_items: [adopted.stream_id],
       conflicts: [],
       synthesis_summary: 'Attempt non-interactive escalation',
@@ -693,31 +748,8 @@ test('Security regressions: unsafe identifiers blocked (XSS/traversal), Web UI a
         'proj_sec',
         '--thread',
         'thr_sec',
-        '--sources',
-        adopted.stream_id,
-        '--text',
-        receiptJson,
-        '--authorize',
-      ],
-      {
-        env: { ...process.env, THREADPASS_HOME: home },
-        encoding: 'utf8',
-      },
-    );
-    assert.notEqual(cliRun.status, 0);
-    assert.match(cliRun.stderr, /authorize_instruction requires interactive confirmation/);
-
-    // Passing explicit --confirm-interactive succeeds cleanly
-    const cliAllowed = spawnSync(
-      process.execPath,
-      [
-        cliPath,
-        'reconcile',
-        'commit',
-        '--project',
-        'proj_sec',
-        '--thread',
-        'thr_sec',
+        '--pack',
+        secPack.envelope_id,
         '--sources',
         adopted.stream_id,
         '--text',
@@ -730,7 +762,33 @@ test('Security regressions: unsafe identifiers blocked (XSS/traversal), Web UI a
         encoding: 'utf8',
       },
     );
-    assert.equal(cliAllowed.status, 0);
+    assert.notEqual(cliRun.status, 0);
+    assert.match(cliRun.stderr, /authorize_instruction requires an interactive terminal/);
+
+    // Non-TTY CLI commit WITHOUT --authorize succeeds with non-human_authority trust tier
+    const cliNonAuth = spawnSync(
+      process.execPath,
+      [
+        cliPath,
+        'reconcile',
+        'commit',
+        '--project',
+        'proj_sec',
+        '--thread',
+        'thr_sec',
+        '--pack',
+        secPack.envelope_id,
+        '--sources',
+        adopted.stream_id,
+        '--text',
+        receiptJson,
+      ],
+      {
+        env: { ...process.env, THREADPASS_HOME: home },
+        encoding: 'utf8',
+      },
+    );
+    assert.equal(cliNonAuth.status, 0, cliNonAuth.stderr);
   } finally {
     await web.close();
     fs.rmSync(home, { recursive: true, force: true });
@@ -850,8 +908,8 @@ test('Real-world LLM regressions: structured state survival, placeholder host_se
     assert.equal(parsedRec.conflicts.length, 1);
     assert.equal(parsedRec.next_actions[0], 'Execute real 2-AI session migration');
 
-    const recConfirm = issueConfirmationProof(
-      normalizeConfirmationText(rawReceipt),
+    const recConfirm = svc.issueLocalConfirmationProof(
+      rawReceipt,
       'authorize_instruction',
       'local_cli',
     );
@@ -859,6 +917,7 @@ test('Real-world LLM regressions: structured state survival, placeholder host_se
       projectId: 'proj_llm',
       threadId: 'thr_llm',
       sourceStreamIds: [a1.stream_id, a2.stream_id],
+      packEnvelopeId: recPack.envelope_id,
       receiptRawText: rawReceipt,
       confirmationProof: recConfirm,
     });
@@ -1288,11 +1347,17 @@ test('HostTranscriptLocator: local machine path, other-machine, cloud-only (part
     assert.ok(recPack.full_markdown.includes('[NO_TRANSCRIPT_FILE / PLACEHOLDER | stream=strm_bare]'));
     assert.ok(recPack.full_markdown.includes('PARTIAL raw transcript visibility'));
 
-    // Commit reconcile & verify packHandoff + forkDispatch preserve reachability notices cleanly
+    // Commit reconcile using a dedicated packed subset & verify packHandoff + forkDispatch preserve reachability notices cleanly
+    const recPackSubset = svc.packReconcile({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+      sourceStreamIds: ['strm_local', 'strm_cloud', upJson.stream_id],
+    });
     svc.commitReconcile({
       projectId: 'proj_loc',
       threadId: 'thr_loc',
       sourceStreamIds: ['strm_local', 'strm_cloud', upJson.stream_id],
+      packEnvelopeId: recPackSubset.envelope_id,
       receiptRawText: JSON.stringify({
         reconciliation_receipt: true,
         adopted_items: ['strm_local', 'strm_cloud'],
@@ -1471,10 +1536,16 @@ test('Multipart model output assembly: out-of-order adopt, open-ended ingest, re
         next_actions: ['Publish release'],
       }) +
       '\n```';
+    const recPack = svc.packReconcile({
+      projectId: 'proj_mp',
+      threadId: 'thr_mp',
+      sourceStreamIds: ['strm_mp_adopt'],
+    });
     const recRes = svc.commitReconcile({
       projectId: 'proj_mp',
       threadId: 'thr_mp',
       sourceStreamIds: ['strm_mp_adopt'],
+      packEnvelopeId: recPack.envelope_id,
       receiptRawText: `${recP1}\n\n${recP2}`,
     });
     assert.deepEqual(recRes.assembled_parts, { group_id: 'grp_rec_1', total_parts: 2 });
@@ -1626,9 +1697,10 @@ test('Identity continuity framing and sensitive-model anti-false-positive prompt
       projectId: 'proj_safe',
       threadId: 'thr_safe',
       sourceStreamIds: ['strm_alpha', 'strm_beta'],
+      packEnvelopeId: recPack.envelope_id,
       receiptRawText: recText,
-      confirmationProof: issueConfirmationProof(
-        normalizeConfirmationText(recText),
+      confirmationProof: svc.issueLocalConfirmationProof(
+        recText,
         'authorize_instruction',
         'local_cli',
       ),
@@ -1699,6 +1771,480 @@ test('Identity continuity framing and sensitive-model anti-false-positive prompt
     assert.ok(html.includes('追加分片文件'));
   } finally {
     await web.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('H1 & H2 audit fixes: Reconcile Pack snapshot binding and Checkpoint base_anchor_id stale guard', () => {
+  const home = makeTempHome('h1-h2-audit');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+    const init = svc.initThread({ projectId: 'proj_h12', threadId: 'thr_h12', mainStreamId: 'strm_main' });
+    svc.adoptExternal({
+      projectId: 'proj_h12',
+      threadId: 'thr_h12',
+      sourceLabel: 'src_a',
+      streamId: 'strm_a',
+      rawText: 'assistant: Proposal A v1',
+    });
+    svc.adoptExternal({
+      projectId: 'proj_h12',
+      threadId: 'thr_h12',
+      sourceLabel: 'src_b',
+      streamId: 'strm_b',
+      rawText: 'assistant: Proposal B v1',
+    });
+
+    const pack = svc.packReconcile({
+      projectId: 'proj_h12',
+      threadId: 'thr_h12',
+      sourceStreamIds: ['strm_a', 'strm_b'],
+    });
+    assert.ok(pack.pack_manifest.pack_manifest_hash);
+    assert.equal(pack.pack_manifest.sources.length, 2);
+
+    const receipt = JSON.stringify({
+      reconciliation_receipt: true,
+      pack_envelope_id: pack.envelope_id,
+      adopted_items: ['strm_a', 'strm_b'],
+      conflicts: [],
+      synthesis_summary: 'Merged A + B v1.',
+    });
+
+    // H1: commit without packEnvelopeId (and without pack_envelope_id inside receipt) fails closed
+    assert.throws(
+      () =>
+        svc.commitReconcile({
+          projectId: 'proj_h12',
+          threadId: 'thr_h12',
+          sourceStreamIds: ['strm_a', 'strm_b'],
+          receiptRawText: JSON.stringify({
+            reconciliation_receipt: true,
+            adopted_items: ['strm_a', 'strm_b'],
+            conflicts: [],
+            synthesis_summary: 'Unbound receipt',
+          }),
+        }),
+      ReconcileDriftError,
+    );
+
+    // H1: mismatched sourceStreamIds set vs packed manifest fails closed
+    assert.throws(
+      () =>
+        svc.commitReconcile({
+          projectId: 'proj_h12',
+          threadId: 'thr_h12',
+          sourceStreamIds: ['strm_a'],
+          packEnvelopeId: pack.envelope_id,
+          receiptRawText: receipt,
+        }),
+      ReconcileDriftError,
+    );
+
+    // H1: advance strm_a after pack -> commit MUST reject drift
+    svc.ingestReply({
+      projectId: 'proj_h12',
+      threadId: 'thr_h12',
+      streamId: 'strm_a',
+      rawText: 'assistant: Proposal A v2 arrived mid-reconcile',
+    });
+    assert.throws(
+      () =>
+        svc.commitReconcile({
+          projectId: 'proj_h12',
+          threadId: 'thr_h12',
+          sourceStreamIds: ['strm_a', 'strm_b'],
+          packEnvelopeId: pack.envelope_id,
+          receiptRawText: receipt,
+        }),
+      ReconcileDriftError,
+    );
+
+    // Re-pack cleanly captures A v2 + B v1
+    const packFresh = svc.packReconcile({
+      projectId: 'proj_h12',
+      threadId: 'thr_h12',
+      sourceStreamIds: ['strm_a', 'strm_b'],
+    });
+    const ckptPrompt = svc.getCheckpointPrompt('proj_h12', 'thr_h12', init.main_stream_id);
+
+    // Advance Main first via valid reconcile commit
+    const committed = svc.commitReconcile({
+      projectId: 'proj_h12',
+      threadId: 'thr_h12',
+      sourceStreamIds: ['strm_a', 'strm_b'],
+      packEnvelopeId: packFresh.envelope_id,
+      receiptRawText: JSON.stringify({
+        reconciliation_receipt: true,
+        pack_envelope_id: packFresh.envelope_id,
+        adopted_items: ['strm_a', 'strm_b'],
+        conflicts: [],
+        synthesis_summary: 'Merged A v2 + B v1 cleanly.',
+      }),
+    });
+
+    // H2: old window submits checkpoint citing stale base_anchor_id -> rejected with StaleCheckpointBaselineError
+    assert.throws(
+      () =>
+        svc.ingestReply({
+          projectId: 'proj_h12',
+          threadId: 'thr_h12',
+          streamId: init.main_stream_id,
+          rawText: JSON.stringify({
+            threadpass_handoff: true,
+            base_anchor_id: ckptPrompt.anchor_id,
+            summary_text: 'Stale work based on pre-reconcile anchor',
+            recent_turns: [{ role: 'assistant', text: 'Outdated output' }],
+          }),
+        }),
+      StaleCheckpointBaselineError,
+    );
+
+    // H2: submitting with current head anchor succeeds cleanly
+    const okIngest = svc.ingestReply({
+      projectId: 'proj_h12',
+      threadId: 'thr_h12',
+      streamId: init.main_stream_id,
+      rawText: JSON.stringify({
+        threadpass_handoff: true,
+        base_anchor_id: committed.anchor_id,
+        summary_text: 'Fresh work grounded on latest anchor',
+        recent_turns: [{ role: 'assistant', text: 'Up-to-date output' }],
+      }),
+    });
+    assert.ok(okIngest.anchor_id);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('H3 & H4 audit fixes: Signed non-replayable ConfirmationProof, 2-step Web challenge, and system-derived human_confirmed', async () => {
+  const home = makeTempHome('h3-h4-audit');
+  const svc = new ThreadPassService({ homeDir: home });
+  const web = await startThreadPassWeb({ service: svc, idleTimeoutMs: 60_000 });
+  try {
+    const init = svc.initThread({ projectId: 'proj_h34', threadId: 'thr_h34', mainStreamId: 'strm_main' });
+
+    // H3: Calling issueConfirmationProof with empty secret throws; manually crafted unsigned proof never grants human_authority
+    assert.throws(
+      () => issueConfirmationProof('text', 'authorize_instruction', 'local_cli', ''),
+      /requires a local device Ed25519 identity or non-empty HMAC secret/,
+    );
+    const unsignedFakeProof = {
+      nonce: '0123456789abcdef0123456789abcdef',
+      content_sha256: sha256Hex(normalizeConfirmationText('assistant: unsigned fake')),
+      purpose: 'authorize_instruction' as const,
+      channel: 'local_cli' as const,
+      confirmed_at: new Date().toISOString(),
+    };
+    const adoptUnsigned = svc.adoptExternal({
+      projectId: 'proj_h34',
+      threadId: 'thr_h34',
+      sourceLabel: 'unsigned_src',
+      streamId: 'strm_unsigned',
+      rawText: 'assistant: unsigned fake',
+      confirmationProof: unsignedFakeProof,
+    });
+    assert.equal(adoptUnsigned.trust_tier, 'unverified_import');
+
+    // H3: Raw Web confirmAuthorize:true without /api/confirm/prepare fails (400); challenge cannot be reused twice
+    const hdrs = { 'Content-Type': 'application/json', 'X-ThreadPass-Token': web.token };
+    const bypassRes = await fetch(`http://127.0.0.1:${web.port}/api/adopt`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_h34',
+        threadId: 'thr_h34',
+        sourceLabel: 'bypass',
+        rawText: 'assistant: attempt raw confirmAuthorize',
+        confirmAuthorize: true,
+      }),
+    });
+    assert.equal(bypassRes.status, 400);
+
+    const webText = 'assistant: properly reviewed via 2-step challenge';
+    const prepRes = await fetch(`http://127.0.0.1:${web.port}/api/confirm/prepare`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({ contentText: webText, purpose: 'authorize_instruction' }),
+    });
+    assert.equal(prepRes.status, 200);
+    const prep = (await prepRes.json()) as { challenge_id: string; content_sha256: string };
+    const goodWebAdopt = await fetch(`http://127.0.0.1:${web.port}/api/adopt`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_h34',
+        threadId: 'thr_h34',
+        sourceLabel: 'web_verified',
+        rawText: webText,
+        confirmChallengeId: prep.challenge_id,
+        confirmContentSha256: prep.content_sha256,
+      }),
+    });
+    assert.equal(goodWebAdopt.status, 200);
+    assert.equal(((await goodWebAdopt.json()) as { trust_tier: string }).trust_tier, 'human_authority');
+
+    // Reusing the same Web challenge ID MUST fail (single-use)
+    const reuseRes = await fetch(`http://127.0.0.1:${web.port}/api/adopt`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_h34',
+        threadId: 'thr_h34',
+        sourceLabel: 'web_reuse',
+        rawText: webText,
+        confirmChallengeId: prep.challenge_id,
+      }),
+    });
+    assert.equal(reuseRes.status, 400);
+
+    // H3: Single-use Ed25519 proof replay is rejected even after fsck --rebuild
+    const signedText = 'assistant: signed once only';
+    const signedProof = svc.issueLocalConfirmationProof(signedText, 'authorize_instruction', 'local_cli');
+    const firstAdopt = svc.adoptExternal({
+      projectId: 'proj_h34',
+      threadId: 'thr_h34',
+      sourceLabel: 'signed_1',
+      streamId: 'strm_signed_1',
+      rawText: signedText,
+      confirmationProof: signedProof,
+    });
+    assert.equal(firstAdopt.trust_tier, 'human_authority');
+
+    const rebuilt = svc.runFsck('proj_h34', 'thr_h34', { rebuildSqlite: true });
+    assert.equal(rebuilt.ok, true);
+
+    const replayAdopt = svc.adoptExternal({
+      projectId: 'proj_h34',
+      threadId: 'thr_h34',
+      sourceLabel: 'signed_replay',
+      streamId: 'strm_signed_replay',
+      rawText: signedText,
+      confirmationProof: signedProof,
+    });
+    assert.equal(replayAdopt.trust_tier, 'unverified_import');
+    assert.ok(replayAdopt.warnings.some((w) => w.includes('replay rejected')));
+
+    // H4: Model self-claiming human_confirmed:true WITHOUT human confirmationProof persists human_confirmed:false
+    const recPack1 = svc.packReconcile({
+      projectId: 'proj_h34',
+      threadId: 'thr_h34',
+      sourceStreamIds: ['strm_signed_1'],
+    });
+    const receiptUnconfirmed = JSON.stringify({
+      reconciliation_receipt: true,
+      pack_envelope_id: recPack1.envelope_id,
+      adopted_items: ['strm_signed_1'],
+      conflicts: [
+        {
+          topic: 'API Versioning',
+          kind: 'semantic',
+          positions: ['a: v1', 'b: v2'],
+          resolution: 'Use v2',
+          human_confirmed: true,
+        },
+      ],
+      synthesis_summary: 'Model claimed human_confirmed without proof.',
+    });
+    svc.commitReconcile({
+      projectId: 'proj_h34',
+      threadId: 'thr_h34',
+      sourceStreamIds: ['strm_signed_1'],
+      packEnvelopeId: recPack1.envelope_id,
+      receiptRawText: receiptUnconfirmed,
+    });
+
+    // H4: With valid ConfirmationProof + confirmedConflictTopics, system sets human_confirmed selectively + binds nonce
+    const recPack2 = svc.packReconcile({
+      projectId: 'proj_h34',
+      threadId: 'thr_h34',
+      sourceStreamIds: ['strm_signed_1'],
+    });
+    const receiptConfirmed = JSON.stringify({
+      reconciliation_receipt: true,
+      pack_envelope_id: recPack2.envelope_id,
+      adopted_items: ['strm_signed_1'],
+      conflicts: [
+        {
+          topic: 'Auth Mode',
+          kind: 'semantic',
+          positions: ['a: JWT', 'b: Cookie'],
+          resolution: 'Cookie + CSRF',
+          needs_human_confirmation: true,
+        },
+        {
+          topic: 'Logging Level',
+          kind: 'semantic',
+          positions: ['a: info', 'b: warn'],
+          resolution: 'info',
+          human_confirmed: true,
+        },
+      ],
+      synthesis_summary: 'Operator reviewed Auth Mode only.',
+    });
+    const recProof = svc.issueLocalConfirmationProof(
+      receiptConfirmed,
+      'authorize_instruction',
+      'local_cli',
+    );
+    svc.commitReconcile({
+      projectId: 'proj_h34',
+      threadId: 'thr_h34',
+      sourceStreamIds: ['strm_signed_1'],
+      packEnvelopeId: recPack2.envelope_id,
+      receiptRawText: receiptConfirmed,
+      confirmationProof: recProof,
+      confirmedConflictTopics: ['Auth Mode'],
+    });
+
+    const mainLines = svc.peekStream('proj_h34', 'thr_h34', init.main_stream_id);
+    const recRecords = mainLines
+      .filter((l) => l.kind === 'control' && l.payload.type === 'reconciliation_record')
+      .map((l) =>
+        l.kind === 'control' && l.payload.type === 'reconciliation_record'
+          ? l.payload.record
+          : null,
+      )
+      .filter((r): r is NonNullable<typeof r> => Boolean(r));
+    assert.equal(recRecords.length, 2);
+    assert.equal(recRecords[0].conflicts[0].human_confirmed, false);
+    assert.equal(recRecords[1].conflicts[0].topic, 'Auth Mode');
+    assert.equal(recRecords[1].conflicts[0].human_confirmed, true);
+    assert.equal(recRecords[1].conflicts[0].confirmation_proof_nonce, recProof.nonce);
+    assert.equal(recRecords[1].conflicts[1].topic, 'Logging Level');
+    assert.equal(recRecords[1].conflicts[1].human_confirmed, false);
+  } finally {
+    await web.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('M1-M4 audit fixes: strict multipart guards, unverified model locator isolation, mixed_origin, and balanced XML chunking', () => {
+  const home = makeTempHome('m1-m4-audit');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+    svc.initThread({ projectId: 'proj_m14', threadId: 'thr_m14', mainStreamId: 'strm_main' });
+
+    // M1: fixed total_parts without explicit is_final=true on final part throws; missing part_group_id throws;
+    // excessive total_parts throws; multiple distinct non-multipart objects throw
+    assert.throws(
+      () =>
+        parseExternalConversationInput(
+          [
+            JSON.stringify({ threadpass_handoff: true, part_group_id: 'g1', part_index: 1, total_parts: 2, is_final: false, summary_text: 'p1' }),
+            JSON.stringify({ threadpass_handoff: true, part_group_id: 'g1', part_index: 2, total_parts: 2, summary_text: 'p2 missing is_final' }),
+          ].join('\n\n'),
+          'bad_m1_final',
+        ),
+      IncompleteMultipartOutputError,
+    );
+    assert.throws(
+      () =>
+        parseExternalConversationInput(
+          JSON.stringify({ threadpass_handoff: true, part_index: 1, total_parts: 1, is_final: true, summary_text: 'no group' }),
+          'bad_m1_gid',
+        ),
+      IncompleteMultipartOutputError,
+    );
+    assert.throws(
+      () =>
+        parseExternalConversationInput(
+          JSON.stringify({ threadpass_handoff: true, part_group_id: 'gbig', part_index: 1, total_parts: 999999, is_final: false, summary_text: 'dos' }),
+          'bad_m1_dos',
+        ),
+      IncompleteMultipartOutputError,
+    );
+    assert.throws(
+      () =>
+        parseExternalConversationInput(
+          [
+            JSON.stringify({ threadpass_handoff: true, summary_text: 'first distinct obj' }),
+            JSON.stringify({ threadpass_handoff: true, summary_text: 'second distinct obj' }),
+          ].join('\n\n'),
+          'bad_m1_multi',
+        ),
+      IncompleteMultipartOutputError,
+    );
+
+    // M2: Model-reported transcript path & host_session_id MUST NOT promote to LOCAL_GREPPABLE or bind host_bindings
+    const existingDiskFile = path.join(home, 'real_file_on_disk.jsonl');
+    fs.writeFileSync(existingDiskFile, '{"msg":"secret"}\n', 'utf8');
+    const modAdopted = svc.adoptExternal({
+      projectId: 'proj_m14',
+      threadId: 'thr_m14',
+      sourceLabel: 'model_lying',
+      streamId: 'strm_model_loc',
+      rawText: JSON.stringify({
+        threadpass_handoff: true,
+        host_session_id: 'model_claimed_hs_1',
+        transcript_file_path: existingDiskFile,
+        summary_text: 'Model self-reported a local disk file path',
+        recent_turns: [{ role: 'assistant', text: 'Reported path' }],
+      }),
+    });
+    assert.equal(modAdopted.transcript_locators[0]?.locator_origin, 'model_reported');
+    assert.equal(modAdopted.transcript_locators[0]?.machine_device_id, undefined);
+    const store = svc.engine.openStore('proj_m14', 'thr_m14');
+    try {
+      assert.equal(store.lookupHostBinding('model_claimed_hs_1'), null);
+    } finally {
+      store.close();
+    }
+
+    // M3: Stream mixing human_authority + untrusted_peer must render outer XML origin="mixed_origin" (not user_confirmed)
+    const authText = 'user: Verified operator baseline direction';
+    const authProof = svc.issueLocalConfirmationProof(authText, 'authorize_instruction', 'local_cli');
+    svc.adoptExternal({
+      projectId: 'proj_m14',
+      threadId: 'thr_m14',
+      sourceLabel: 'mixed_src & <test>',
+      streamId: 'strm_mixed',
+      rawText: authText,
+      confirmationProof: authProof,
+    });
+    svc.ingestReply({
+      projectId: 'proj_m14',
+      threadId: 'thr_m14',
+      streamId: 'strm_mixed',
+      rawText: 'assistant: Unverified follow-up reply ' + 'Z'.repeat(650),
+    });
+
+    const m34Pack = svc.packReconcile({
+      projectId: 'proj_m14',
+      threadId: 'thr_m14',
+      sourceStreamIds: ['strm_model_loc', 'strm_mixed'],
+      budget: {
+        effective_context_budget: 100_000,
+        per_turn_input_limit: 900,
+        budget_confidence: 'heuristic',
+        supports_attachments: false,
+      },
+    });
+    assert.ok(m34Pack.full_markdown.includes('MODEL_REPORTED_PATH_UNVERIFIED'));
+    assert.equal(m34Pack.full_markdown.includes(`LOCAL_GREPPABLE on`), false);
+    assert.ok(m34Pack.full_markdown.includes('origin="mixed_origin"'));
+    assert.equal(m34Pack.full_markdown.includes('origin="user_confirmed"'), false);
+    assert.ok(m34Pack.full_markdown.includes('Source Stream #2: strm_mixed (origin=mixed_origin)'));
+
+    // M4: XML attributes escape `&` and `< >`; EVERY chunk preserves length <= 900 AND balanced open/close tags
+    const attrCheck = renderNonInstructionFence({
+      sourceLabel: 'A & B <test> "q" \'s\'',
+      trustTier: 'mixed_origin',
+      anchorOrRef: 'ref&1',
+      bodyText: 'hello',
+    });
+    assert.ok(attrCheck.includes('source="A &amp; B &lt;test&gt; &quot;q&quot; &apos;s&apos;"'));
+    assert.ok(attrCheck.includes('ref="ref&amp;1"'));
+
+    assert.ok(m34Pack.parts.length >= 2);
+    for (const p of m34Pack.parts) {
+      assert.ok(p.text.length <= 900, `Part ${p.part_index} exceeded 900 chars: ${p.text.length}`);
+      const opens = [...p.text.matchAll(/<(archived_reference_[a-f0-9]+)\b/g)].map((m) => m[1]);
+      const closes = [...p.text.matchAll(/<\/(archived_reference_[a-f0-9]+)>/g)].map((m) => m[1]);
+      assert.deepEqual(opens, closes, `Unbalanced XML reference tags inside part ${p.part_index}`);
+    }
+  } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

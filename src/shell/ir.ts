@@ -15,6 +15,9 @@ export interface ParsedTurnMessage {
   source_ref?: string;
 }
 
+export const MAX_MULTIPART_PARTS = 64;
+export const MAX_MULTIPART_INPUT_BYTES = 4 * 1024 * 1024;
+
 export interface AssembledMultipartInfo {
   group_id: string;
   total_parts: number;
@@ -31,6 +34,7 @@ export interface ParsedAdoptPackage {
   mode: HandoffMode;
   continuity_level: ContinuityLevel;
   source_label: string;
+  base_anchor_id?: string;
   host_session_id?: string;
   transcript_file_path?: string;
   machine_hostname?: string;
@@ -129,6 +133,11 @@ export function extractStructuredJsonObjects(
   rawText: string,
   expectedKeys: readonly string[],
 ): ExtractedJsonObjectsResult {
+  if (Buffer.byteLength(rawText, 'utf8') > MAX_MULTIPART_INPUT_BYTES) {
+    throw new IncompleteMultipartOutputError(
+      `Structured input exceeds maximum allowed size (${MAX_MULTIPART_INPUT_BYTES} bytes)`,
+    );
+  }
   const trimmed = rawText.trim();
   if (!trimmed) {
     return { objects: [], looksLikeJson: false };
@@ -247,8 +256,9 @@ function hasMultipartFields(obj: Record<string, unknown>): boolean {
 
 /**
  * Validates and orders single- or multi-part model JSON outputs.
- * When multipart envelope metadata is present, enforces group consistency,
- * duplicate conflict detection, missing-part fail-closed erroring, and final-part termination.
+ * When multipart envelope metadata is present, enforces per-part group_id, part_index,
+ * explicit boolean is_final, max part ceiling, missing-part fail-closed erroring,
+ * and refusal when multiple distinct non-multipart JSON objects appear together.
  */
 export function assembleMultipartObjects(objects: readonly Record<string, unknown>[]): {
   parts: Record<string, unknown>[];
@@ -259,7 +269,27 @@ export function assembleMultipartObjects(objects: readonly Record<string, unknow
   }
   const mpObjs = objects.filter(hasMultipartFields);
   if (mpObjs.length === 0) {
-    return { parts: [objects[objects.length - 1]] };
+    if (objects.length > 1) {
+      const firstCan = canonicalJson(objects[0]);
+      const allSame = objects.every((o) => canonicalJson(o) === firstCan);
+      if (!allSame) {
+        throw new IncompleteMultipartOutputError(
+          `Found ${objects.length} distinct ThreadPass JSON objects without multipart metadata (part_group_id, part_index, is_final); refusing to silently drop earlier objects`,
+        );
+      }
+    }
+    return { parts: [objects[0]] };
+  }
+
+  if (mpObjs.length !== objects.length) {
+    throw new IncompleteMultipartOutputError(
+      'Mixed multipart and non-multipart ThreadPass JSON objects in input; refusing partial assembly',
+    );
+  }
+  if (mpObjs.length > MAX_MULTIPART_PARTS * 2) {
+    throw new IncompleteMultipartOutputError(
+      `Multipart output exceeds maximum object ceiling (${mpObjs.length} > ${MAX_MULTIPART_PARTS * 2})`,
+    );
   }
 
   const groupIds = new Set<string>();
@@ -269,24 +299,47 @@ export function assembleMultipartObjects(objects: readonly Record<string, unknow
   const nonFinalIndices = new Set<number>();
 
   for (const obj of mpObjs) {
-    if (typeof obj.part_group_id === 'string' && obj.part_group_id.trim()) {
-      groupIds.add(obj.part_group_id.trim());
-    }
-    const idx = obj.part_index;
-    if (typeof idx !== 'number' || !Number.isInteger(idx) || idx < 1) {
+    const gid = typeof obj.part_group_id === 'string' ? obj.part_group_id.trim() : '';
+    if (!gid) {
       throw new IncompleteMultipartOutputError(
-        `Multipart output entry is missing a valid positive integer part_index (got ${JSON.stringify(idx)})`,
+        'Multipart output entry is missing a non-empty string part_group_id',
       );
     }
+    groupIds.add(gid);
+
+    const idx = obj.part_index;
+    if (
+      typeof idx !== 'number' ||
+      !Number.isInteger(idx) ||
+      idx < 1 ||
+      idx > MAX_MULTIPART_PARTS
+    ) {
+      throw new IncompleteMultipartOutputError(
+        `Multipart output entry must have integer part_index in 1..${MAX_MULTIPART_PARTS} (got ${JSON.stringify(idx)})`,
+      );
+    }
+
+    if (typeof obj.is_final !== 'boolean') {
+      throw new IncompleteMultipartOutputError(
+        `Multipart output part ${idx} (group=${gid}) must specify explicit boolean is_final`,
+      );
+    }
+
     if (obj.total_parts !== undefined && obj.total_parts !== null) {
       const tot = obj.total_parts;
-      if (typeof tot !== 'number' || !Number.isInteger(tot) || tot < 1) {
+      if (
+        typeof tot !== 'number' ||
+        !Number.isInteger(tot) ||
+        tot < 1 ||
+        tot > MAX_MULTIPART_PARTS
+      ) {
         throw new IncompleteMultipartOutputError(
-          `Multipart output part ${idx} has invalid total_parts (${JSON.stringify(tot)})`,
+          `Multipart output part ${idx} has invalid total_parts (expected 1..${MAX_MULTIPART_PARTS}, got ${JSON.stringify(tot)})`,
         );
       }
       declaredTotals.add(tot);
     }
+
     const existing = byIndex.get(idx);
     if (existing) {
       if (canonicalJson(existing) !== canonicalJson(obj)) {
@@ -299,7 +352,7 @@ export function assembleMultipartObjects(objects: readonly Record<string, unknow
     }
     if (obj.is_final === true) {
       finalIndices.add(idx);
-    } else if (obj.is_final === false) {
+    } else {
       nonFinalIndices.add(idx);
     }
   }
@@ -315,7 +368,7 @@ export function assembleMultipartObjects(objects: readonly Record<string, unknow
     );
   }
 
-  const groupId = [...groupIds][0] ?? 'default';
+  const groupId = [...groupIds][0];
   let expectedTotal: number;
 
   if (declaredTotals.size === 1) {
@@ -334,9 +387,9 @@ export function assembleMultipartObjects(objects: readonly Record<string, unknow
         );
       }
     }
-    if (nonFinalIndices.has(expectedTotal)) {
+    if (!finalIndices.has(expectedTotal) || nonFinalIndices.has(expectedTotal)) {
       throw new IncompleteMultipartOutputError(
-        `Multipart output (group=${groupId}) marked final part ${expectedTotal} with is_final=false`,
+        `Multipart output (group=${groupId}) final part ${expectedTotal} must have is_final=true`,
       );
     }
   } else {
@@ -479,6 +532,7 @@ export function parseExternalConversationInput(
 
     let mode: HandoffMode = 'model_authored';
     let resolvedLabel: string | undefined;
+    let baseAnchorId: string | undefined;
     let hostSessionId: string | undefined;
     let transcriptFilePath: string | undefined;
     let machineHostname: string | undefined;
@@ -516,6 +570,15 @@ export function parseExternalConversationInput(
       }
       if (!resolvedLabel && typeof obj.source_label === 'string' && obj.source_label.trim()) {
         resolvedLabel = obj.source_label.trim();
+      }
+      const partBaseAnchor = normalizeOptionalMetaString(obj.base_anchor_id);
+      if (partBaseAnchor) {
+        if (baseAnchorId && baseAnchorId !== partBaseAnchor) {
+          throw new IncompleteMultipartOutputError(
+            `Conflicting base_anchor_id across multipart output (${baseAnchorId} vs ${partBaseAnchor})`,
+          );
+        }
+        baseAnchorId = partBaseAnchor;
       }
       hostSessionId ??= normalizeHostSessionId(obj.host_session_id);
       transcriptFilePath ??= normalizeOptionalMetaString(obj.transcript_file_path);
@@ -583,6 +646,7 @@ export function parseExternalConversationInput(
       continuity_level:
         mode === 'evidence_based' ? 'Evidence Recovery' : 'Prompt Reconstruction',
       source_label: resolvedLabel ?? sourceLabel,
+      ...(baseAnchorId ? { base_anchor_id: baseAnchorId } : {}),
       host_session_id: hostSessionId,
       transcript_file_path: transcriptFilePath,
       machine_hostname: machineHostname,

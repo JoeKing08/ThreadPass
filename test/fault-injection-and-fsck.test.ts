@@ -831,10 +831,16 @@ test('runFsck detects offline Coordinator Journal divergence across synced devic
         }),
       /unresolved divergent Coordinator Journal heads/,
     );
+    const recPack = svcA.packReconcile({
+      projectId: 'proj_jd',
+      threadId: 'thr_jd',
+      sourceStreamIds: ['strm_ext_a', 'strm_ext_b'],
+    });
     svcA.commitReconcile({
       projectId: 'proj_jd',
       threadId: 'thr_jd',
       sourceStreamIds: ['strm_ext_a', 'strm_ext_b'],
+      packEnvelopeId: recPack.envelope_id,
       receiptRawText: JSON.stringify({
         reconciliation_receipt: true,
         adopted_items: ['strm_ext_a', 'strm_ext_b'],

@@ -18,6 +18,7 @@ import {
   SCHEMA_VERSION,
   type AdoptedSourceManifest,
   type ConfirmationProof,
+  type ConfirmationPurpose,
   type ControlRecord,
   type DispatchRecoveryCapsule,
   type EventRecord,
@@ -27,11 +28,16 @@ import {
   type JournalEventRecord,
   type LineageAnchor,
   type NotifyReceiptRecord,
+  type ProvenanceChain,
+  type ReconcilePackManifest,
+  type ReconcilePackSourceSnapshot,
   type ReconciliationRecord,
   type StreamShardLine,
   type TrustTier,
 } from '../core/types.js';
+import { ensureExclusiveAcl, publishImmutable } from '../profile/local-offline/acl-and-fs.js';
 import {
+  loadTrustedDeviceKeys,
   pinTrustedDeviceKey,
   updateTrustedDeviceKeyStatus,
 } from '../profile/local-offline/crypto-keys.js';
@@ -68,9 +74,12 @@ import {
 import {
   computeTrustTier,
   formatOriginLabel,
+  issueConfirmationProof,
   normalizeConfirmationText,
   renderNonInstructionFence,
   TRUST_ADAPTER_VERSION,
+  type ConfirmationVerifier,
+  type ReferenceOriginSummary,
 } from './trust.js';
 import { captureWorkspaceManifest } from './workspace.js';
 
@@ -96,6 +105,20 @@ export class ReleaseGateBlockedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ReleaseGateBlockedError';
+  }
+}
+
+export class ReconcileDriftError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReconcileDriftError';
+  }
+}
+
+export class StaleCheckpointBaselineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StaleCheckpointBaselineError';
   }
 }
 
@@ -171,6 +194,48 @@ export class ThreadPassService {
     };
   }
 
+  /**
+   * Issues an Ed25519 device-signed ConfirmationProof bound to the local operator's device key.
+   */
+  issueLocalConfirmationProof(
+    rawText: string,
+    purpose: ConfirmationPurpose,
+    channel: 'local_cli' | 'thp_web',
+  ): ConfirmationProof {
+    return issueConfirmationProof(rawText, purpose, channel, {
+      identity: this.engine.identity,
+    });
+  }
+
+  private evaluateConfirmationProof(
+    store: StateStore,
+    projectId: string,
+    threadId: string,
+    proof: ConfirmationProof | undefined,
+    provenance: ProvenanceChain,
+    exactSha: string,
+  ): { trustTier: TrustTier; proofAccepted: boolean; warning?: string } {
+    if (!proof) {
+      return { trustTier: computeTrustTier(provenance, exactSha), proofAccepted: false };
+    }
+    if (store.hasConsumedConfirmationNonce(proof.nonce)) {
+      const stripped = { ...provenance, confirmation_proof: undefined };
+      return {
+        trustTier: computeTrustTier(stripped, exactSha),
+        proofAccepted: false,
+        warning: `Confirmation proof nonce ${proof.nonce} was already consumed (replay rejected); downgraded trust.`,
+      };
+    }
+    const verifier: ConfirmationVerifier = {
+      trustedKeys: loadTrustedDeviceKeys(this.engine.homeDir).keys,
+      projectId,
+      threadId,
+      localIdentity: this.engine.identity,
+    };
+    const trustTier = computeTrustTier(provenance, exactSha, verifier);
+    return { trustTier, proofAccepted: trustTier === 'human_authority' };
+  }
+
   private getTranscriptFormatContext(
     projectId: string,
     threadId: string,
@@ -190,9 +255,15 @@ export class ThreadPassService {
     streamId: string;
     anchorId: string;
     sourceLabel: string;
-    hostSessionId?: string;
     nowIso: string;
-    options?: TranscriptInputOptions;
+    operatorOptions?: TranscriptInputOptions & { hostSessionId?: string };
+    modelOptions?: {
+      transcriptFilePath?: string;
+      machineHostname?: string;
+      cloudProvider?: string;
+      remoteUri?: string;
+      hostSessionId?: string;
+    };
     requirePlaceholderIfEmpty?: boolean;
   }): {
     controls: ControlRecord[];
@@ -205,13 +276,22 @@ export class ThreadPassService {
     const locators: HostTranscriptLocator[] = [];
     let redactedCount = 0;
 
-    const opts = params.options ?? {};
-    const filePath = normalizeOptionalMetaString(opts.transcriptFilePath);
-    const hostname = normalizeOptionalMetaString(opts.machineHostname) ?? os.hostname();
-    const cloudProvider = normalizeOptionalMetaString(opts.cloudProvider);
-    const remoteUri = normalizeOptionalMetaString(opts.remoteUri);
-    const hostSessionId = normalizeOptionalMetaString(params.hostSessionId);
-    const note = normalizeOptionalMetaString(opts.transcriptNote);
+    const op = params.operatorOptions ?? {};
+    const mod = params.modelOptions ?? {};
+
+    const opFilePath = normalizeOptionalMetaString(op.transcriptFilePath);
+    const opHostname = normalizeOptionalMetaString(op.machineHostname) ?? os.hostname();
+    const opCloudProvider = normalizeOptionalMetaString(op.cloudProvider);
+    const opRemoteUri = normalizeOptionalMetaString(op.remoteUri);
+    const opHostSessionId = normalizeOptionalMetaString(op.hostSessionId);
+    const opNote = normalizeOptionalMetaString(op.transcriptNote);
+
+    const modFilePath = normalizeOptionalMetaString(mod.transcriptFilePath);
+    const modHostname = normalizeOptionalMetaString(mod.machineHostname);
+    const modCloudProvider = normalizeOptionalMetaString(mod.cloudProvider);
+    const modRemoteUri = normalizeOptionalMetaString(mod.remoteUri);
+    const modHostSessionId = normalizeOptionalMetaString(mod.hostSessionId);
+    const effectiveHostSessionId = opHostSessionId ?? modHostSessionId;
 
     const pushLocator = (loc: HostTranscriptLocator) => {
       locators.push(loc);
@@ -226,8 +306,8 @@ export class ThreadPassService {
       });
     };
 
-    if (filePath) {
-      const fpRes = this.engine.redactor.sanitizeText(filePath);
+    if (opFilePath) {
+      const fpRes = this.engine.redactor.sanitizeText(opFilePath);
       redactedCount += fpRes.redactedCount;
       pushLocator({
         locator_id: newId('tloc', 8),
@@ -235,18 +315,19 @@ export class ThreadPassService {
         anchor_id: params.anchorId,
         source_label: params.sourceLabel,
         host_kind: 'local_file',
-        machine_hostname: hostname,
+        locator_origin: 'operator_verified',
+        machine_hostname: opHostname,
         machine_device_id: this.engine.identity.device_id,
         file_path: fpRes.sanitized,
-        ...(cloudProvider ? { cloud_provider: cloudProvider } : {}),
-        ...(hostSessionId ? { host_session_id: hostSessionId } : {}),
-        ...(note ? { note } : {}),
+        ...(opCloudProvider ? { cloud_provider: opCloudProvider } : {}),
+        ...(effectiveHostSessionId ? { host_session_id: effectiveHostSessionId } : {}),
+        ...(opNote ? { note: opNote } : {}),
         recorded_at: params.nowIso,
       });
     }
 
-    if (opts.uploadedTranscriptText && opts.uploadedTranscriptText.trim().length > 0) {
-      const upRes = this.engine.redactor.sanitizeText(opts.uploadedTranscriptText);
+    if (op.uploadedTranscriptText && op.uploadedTranscriptText.trim().length > 0) {
+      const upRes = this.engine.redactor.sanitizeText(op.uploadedTranscriptText);
       redactedCount += upRes.redactedCount;
       const sanitizedBytes = Buffer.from(upRes.sanitized, 'utf8');
       const blobSha = sha256Hex(sanitizedBytes);
@@ -256,26 +337,27 @@ export class ThreadPassService {
         sync_policy: 'approved',
         media_type: 'text/plain',
       };
-      const filename = normalizeOptionalMetaString(opts.uploadedTranscriptFilename);
+      const filename = normalizeOptionalMetaString(op.uploadedTranscriptFilename);
       pushLocator({
         locator_id: newId('tloc', 8),
         stream_id: params.streamId,
         anchor_id: params.anchorId,
         source_label: params.sourceLabel,
         host_kind: 'web_uploaded_blob',
-        machine_hostname: hostname,
+        locator_origin: 'operator_verified',
+        machine_hostname: opHostname,
         machine_device_id: this.engine.identity.device_id,
         uploaded_blob_sha256: blobSha,
         uploaded_blob_rel: blobRel,
         ...(filename ? { uploaded_filename: filename } : {}),
-        ...(cloudProvider ? { cloud_provider: cloudProvider } : {}),
-        ...(hostSessionId ? { host_session_id: hostSessionId } : {}),
-        ...(note ? { note } : {}),
+        ...(opCloudProvider ? { cloud_provider: opCloudProvider } : {}),
+        ...(effectiveHostSessionId ? { host_session_id: effectiveHostSessionId } : {}),
+        ...(opNote ? { note: opNote } : {}),
         recorded_at: params.nowIso,
       });
-    } else if (!filePath && (cloudProvider || remoteUri)) {
-      const safeUri = remoteUri
-        ? this.engine.redactor.sanitizeText(redactRemoteUrlCredentials(remoteUri)).sanitized
+    } else if (!opFilePath && (opCloudProvider || opRemoteUri)) {
+      const safeUri = opRemoteUri
+        ? this.engine.redactor.sanitizeText(redactRemoteUrlCredentials(opRemoteUri)).sanitized
         : undefined;
       pushLocator({
         locator_id: newId('tloc', 8),
@@ -283,10 +365,48 @@ export class ThreadPassService {
         anchor_id: params.anchorId,
         source_label: params.sourceLabel,
         host_kind: 'cloud_remote',
-        ...(cloudProvider ? { cloud_provider: cloudProvider } : {}),
-        ...(hostSessionId ? { host_session_id: hostSessionId } : {}),
+        locator_origin: 'operator_verified',
+        ...(opCloudProvider ? { cloud_provider: opCloudProvider } : {}),
+        ...(effectiveHostSessionId ? { host_session_id: effectiveHostSessionId } : {}),
         ...(safeUri ? { remote_uri: safeUri } : {}),
-        ...(note ? { note } : {}),
+        ...(opNote ? { note: opNote } : {}),
+        recorded_at: params.nowIso,
+      });
+    }
+
+    // Model-reported path/cloud hints are stored as unverified metadata and NEVER promoted to local machine bindings
+    if (!opFilePath && modFilePath) {
+      const mFpRes = this.engine.redactor.sanitizeText(modFilePath);
+      redactedCount += mFpRes.redactedCount;
+      pushLocator({
+        locator_id: newId('tloc', 8),
+        stream_id: params.streamId,
+        anchor_id: params.anchorId,
+        source_label: params.sourceLabel,
+        host_kind: 'local_file',
+        locator_origin: 'model_reported',
+        ...(modHostname ? { machine_hostname: modHostname } : {}),
+        file_path: mFpRes.sanitized,
+        ...(modCloudProvider ? { cloud_provider: modCloudProvider } : {}),
+        ...(modHostSessionId ? { host_session_id: modHostSessionId } : {}),
+        ...(opNote ? { note: opNote } : {}),
+        recorded_at: params.nowIso,
+      });
+    } else if (!opFilePath && !opCloudProvider && !opRemoteUri && !modFilePath && (modCloudProvider || modRemoteUri)) {
+      const safeModUri = modRemoteUri
+        ? this.engine.redactor.sanitizeText(redactRemoteUrlCredentials(modRemoteUri)).sanitized
+        : undefined;
+      pushLocator({
+        locator_id: newId('tloc', 8),
+        stream_id: params.streamId,
+        anchor_id: params.anchorId,
+        source_label: params.sourceLabel,
+        host_kind: 'cloud_remote',
+        locator_origin: 'model_reported',
+        ...(modCloudProvider ? { cloud_provider: modCloudProvider } : {}),
+        ...(modHostSessionId ? { host_session_id: modHostSessionId } : {}),
+        ...(safeModUri ? { remote_uri: safeModUri } : {}),
+        ...(opNote ? { note: opNote } : {}),
         recorded_at: params.nowIso,
       });
     }
@@ -298,8 +418,13 @@ export class ThreadPassService {
         anchor_id: params.anchorId,
         source_label: params.sourceLabel,
         host_kind: 'placeholder_unavailable',
-        ...(hostSessionId ? { host_session_id: hostSessionId } : {}),
-        ...(note ? { note } : {}),
+        ...(effectiveHostSessionId
+          ? {
+              locator_origin: opHostSessionId ? 'operator_verified' : 'model_reported',
+              host_session_id: effectiveHostSessionId,
+            }
+          : {}),
+        ...(opNote ? { note: opNote } : {}),
         recorded_at: params.nowIso,
       });
     }
@@ -382,9 +507,8 @@ export class ThreadPassService {
       streamId: mainStreamId,
       anchorId,
       sourceLabel: mainStreamId,
-      hostSessionId: params.hostSessionId,
       nowIso,
-      options: params,
+      operatorOptions: params,
       requirePlaceholderIfEmpty: false,
     });
 
@@ -572,39 +696,65 @@ export class ThreadPassService {
     const sanitizedRawRes = this.engine.redactor.sanitizeText(pkg.raw_text);
     const sanitizedPkgText = sanitizedRawRes.sanitized;
 
-    // Verify confirmation proof against exact raw text first, then sanitize all fields persisted at rest
+    // Verify confirmation proof against exact raw text + unconsumed nonce + trusted signature
     const exactSha = sha256Hex(normalizeConfirmationText(params.rawText));
     const verificationMethod =
       pkg.mode === 'model_authored' ? 'model_reported' : 'unverified_text_import';
-    const provenance = {
+    const rawProvenance: ProvenanceChain = {
       capture_origin: `adopt_paste:${label}`,
       verification_method: verificationMethod as 'model_reported' | 'unverified_text_import',
       source_event_ref: `adopt:${label}`,
       adapter_version: TRUST_ADAPTER_VERSION,
       confirmation_proof: params.confirmationProof,
     };
-    const trustTier = computeTrustTier(provenance, exactSha);
 
     const sanitizedPkgRes = this.sanitizeAdoptPackage(pkg);
     const safePkg = sanitizedPkgRes.pkg;
 
     const anchorId = newId('anc', 8);
     const nowIso = this.engine.clock.wallIso();
-    const { events, invocation } = buildEventsFromAdoptedPackage({
-      streamId,
-      txnId: 'pending',
-      pkg: safePkg,
-      trustTier,
-      provenance,
-      startSeq: 1,
-      nowIso,
-    });
+    const operatorHostSessionId = normalizeOptionalMetaString(params.hostSessionId);
+    if (!operatorHostSessionId && pkg.host_session_id) {
+      warnings.push(
+        `Ignored model-reported host_session_id (${pkg.host_session_id}) for active host binding; recorded as unverified locator metadata only.`,
+      );
+    }
 
-    // 3-layer pre-ingestion lookup across SQLite
+    // 3-layer pre-ingestion lookup across SQLite & confirmation proof replay/signature verification
     const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let threadRow: ReturnType<typeof store.getThread>;
     let existingStream: ReturnType<typeof store.getStream>;
+    let trustTier: TrustTier;
+    let effectiveProvenance: ProvenanceChain;
+    let events: EventRecord[];
+    let invocation: ReturnType<typeof buildEventsFromAdoptedPackage>['invocation'];
     try {
+      const proofEval = this.evaluateConfirmationProof(
+        store,
+        params.projectId,
+        params.threadId,
+        params.confirmationProof,
+        rawProvenance,
+        exactSha,
+      );
+      trustTier = proofEval.trustTier;
+      if (proofEval.warning) warnings.push(proofEval.warning);
+      effectiveProvenance = {
+        ...rawProvenance,
+        confirmation_proof: proofEval.proofAccepted ? params.confirmationProof : undefined,
+      };
+      const built = buildEventsFromAdoptedPackage({
+        streamId,
+        txnId: 'pending',
+        pkg: safePkg,
+        trustTier,
+        provenance: effectiveProvenance,
+        startSeq: 1,
+        nowIso,
+      });
+      events = built.events;
+      invocation = built.invocation;
+
       threadRow = store.getThread(params.threadId);
       if (!threadRow) {
         throw new Error(`Thread ${params.threadId} is not initialized in project ${params.projectId}`);
@@ -622,12 +772,11 @@ export class ThreadPassService {
         );
       }
 
-      const hostId = params.hostSessionId ?? pkg.host_session_id;
-      if (hostId) {
-        const hb = store.lookupHostBinding(hostId);
+      if (operatorHostSessionId) {
+        const hb = store.lookupHostBinding(operatorHostSessionId);
         if (hb && hb.thread_id === params.threadId) {
           throw new DuplicateAdoptionError(
-            `host_session_id ${hostId} is already bound to stream ${hb.stream_id} in same thread ${params.threadId}`,
+            `host_session_id ${operatorHostSessionId} is already bound to stream ${hb.stream_id} in same thread ${params.threadId}`,
           );
         }
       }
@@ -651,11 +800,11 @@ export class ThreadPassService {
           if (!fs.existsSync(otherDb)) continue;
           const otherStore = new StateStore(otherDb);
           try {
-            if (hostId) {
-              const otherHb = otherStore.lookupHostBinding(hostId);
+            if (operatorHostSessionId) {
+              const otherHb = otherStore.lookupHostBinding(operatorHostSessionId);
               if (otherHb && !params.allowForeignCanonical) {
                 throw new ForeignCanonicalDetectedError(
-                  `host_session_id ${hostId} belongs to another canonical thread ${otherHb.thread_id} (${otherHb.stream_id}); re-run as foreign_canonical fixed snapshot without stealing active host binding`,
+                  `host_session_id ${operatorHostSessionId} belongs to another canonical thread ${otherHb.thread_id} (${otherHb.stream_id}); re-run as foreign_canonical fixed snapshot without stealing active host binding`,
                   otherHb.thread_id,
                   otherHb.stream_id,
                 );
@@ -759,24 +908,20 @@ export class ThreadPassService {
       },
     };
 
-    const hostIdToBind = !params.allowForeignCanonical
-      ? (params.hostSessionId ?? pkg.host_session_id)
-      : undefined;
+    const hostIdToBind = !params.allowForeignCanonical ? operatorHostSessionId : undefined;
 
     const transcriptArtifacts = this.prepareTranscriptArtifacts({
       streamId,
       anchorId,
       sourceLabel: label,
-      hostSessionId: params.hostSessionId ?? pkg.host_session_id,
       nowIso,
-      options: {
-        transcriptFilePath: params.transcriptFilePath ?? pkg.transcript_file_path,
-        machineHostname: params.machineHostname ?? pkg.machine_hostname,
-        cloudProvider: params.cloudProvider ?? pkg.cloud_provider,
-        remoteUri: params.remoteUri ?? pkg.remote_uri,
-        uploadedTranscriptText: params.uploadedTranscriptText,
-        uploadedTranscriptFilename: params.uploadedTranscriptFilename,
-        transcriptNote: params.transcriptNote,
+      operatorOptions: params,
+      modelOptions: {
+        transcriptFilePath: pkg.transcript_file_path,
+        machineHostname: pkg.machine_hostname,
+        cloudProvider: pkg.cloud_provider,
+        remoteUri: pkg.remote_uri,
+        hostSessionId: pkg.host_session_id,
       },
       requirePlaceholderIfEmpty: true,
     });
@@ -838,13 +983,16 @@ export class ThreadPassService {
     budget?: HostBudgetSpec;
     writeAttachment?: boolean;
   }): PackedEnvelopeResult & {
+    pack_manifest: ReconcilePackManifest;
     common_ancestors: string[];
     source_anchors: Array<{ stream_id: string; anchor_id: string }>;
     attachment_path?: string;
   } {
     const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let threadRow: ReturnType<typeof store.getThread>;
+    let mainBaseAnchorId: string | null = null;
     let sources: ReconcileSourceInput[];
+    let sourceSnapshots: ReconcilePackSourceSnapshot[] = [];
     let commonAncestors: string[] = [];
     let transcriptLocators: HostTranscriptLocator[] = [];
 
@@ -853,6 +1001,8 @@ export class ThreadPassService {
       if (!threadRow) {
         throw new Error(`Thread ${params.threadId} not found`);
       }
+      const mainStreamRow = store.getStream(threadRow.main_stream_id);
+      mainBaseAnchorId = mainStreamRow?.head_anchor_id ?? null;
       const allStreams = store.listStreams(params.threadId);
       const selectedIds =
         params.sourceStreamIds && params.sourceStreamIds.length > 0
@@ -889,15 +1039,25 @@ export class ThreadPassService {
           sid,
         );
         const events = lines.filter((l): l is EventRecord => l.kind === 'event');
-        const highestTrust = events.some((e) => e.trust_tier === 'human_authority')
-          ? 'human_authority'
-          : events[0]?.trust_tier ?? 'untrusted_peer';
+        const distinctTiers = new Set(events.map((e) => e.trust_tier));
+        const originSummary: ReferenceOriginSummary =
+          distinctTiers.size === 0
+            ? 'untrusted_peer'
+            : distinctTiers.size === 1
+              ? [...distinctTiers][0]
+              : 'mixed_origin';
 
+        sourceSnapshots.push({
+          stream_id: sid,
+          anchor_id: anchor.anchor_id,
+          anchor_sha256: canonicalSha256(anchor),
+          completeness: sRow.health,
+        });
         sources.push({
           streamId: sid,
           anchor,
           events,
-          trustTier: highestTrust,
+          trustTier: originSummary,
           completeness: sRow.health,
           sourceLabel: sid,
         });
@@ -930,9 +1090,34 @@ export class ThreadPassService {
     // Enforce Outbound Egress Gate
     assertOutboundEgressSafe(this.engine.redactor, packed.full_markdown);
 
+    const layout = this.engine.getLayout(params.projectId, params.threadId);
+    ensureExclusiveAcl(layout.reconcilePacksDir, 'dir');
+    ensureExclusiveAcl(layout.txnsStagingDir, 'dir');
+    const unsignedManifest: Omit<ReconcilePackManifest, 'pack_manifest_hash'> = {
+      schema_version: SCHEMA_VERSION,
+      envelope_id: packed.envelope_id,
+      project_id: params.projectId,
+      thread_id: params.threadId,
+      main_stream_id: threadRow.main_stream_id,
+      main_base_anchor_id: mainBaseAnchorId,
+      sources: sourceSnapshots,
+      prompt_manifest_hash: packed.manifest_hash,
+      created_at: this.engine.clock.wallIso(),
+    };
+    const packManifest: ReconcilePackManifest = {
+      ...unsignedManifest,
+      pack_manifest_hash: canonicalSha256(unsignedManifest),
+    };
+    const finalPackPath = path.join(layout.reconcilePacksDir, `${packed.envelope_id}.pack.json`);
+    publishImmutable(
+      layout.txnsStagingDir,
+      finalPackPath,
+      Buffer.from(`${canonicalJson(packManifest)}\n`, 'utf8'),
+    );
+    ensureExclusiveAcl(finalPackPath, 'file');
+
     let attachmentPath: string | undefined;
     if (params.writeAttachment) {
-      const layout = this.engine.getLayout(params.projectId, params.threadId);
       fs.mkdirSync(layout.bundlesDir, { recursive: true });
       attachmentPath = path.join(
         layout.bundlesDir,
@@ -943,6 +1128,7 @@ export class ThreadPassService {
 
     return {
       ...packed,
+      pack_manifest: packManifest,
       common_ancestors: commonAncestors,
       source_anchors: sources.map((s) => ({
         stream_id: s.streamId,
@@ -962,6 +1148,9 @@ export class ThreadPassService {
     threadId: string;
     sourceStreamIds: string[];
     receiptRawText: string;
+    packEnvelopeId?: string;
+    confirmedConflictTopics?: string[];
+    confirmAllConflicts?: boolean;
     confirmationProof?: ConfirmationProof;
     workspaceDir?: string;
     hostSessionId?: string;
@@ -985,12 +1174,41 @@ export class ThreadPassService {
     const sanitizedExcluded = this.sanitizeTextList(parsed.excluded_items).items;
     const sanitizedProvenanceRefs = this.sanitizeTextList(parsed.provenance_only_refs).items;
     const sanitizedNextActions = this.sanitizeTextList(parsed.next_actions).items;
-    const sanitizedConflicts = parsed.conflicts.map((c) => ({
-      ...c,
-      topic: this.engine.redactor.sanitizeText(c.topic).sanitized,
-      positions: this.sanitizeTextList(c.positions).items,
-      resolution: this.engine.redactor.sanitizeText(c.resolution).sanitized,
-    }));
+
+    const layout = this.engine.getLayout(params.projectId, params.threadId);
+    const paramPackId = normalizeOptionalMetaString(params.packEnvelopeId);
+    if (paramPackId && parsed.pack_envelope_id && paramPackId !== parsed.pack_envelope_id) {
+      throw new ReconcileDriftError(
+        `Reconcile pack envelope mismatch: caller supplied ${paramPackId}, receipt references ${parsed.pack_envelope_id}`,
+      );
+    }
+    const resolvedPackId = paramPackId ?? parsed.pack_envelope_id;
+    let loadedPack: ReconcilePackManifest | undefined;
+    if (resolvedPackId) {
+      assertSafeIdentifier('pack_envelope_id', resolvedPackId);
+      const packPath = path.join(layout.reconcilePacksDir, `${resolvedPackId}.pack.json`);
+      if (!fs.existsSync(packPath)) {
+        throw new ReconcileDriftError(
+          `Reconcile pack manifest ${resolvedPackId} not found; run packReconcile first`,
+        );
+      }
+      loadedPack = JSON.parse(fs.readFileSync(packPath, 'utf8')) as ReconcilePackManifest;
+      const { pack_manifest_hash, ...unsignedPack } = loadedPack;
+      if (canonicalSha256(unsignedPack) !== pack_manifest_hash) {
+        throw new ReconcileDriftError(
+          `Reconcile pack manifest ${resolvedPackId} integrity hash mismatch`,
+        );
+      }
+      if (
+        loadedPack.project_id !== params.projectId ||
+        loadedPack.thread_id !== params.threadId
+      ) {
+        throw new ReconcileDriftError(
+          `Reconcile pack ${resolvedPackId} belongs to ${loadedPack.project_id}/${loadedPack.thread_id}`,
+        );
+      }
+    }
+
     const store = this.engine.openExistingStore(params.projectId, params.threadId);
 
     let threadRow: ReturnType<typeof store.getThread>;
@@ -999,6 +1217,16 @@ export class ThreadPassService {
     let depItems: InputDependencyManifest['items'] = [];
     let journalCausalPreds: string[] = [];
     let mainAnchorParents: string[] = [];
+    let reconcileTrustTier: TrustTier;
+    let proofAccepted = false;
+
+    const rawReconcileProvenance: ProvenanceChain = {
+      capture_origin: 'thp_reconcile_commit',
+      verification_method: 'model_reported',
+      source_event_ref: 'reconcile_pending',
+      adapter_version: TRUST_ADAPTER_VERSION,
+      confirmation_proof: params.confirmationProof,
+    };
 
     try {
       threadRow = store.getThread(params.threadId);
@@ -1027,6 +1255,9 @@ export class ThreadPassService {
         mainAnchorParents = [mainRow.head_anchor_id];
       }
 
+      const isDivergentRecovery =
+        mainRow.health === 'divergent_heads' || threadRow.journal_head_id === null;
+
       if (threadRow.journal_head_id) {
         journalCausalPreds = [threadRow.journal_head_id];
       } else {
@@ -1042,37 +1273,91 @@ export class ThreadPassService {
           .sort();
       }
 
-      for (const sid of params.sourceStreamIds) {
-        const sRow = store.getStream(sid);
-        if (!sRow) {
-          throw new Error(`Source stream ${sid} not found`);
-        }
-        if (sRow.health === 'quarantined' || sRow.health === 'divergent_heads') {
-          throw new Error(
-            `Reconcile source ${sid} has health=${sRow.health}; resolve fsck/divergent heads before reconciling`,
+      if (loadedPack) {
+        if (loadedPack.main_stream_id !== threadRow.main_stream_id) {
+          throw new ReconcileDriftError(
+            `Reconcile pack ${loadedPack.envelope_id} targets main=${loadedPack.main_stream_id}, current=${threadRow.main_stream_id}`,
           );
         }
-        if (!sRow.head_anchor_id) {
-          throw new Error(`Reconcile source ${sid} missing published head`);
+        if (
+          mainRow.health !== 'divergent_heads' &&
+          mainRow.head_anchor_id !== loadedPack.main_base_anchor_id
+        ) {
+          throw new ReconcileDriftError(
+            `Main stream ${mainRow.stream_id} advanced from ${loadedPack.main_base_anchor_id ?? 'none'} to ${mainRow.head_anchor_id ?? 'none'} since pack ${loadedPack.envelope_id}; re-run packReconcile`,
+          );
         }
-        const a = store.getAnchor(sRow.head_anchor_id);
-        if (!a) throw new Error(`Anchor ${sRow.head_anchor_id} missing`);
-        inputSources.push({
-          stream_id: sid,
-          anchor_id: a.anchor_id,
-          completeness: sRow.health,
-        });
-        depItems.push({
-          id: newId('dep', 6),
-          ref_type: 'anchor',
-          target_id: a.anchor_id,
-          stream_id: sid,
-          thread_id: params.threadId,
-          sha256: canonicalSha256(a),
-          observability: 'exact',
-          required_for_recovery: true,
-        });
+        if (params.sourceStreamIds.length > 0) {
+          const requestedSorted = [...new Set(params.sourceStreamIds)].sort();
+          const packSorted = [...new Set(loadedPack.sources.map((s) => s.stream_id))].sort();
+          if (
+            requestedSorted.length !== packSorted.length ||
+            requestedSorted.some((sid, idx) => sid !== packSorted[idx])
+          ) {
+            throw new ReconcileDriftError(
+              `Reconcile source streams drifted vs pack ${loadedPack.envelope_id}: requested=[${requestedSorted.join(',')}] expected=[${packSorted.join(',')}]`,
+            );
+          }
+        }
+        for (const ps of loadedPack.sources) {
+          const sRow = store.getStream(ps.stream_id);
+          if (!sRow) {
+            throw new ReconcileDriftError(`Packed source stream ${ps.stream_id} no longer exists`);
+          }
+          if (sRow.health === 'quarantined' || sRow.health === 'divergent_heads') {
+            throw new ReconcileDriftError(
+              `Packed source stream ${ps.stream_id} entered health=${sRow.health}; resolve and re-pack`,
+            );
+          }
+          if (sRow.head_anchor_id !== ps.anchor_id) {
+            throw new ReconcileDriftError(
+              `Source stream ${ps.stream_id} drifted from packed anchor ${ps.anchor_id} to ${sRow.head_anchor_id ?? 'none'}; re-run packReconcile`,
+            );
+          }
+          const a = store.getAnchor(ps.anchor_id);
+          if (!a) {
+            throw new ReconcileDriftError(`Packed source anchor ${ps.anchor_id} missing`);
+          }
+          const actualHash = canonicalSha256(a);
+          if (actualHash !== ps.anchor_sha256) {
+            throw new ReconcileDriftError(
+              `Source anchor ${ps.anchor_id} digest changed since pack ${loadedPack.envelope_id}`,
+            );
+          }
+          inputSources.push({
+            stream_id: ps.stream_id,
+            anchor_id: ps.anchor_id,
+            completeness: sRow.health,
+          });
+          depItems.push({
+            id: newId('dep', 6),
+            ref_type: 'anchor',
+            target_id: ps.anchor_id,
+            stream_id: ps.stream_id,
+            thread_id: params.threadId,
+            sha256: ps.anchor_sha256,
+            observability: 'exact',
+            required_for_recovery: true,
+          });
+        }
+      } else if (params.sourceStreamIds.length === 0 && isDivergentRecovery) {
+        // Explicit Main/Journal divergence healing without external sources is allowed without a pack
+      } else {
+        throw new ReconcileDriftError(
+          'commitReconcile requires a bound packEnvelopeId from packReconcile to verify exact packed snapshots',
+        );
       }
+
+      const proofEval = this.evaluateConfirmationProof(
+        store,
+        params.projectId,
+        params.threadId,
+        params.confirmationProof,
+        rawReconcileProvenance,
+        exactReceiptSha,
+      );
+      reconcileTrustTier = proofEval.trustTier;
+      proofAccepted = proofEval.proofAccepted;
     } finally {
       store.close();
     }
@@ -1085,6 +1370,27 @@ export class ThreadPassService {
       input_dependency_id: newId('idm', 8),
       items: depItems,
     };
+
+    const sanitizedConflicts = parsed.conflicts.map((c) => {
+      const topic = this.engine.redactor.sanitizeText(c.topic).sanitized;
+      const confirmedByHuman =
+        proofAccepted &&
+        reconcileTrustTier === 'human_authority' &&
+        (params.confirmedConflictTopics
+          ? params.confirmedConflictTopics.includes(c.topic) ||
+            params.confirmedConflictTopics.includes(topic)
+          : params.confirmAllConflicts !== false);
+      return {
+        ...c,
+        topic,
+        positions: this.sanitizeTextList(c.positions).items,
+        resolution: this.engine.redactor.sanitizeText(c.resolution).sanitized,
+        human_confirmed: confirmedByHuman,
+        ...(confirmedByHuman && params.confirmationProof
+          ? { confirmation_proof_nonce: params.confirmationProof.nonce }
+          : {}),
+      };
+    });
 
     const recRecord: ReconciliationRecord = {
       reconciliation_id: reconciliationId,
@@ -1101,7 +1407,13 @@ export class ThreadPassService {
       strategy_id: 'explicit_human_or_main_reconciliation',
       strategy_version: SCHEMA_VERSION,
       input_manifest_hash: canonicalSha256(depManifest),
-      confirmation_proof: params.confirmationProof,
+      ...(loadedPack
+        ? {
+            pack_envelope_id: loadedPack.envelope_id,
+            pack_manifest_hash: loadedPack.pack_manifest_hash,
+          }
+        : {}),
+      confirmation_proof: proofAccepted ? params.confirmationProof : undefined,
       created_at: nowIso,
     };
 
@@ -1111,14 +1423,13 @@ export class ThreadPassService {
       `reconcile|${reconciliationId}`,
     );
 
-    const reconcileProvenance = {
+    const reconcileProvenance: ProvenanceChain = {
       capture_origin: 'thp_reconcile_commit',
-      verification_method: 'model_reported' as const,
+      verification_method: 'model_reported',
       source_event_ref: reconciliationId,
       adapter_version: TRUST_ADAPTER_VERSION,
-      confirmation_proof: params.confirmationProof,
+      confirmation_proof: proofAccepted ? params.confirmationProof : undefined,
     };
-    const reconcileTrustTier = computeTrustTier(reconcileProvenance, exactReceiptSha);
 
     const injectEvent: EventRecord = {
       schema_version: SCHEMA_VERSION,
@@ -1187,9 +1498,8 @@ export class ThreadPassService {
       streamId: threadRow.main_stream_id,
       anchorId: newAnchorId,
       sourceLabel: threadRow.main_stream_id,
-      hostSessionId: params.hostSessionId,
       nowIso,
-      options: params,
+      operatorOptions: params,
       requirePlaceholderIfEmpty: false,
     });
 
@@ -1431,6 +1741,7 @@ export class ThreadPassService {
     threadId: string;
     streamId: string;
     rawText: string;
+    expectedBaseAnchorId?: string;
     verificationMethod?: 'local_cli_direct' | 'unverified_text_import' | 'model_reported';
     confirmationProof?: ConfirmationProof;
     ackBatchId?: string;
@@ -1449,9 +1760,29 @@ export class ThreadPassService {
     if (!params.rawText.trim()) {
       throw new Error('ingestReply requires non-empty rawText');
     }
+    const pkg = parseExternalConversationInput(params.rawText, params.streamId);
+    const paramBase = normalizeOptionalMetaString(params.expectedBaseAnchorId);
+    if (paramBase && pkg.base_anchor_id && paramBase !== pkg.base_anchor_id) {
+      throw new StaleCheckpointBaselineError(
+        `Checkpoint base_anchor_id conflict: caller supplied ${paramBase}, payload carries ${pkg.base_anchor_id}`,
+      );
+    }
+    const effectiveBaseAnchor = paramBase ?? pkg.base_anchor_id;
+
+    const exactSha = sha256Hex(normalizeConfirmationText(params.rawText));
+    const rawProvenance: ProvenanceChain = {
+      capture_origin: 'thp_ingest',
+      verification_method: params.verificationMethod ?? 'model_reported',
+      source_event_ref: `ingest:${params.streamId}`,
+      adapter_version: TRUST_ADAPTER_VERSION,
+      confirmation_proof: params.confirmationProof,
+    };
+
     const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let headAnchorId: string | null = null;
     let lastSeq = 0;
+    let trustTier: TrustTier;
+    let effectiveProvenance: ProvenanceChain;
     try {
       const sRow = store.getStream(params.streamId);
       if (!sRow) throw new Error(`Stream ${params.streamId} not found`);
@@ -1462,6 +1793,26 @@ export class ThreadPassService {
       }
       headAnchorId = sRow.head_anchor_id;
       lastSeq = sRow.last_seq;
+      if (effectiveBaseAnchor && effectiveBaseAnchor !== headAnchorId) {
+        throw new StaleCheckpointBaselineError(
+          `Checkpoint base_anchor_id (${effectiveBaseAnchor}) does not match current stream ${params.streamId} head (${headAnchorId ?? 'none'}); stream has advanced — re-pack handoff or reconcile instead of appending stale context`,
+        );
+      }
+
+      const proofEval = this.evaluateConfirmationProof(
+        store,
+        params.projectId,
+        params.threadId,
+        params.confirmationProof,
+        rawProvenance,
+        exactSha,
+      );
+      trustTier = proofEval.trustTier;
+      if (proofEval.warning) pkg.parse_warnings.push(proofEval.warning);
+      effectiveProvenance = {
+        ...rawProvenance,
+        confirmation_proof: proofEval.proofAccepted ? params.confirmationProof : undefined,
+      };
     } finally {
       store.close();
     }
@@ -1472,7 +1823,6 @@ export class ThreadPassService {
       params.streamId,
     );
 
-    const pkg = parseExternalConversationInput(params.rawText, params.streamId);
     const effectiveAckBatch = params.ackBatchId ?? pkg.mailbox_ack?.batch_id;
     const effectiveAckMsgs =
       params.ackMessageIds && params.ackMessageIds.length > 0
@@ -1521,15 +1871,6 @@ export class ThreadPassService {
       });
     }
 
-    const exactSha = sha256Hex(normalizeConfirmationText(params.rawText));
-    const provenance = {
-      capture_origin: 'thp_ingest',
-      verification_method: params.verificationMethod ?? 'model_reported',
-      source_event_ref: `ingest:${params.streamId}`,
-      adapter_version: TRUST_ADAPTER_VERSION,
-      confirmation_proof: params.confirmationProof,
-    };
-    const trustTier = computeTrustTier(provenance, exactSha);
     const sanitizedPkgRes = this.sanitizeAdoptPackage(pkg);
     const safePkg = sanitizedPkgRes.pkg;
     const { events, invocation } = buildEventsFromAdoptedPackage({
@@ -1537,7 +1878,7 @@ export class ThreadPassService {
       txnId: 'pending',
       pkg: safePkg,
       trustTier,
-      provenance,
+      provenance: effectiveProvenance,
       startSeq: lastSeq + 1,
       nowIso,
       turnScopeSeed: `${headAnchorId ?? 'root'}:${lastSeq}`,
@@ -1564,16 +1905,14 @@ export class ThreadPassService {
       streamId: params.streamId,
       anchorId: newAnchorId,
       sourceLabel: params.streamId,
-      hostSessionId: params.hostSessionId ?? pkg.host_session_id,
       nowIso,
-      options: {
-        transcriptFilePath: params.transcriptFilePath ?? pkg.transcript_file_path,
-        machineHostname: params.machineHostname ?? pkg.machine_hostname,
-        cloudProvider: params.cloudProvider ?? pkg.cloud_provider,
-        remoteUri: params.remoteUri ?? pkg.remote_uri,
-        uploadedTranscriptText: params.uploadedTranscriptText,
-        uploadedTranscriptFilename: params.uploadedTranscriptFilename,
-        transcriptNote: params.transcriptNote,
+      operatorOptions: params,
+      modelOptions: {
+        transcriptFilePath: pkg.transcript_file_path,
+        machineHostname: pkg.machine_hostname,
+        cloudProvider: pkg.cloud_provider,
+        remoteUri: pkg.remote_uri,
+        hostSessionId: pkg.host_session_id,
       },
       requirePlaceholderIfEmpty: false,
     });
@@ -1837,9 +2176,8 @@ export class ThreadPassService {
       streamId: workerStreamId,
       anchorId: workerAnchorId,
       sourceLabel: workerStreamId,
-      hostSessionId: params.hostSessionId,
       nowIso,
-      options: params,
+      operatorOptions: params,
       requirePlaceholderIfEmpty: false,
     });
 

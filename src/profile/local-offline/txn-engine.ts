@@ -226,6 +226,9 @@ export class ThreadDirLayout {
   get bundlesDir(): string {
     return path.join(this.rootDir, 'bundles');
   }
+  get reconcilePacksDir(): string {
+    return path.join(this.rootDir, 'reconcile-packs');
+  }
 
   ensureDirectories(): void {
     ensureExclusiveAcl(this.homeDir, 'dir');
@@ -1471,6 +1474,9 @@ export class LocalOfflineEngine {
       const streamId = shard.stream_id ?? '';
       for (const rec of lines) {
         if (rec.kind === 'event') {
+          if (rec.provenance.confirmation_proof?.nonce) {
+            store.consumeConfirmationNonce(rec.provenance.confirmation_proof, rec.created_at);
+          }
           store.db
             .prepare(
               `INSERT OR IGNORE INTO event_fingerprints(event_id, project_id, thread_id, stream_id)
@@ -1496,6 +1502,13 @@ export class LocalOfflineEngine {
         } else if (rec.kind === 'control') {
           if (rec.payload.type === 'anchor') {
             shardAnchor = rec.payload.anchor;
+          } else if (rec.payload.type === 'reconciliation_record') {
+            if (rec.payload.record.confirmation_proof?.nonce) {
+              store.consumeConfirmationNonce(
+                rec.payload.record.confirmation_proof,
+                rec.created_at,
+              );
+            }
           } else if (rec.payload.type === 'notify_receipt') {
             this.applyNotifyReceiptProj(store, rec.payload.receipt);
           } else if (rec.payload.type === 'transcript_locator') {

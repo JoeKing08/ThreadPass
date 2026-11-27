@@ -109,6 +109,134 @@ export function splitIntoLineAwareChunks(full: string, payloadMax: number): stri
   return chunks.length > 0 ? chunks : [''];
 }
 
+/**
+ * Splits markdown into chunks respecting BOTH line boundaries AND XML `<archived_reference_...>` /
+ * legacy `<<<UNTRUSTED_DATA_...>>>` fence blocks so every single part keeps balanced open/close tags.
+ */
+export function splitIntoFenceAwareChunks(full: string, payloadMax: number): string[] {
+  const limit = Math.max(256, payloadMax);
+  const rawLines = full.split('\n');
+  const units: Array<{ kind: 'plain' | 'xml_fence' | 'legacy_fence'; text: string }> = [];
+
+  let i = 0;
+  while (i < rawLines.length) {
+    const line = rawLines[i];
+    const xmlOpen = line.match(/^<(archived_reference_[a-f0-9]+)\b[^>]*>$/);
+    if (xmlOpen) {
+      const closeTag = `</${xmlOpen[1]}>`;
+      const buf: string[] = [line];
+      let j = i + 1;
+      let closed = false;
+      while (j < rawLines.length) {
+        buf.push(rawLines[j]);
+        if (rawLines[j].trim() === closeTag) {
+          closed = true;
+          j += 1;
+          break;
+        }
+        j += 1;
+      }
+      if (closed) {
+        units.push({ kind: 'xml_fence', text: buf.join('\n') });
+        i = j;
+        continue;
+      }
+    }
+
+    const legacyOpen = line.match(/^<<<(UNTRUSTED_DATA_[A-Z0-9]+)\b/);
+    if (legacyOpen) {
+      const closeMarker = `<<<END_${legacyOpen[1]}>>>`;
+      const buf: string[] = [line];
+      let j = i + 1;
+      let closed = false;
+      while (j < rawLines.length) {
+        buf.push(rawLines[j]);
+        if (rawLines[j].trim() === closeMarker) {
+          closed = true;
+          j += 1;
+          break;
+        }
+        j += 1;
+      }
+      if (closed) {
+        units.push({ kind: 'legacy_fence', text: buf.join('\n') });
+        i = j;
+        continue;
+      }
+    }
+
+    units.push({ kind: 'plain', text: line });
+    i += 1;
+  }
+
+  // Expand any oversized unit before packing
+  const boundedUnits: string[] = [];
+  for (const unit of units) {
+    if (unit.text.length <= limit) {
+      boundedUnits.push(unit.text);
+      continue;
+    }
+
+    if (unit.kind === 'xml_fence') {
+      const fLines = unit.text.split('\n');
+      const openLine = fLines[0];
+      const closeLine = fLines[fLines.length - 1];
+      const inner = fLines.slice(1, -1).join('\n');
+      const segAttrBudget = ' segment="999/999"'.length;
+      const innerMax = limit - (openLine.length + segAttrBudget + closeLine.length + 2);
+      if (innerMax >= 64) {
+        const innerSlices = splitIntoLineAwareChunks(inner, innerMax);
+        const total = innerSlices.length;
+        for (let idx = 0; idx < total; idx++) {
+          const segOpen = openLine.replace(/>$/, ` segment="${idx + 1}/${total}">`);
+          boundedUnits.push(`${segOpen}\n${innerSlices[idx]}\n${closeLine}`);
+        }
+        continue;
+      }
+    } else if (unit.kind === 'legacy_fence') {
+      const fLines = unit.text.split('\n');
+      const headerCount = fLines.length >= 3 && fLines[1].startsWith('[SECURITY NOTICE:') ? 2 : 1;
+      const header = fLines.slice(0, headerCount).join('\n');
+      const footer = fLines[fLines.length - 1];
+      const inner = fLines.slice(headerCount, -1).join('\n');
+      const innerMax = limit - (header.length + footer.length + 2);
+      if (innerMax >= 64) {
+        const innerSlices = splitIntoLineAwareChunks(inner, innerMax);
+        for (const s of innerSlices) {
+          boundedUnits.push(`${header}\n${s}\n${footer}`);
+        }
+        continue;
+      }
+    }
+
+    boundedUnits.push(...splitIntoLineAwareChunks(unit.text, limit));
+  }
+
+  const chunks: string[] = [];
+  let cur = '';
+  for (const u of boundedUnits) {
+    if (u.length > limit) {
+      if (cur.length > 0) {
+        chunks.push(cur);
+        cur = '';
+      }
+      chunks.push(...splitIntoLineAwareChunks(u, limit));
+      continue;
+    }
+    const candidate = cur.length === 0 ? u : `${cur}\n${u}`;
+    if (candidate.length <= limit) {
+      cur = candidate;
+    } else {
+      chunks.push(cur);
+      cur = u;
+    }
+  }
+  if (cur.length > 0) {
+    chunks.push(cur);
+  }
+  return chunks.length > 0 ? chunks : [''];
+}
+
 function isFencedBlock(block: string): boolean {
   return block.startsWith('<archived_reference_') || block.startsWith('<<<UNTRUSTED_DATA_');
 }
@@ -327,7 +455,7 @@ export function packBudgetedEnvelope(
   const estimatePartCount = (text: string): number => {
     if (text.length <= budget.per_turn_input_limit) return 1;
     const payloadMax = Math.max(256, budget.per_turn_input_limit - headerReserve);
-    return splitIntoLineAwareChunks(text, payloadMax).length;
+    return splitIntoFenceAwareChunks(text, payloadMax).length;
   };
   const estimateTotalTokensWithChunkOverhead = (text: string): number => {
     const partCount = estimatePartCount(text);
@@ -407,7 +535,7 @@ export function packBudgetedEnvelope(
     );
   }
   const payloadMax = budget.per_turn_input_limit - headerReserve;
-  const rawChunks = splitIntoLineAwareChunks(full, payloadMax);
+  const rawChunks = splitIntoFenceAwareChunks(full, payloadMax);
   const totalParts = rawChunks.length;
   const parts = rawChunks.map((chunk, idx) => {
     const partIndex = idx + 1;
