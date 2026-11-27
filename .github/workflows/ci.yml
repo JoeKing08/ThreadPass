@@ -1,0 +1,51 @@
+name: ThreadPass Multi-Platform CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: ${{ matrix.os }} / Node ${{ matrix.node-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: ['22.18.0', '22.x', '24.x', '26.x']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Verify zero runtime dependencies & Pure Core isolation
+        run: |
+          node -e "const fs=require('fs'),path=require('path'); const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); const deps=Object.keys(pkg.dependencies||{}); if(deps.length!==0){throw new Error('Forbidden runtime dependencies: '+deps.join(','))}; const badRe=/(?:node:(?:fs|sqlite|http)|(?:\.\.\/)+(?:profile|shell))/; for(const f of fs.readdirSync('src/core')){if(!f.endsWith('.ts'))continue; const txt=fs.readFileSync(path.join('src/core',f),'utf8'); if(badRe.test(txt)){throw new Error('Pure Core isolation violation in '+f)}} console.log('Architecture isolation & zero-dep check passed.');"
+
+      - name: Install devDependencies
+        run: npm ci
+
+      - name: TypeScript check (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Build TypeScript (tsc)
+        run: npm run build
+
+      - name: Verify CLI shebang uses LF line endings
+        run: |
+          node -e "const fs=require('fs'); const firstLine=fs.readFileSync('dist/src/shell/cli.js','utf8').split('\n')[0]; if(firstLine!=='#!/usr/bin/env node'||firstLine.includes('\r')){throw new Error('Bad CLI shebang line: '+JSON.stringify(firstLine))} console.log('CLI LF shebang verified.');"
+
+      - name: Run unit, fault-injection, and 7-AI E2E tests
+        run: npm test
+
+      - name: CLI smoke check
+        run: node dist/src/shell/cli.js --help

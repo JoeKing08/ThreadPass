@@ -1,0 +1,22 @@
+{
+  "name": "threadpass",
+  "version": "0.1.0",
+  "description": "ThreadPass cross-host session continuity kernel and reference shell",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "bin": {
+    "thp": "./dist/src/shell/cli.js"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "node --test dist/test/core-state-machine.test.js dist/test/fault-injection-and-fsck.test.js dist/test/bootstrap-7ai-e2e.test.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^26.6.11",
+    "typescript": "^7.0.2"
+  }
+}

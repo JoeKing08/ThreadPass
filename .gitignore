@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.threadpass/
+*.log
+*.tmp
+.env
