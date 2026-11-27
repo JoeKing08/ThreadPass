@@ -125,7 +125,7 @@ export function renderNonInstructionFence(params: {
 }): string {
   const safeTag = `UNTRUSTED_DATA_${sha256Hex(params.anchorOrRef).slice(0, 8).toUpperCase()}`;
   const neutralized = params.bodyText.replace(
-    /<<<\s*\/?\s*(?:UNTRUSTED_DATA|END_UNTRUSTED|SYSTEM|INSTRUCTION)[^>]*>>>/gi,
+    /<<<\s*\/?\s*(?:UNTRUSTED_DATA|END_UNTRUSTED|SYSTEM|INSTRUCTION|NON_EXECUTABLE_PART_PAYLOAD|END_PART_PAYLOAD)[^>]*>>>/gi,
     '[ESCAPED_FENCE_MARKER]',
   );
   return [

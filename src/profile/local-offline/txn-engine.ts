@@ -637,6 +637,12 @@ export class LocalOfflineEngine {
           });
         }
       }
+      const safeAnchor: LineageAnchor = sInput.anchor.summary
+        ? {
+            ...sInput.anchor,
+            summary: this.redactor.sanitizeText(sInput.anchor.summary).sanitized,
+          }
+        : sInput.anchor;
       lines.push({
         schema_version: SCHEMA_VERSION,
         kind: 'control',
@@ -644,7 +650,7 @@ export class LocalOfflineEngine {
         stream_id: sInput.stream_id,
         commit_txn_id: txnId,
         created_at: nowIso,
-        payload: { type: 'anchor', anchor: sInput.anchor },
+        payload: { type: 'anchor', anchor: safeAnchor },
       });
 
       const jsonl = `${lines.map((l) => canonicalJson(l)).join('\n')}\n`;

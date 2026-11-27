@@ -82,6 +82,7 @@ function renderHtmlPage(
   label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 4px; }
   input[type=text], textarea { width: 100%; box-sizing: border-box; background: #0b1220; color: var(--fg); border: 1px solid #475569; border-radius: 6px; padding: 8px 10px; font-family: ui-monospace, monospace; font-size: 13px; }
   textarea { min-height: 120px; resize: vertical; }
+  textarea.drag-over { border-color: var(--acc); background: #0c1e35; }
   button { background: var(--acc); color: #082f49; border: none; border-radius: 6px; padding: 8px 14px; font-weight: 600; cursor: pointer; }
   button.sec { background: #334155; color: var(--fg); }
   button.danger { background: var(--err); color: #fff; }
@@ -94,6 +95,11 @@ function renderHtmlPage(
   .part-box { border: 1px solid #475569; border-radius: 8px; padding: 10px; margin-top: 8px; background: #0b1220; }
   .streams-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; margin: 8px 0; }
   .stream-item { background: #0b1220; border: 1px solid #334155; border-radius: 6px; padding: 8px; font-size: 12px; }
+  .alert { display: none; padding: 10px 14px; border-radius: 8px; font-size: 13px; border: 1px solid; }
+  .alert.show { display: block; }
+  .alert.err { background: #450a0a; border-color: #ef4444; color: #fecaca; }
+  .alert.ok { background: #052e16; border-color: #22c55e; color: #bbf7d0; }
+  .file-label { font-size: 12px; color: var(--acc); cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
 </style>
 </head>
 <body>
@@ -102,15 +108,18 @@ function renderHtmlPage(
     <strong>ThreadPass</strong> <span class="badge">thp web · 127.0.0.1 Ephemeral Shell · Zero Daemon</span>
   </div>
   <div class="row">
-    <button class="sec" onclick="refreshStatus()">刷新状态</button>
+    <button class="sec" onclick="runUiAction('fsckOut', refreshStatus)">刷新状态</button>
     <button class="danger" onclick="shutdownServer()">退出并关闭服务</button>
   </div>
 </header>
 <main>
+  <datalist id="streamIdsList"></datalist>
+  <div id="uiAlert" class="alert" role="status"></div>
+
   <div class="bar row">
     <div style="flex:1; min-width:180px;"><label>Project ID</label><input id="projectId" type="text" /></div>
     <div style="flex:1; min-width:180px;"><label>Thread ID</label><input id="threadId" type="text" /></div>
-    <div style="align-self:flex-end;"><button onclick="initThread()">新建 / 初始化 Main</button></div>
+    <div style="align-self:flex-end;"><button onclick="runUiAction('adoptOut', initThread)">新建 / 初始化 Main</button></div>
   </div>
 
   <div class="tabs">
@@ -124,15 +133,18 @@ function renderHtmlPage(
     <h3>收编外部 AI 会话（支持结构化 JSON 或直接粘贴原始对话兜底）</h3>
     <div class="row">
       <div style="flex:1;"><label>Source Label（如 ai_gpt / ai_claude / ai_1）</label><input id="adoptSource" type="text" value="external_ai_1" /></div>
-      <div style="align-self:flex-end;"><button class="sec" onclick="copyAdoptPrompt()">复制提取 Prompt 模板</button></div>
+      <div style="align-self:flex-end;"><button class="sec" onclick="runUiAction('adoptOut', () => copyAdoptPrompt(this))">复制提取 Prompt 模板</button></div>
     </div>
-    <label style="margin-top:10px;">粘贴源 AI 回复或原始对话全文（自动跨块脱敏 + 防重复收编反查）</label>
-    <textarea id="adoptText" placeholder="在此粘贴外部 AI 输出的 JSON 交接块或原始聊天记录..."></textarea>
+    <div class="row" style="justify-content:space-between; margin-top:10px;">
+      <label style="margin:0;">粘贴源 AI 回复或原始对话全文（自动跨块脱敏 + 防重复收编反查，支持拖放 .md/.txt）</label>
+      <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('adoptText', this)" /></label>
+    </div>
+    <textarea id="adoptText" placeholder="在此粘贴或拖放外部 AI 输出的 JSON 交接块或原始聊天记录..."></textarea>
     <div class="row" style="margin-top:8px;">
       <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
         <input id="adoptConfirm" type="checkbox" /> 我已审阅上述确切原文并签发哈希绑定人类授权凭证（human_authority）
       </label>
-      <button onclick="doAdopt()">提交收编 (Adopt)</button>
+      <button onclick="runUiAction('adoptOut', doAdopt)">提交收编 (Adopt)</button>
     </div>
     <pre id="adoptOut"></pre>
   </section>
@@ -144,17 +156,20 @@ function renderHtmlPage(
     <input id="recGoal" type="text" value="Synthesize all selected streams into unified ThreadPass Main engineering plan." />
     <div class="row" style="margin-top:8px;">
       <label>单次粘贴上限 (chars)：<input id="recLimit" type="text" value="24000" style="width:90px;display:inline;" /></label>
-      <button onclick="packReconcile()">生成 Reconcile 合并信封 & 分片</button>
+      <button onclick="runUiAction('recOut', packReconcile)">生成 Reconcile 合并信封 & 分片</button>
       <button class="sec" onclick="downloadLatestMd()">导出 .md 附件</button>
     </div>
     <div id="recParts"></div>
-    <label style="margin-top:12px;">粘贴合并 AI 返回的 ReconciliationReceipt（或纯文本总结）</label>
-    <textarea id="recReceipt" placeholder="粘贴 JSON ReconciliationReceipt 或总结文本"></textarea>
+    <div class="row" style="justify-content:space-between; margin-top:12px;">
+      <label style="margin:0;">粘贴合并 AI 返回的 ReconciliationReceipt（或纯文本总结，支持拖放文件）</label>
+      <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('recReceipt', this)" /></label>
+    </div>
+    <textarea id="recReceipt" placeholder="粘贴或拖放 JSON ReconciliationReceipt 或总结文本"></textarea>
     <div class="row" style="margin-top:8px;">
       <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
         <input id="recConfirm" type="checkbox" /> 人工审阅确认合并裁决并绑定内容哈希
       </label>
-      <button onclick="commitReconcile()">落盘 Reconciliation & 更新 Main</button>
+      <button onclick="runUiAction('recOut', commitReconcile)">落盘 Reconciliation & 更新 Main</button>
     </div>
     <pre id="recOut"></pre>
   </section>
@@ -162,47 +177,52 @@ function renderHtmlPage(
   <section id="panel-handoff" class="card panel">
     <h3>A. 阶段备份回 Main / 子流 (Checkpoint Ingest)</h3>
     <div class="row">
-      <div style="flex:1;"><label>Stream ID（留空默认 Main）</label><input id="ckptStream" type="text" placeholder="例如 main 或 sub_a" /></div>
+      <div style="flex:1;"><label>Stream ID（留空默认 Main）</label><input id="ckptStream" type="text" list="streamIdsList" placeholder="例如 main 或 sub_a" /></div>
       <div style="flex:1;"><label>工作区目录（可选）</label><input id="ckptWorkspace" type="text" placeholder="例如 C:\\Projects\\ThreadPass" /></div>
-      <div style="align-self:flex-end;"><button class="sec" onclick="copyCheckpointPrompt()">复制已纳管流备份 Prompt</button></div>
+      <div style="align-self:flex-end;"><button class="sec" onclick="runUiAction('hoOut', () => copyCheckpointPrompt(this))">复制已纳管流备份 Prompt</button></div>
     </div>
-    <label style="margin-top:8px;">粘贴 AI 返回的检查点 JSON（或这段新对话原文）</label>
-    <textarea id="ckptText" placeholder="粘贴检查点 JSON 或新阶段对话原文..."></textarea>
+    <div class="row" style="justify-content:space-between; margin-top:8px;">
+      <label style="margin:0;">粘贴 AI 返回的检查点 JSON（或这段新对话原文，支持拖放文件）</label>
+      <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('ckptText', this)" /></label>
+    </div>
+    <textarea id="ckptText" placeholder="粘贴或拖放检查点 JSON 或新阶段对话原文..."></textarea>
     <div class="row" style="margin-top:8px;">
       <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
         <input id="ckptConfirm" type="checkbox" /> 我已审阅原文并签发哈希绑定授权凭证
       </label>
-      <button onclick="doIngest()">提交备份存档 (Ingest)</button>
+      <button onclick="runUiAction('hoOut', doIngest)">提交备份存档 (Ingest)</button>
     </div>
 
     <hr style="border-color:#334155;margin:16px 0;" />
     <h3>B. 跨宿主续聊 (Handoff Pack)</h3>
     <div class="row">
-      <div style="flex:1;"><label>Target Stream ID（留空默认 Main）</label><input id="hoStream" type="text" /></div>
-      <div style="align-self:flex-end;"><button onclick="packHandoff()">打包续聊 Handoff</button></div>
+      <div style="flex:1;"><label>Target Stream ID（留空默认 Main）</label><input id="hoStream" type="text" list="streamIdsList" /></div>
+      <div style="width:130px;"><label>单次上限 (chars)</label><input id="hoLimit" type="text" value="24000" /></div>
+      <div style="align-self:flex-end;"><button onclick="runUiAction('hoOut', packHandoff)">打包续聊 Handoff</button></div>
+      <div style="align-self:flex-end;"><button class="sec" onclick="downloadLatestMd()">导出 .md 附件</button></div>
     </div>
     <div id="hoParts"></div>
 
     <hr style="border-color:#334155;margin:16px 0;" />
     <h3>C. 派生独立 Subagent 子流 (Atomic Fork)</h3>
     <div class="row">
-      <div style="flex:1;"><label>Origin Stream（留空默认 Main）</label><input id="forkOrigin" type="text" /></div>
+      <div style="flex:1;"><label>Origin Stream（留空默认 Main）</label><input id="forkOrigin" type="text" list="streamIdsList" /></div>
       <div style="flex:1;"><label>Worker Stream Name（可选，如 sub_a）</label><input id="forkWorker" type="text" placeholder="sub_a" /></div>
       <div style="flex:1;"><label>独立工作区 / worktree 目录（可选）</label><input id="forkWs" type="text" /></div>
     </div>
     <div class="row" style="margin-top:8px;">
       <div style="flex:1;"><label>派生子流任务描述 (Fork Task Brief)</label><input id="forkTask" type="text" placeholder="Implement sub-module X" /></div>
-      <div style="align-self:flex-end;"><button onclick="doFork()">原子派发 Fork</button></div>
+      <div style="align-self:flex-end;"><button onclick="runUiAction('hoOut', doFork)">原子派发 Fork</button></div>
     </div>
     <div id="forkPromptBox"></div>
 
     <hr style="border-color:#334155;margin:16px 0;" />
     <h3>D. 跨流异步发信 (Mailbox Send)</h3>
     <div class="row">
-      <div style="flex:1;"><label>From Stream ID</label><input id="mbFrom" type="text" placeholder="sub_a" /></div>
-      <div style="flex:1;"><label>To Stream ID</label><input id="mbTo" type="text" placeholder="main" /></div>
+      <div style="flex:1;"><label>From Stream ID</label><input id="mbFrom" type="text" list="streamIdsList" placeholder="sub_a" /></div>
+      <div style="flex:1;"><label>To Stream ID</label><input id="mbTo" type="text" list="streamIdsList" placeholder="main" /></div>
       <div style="flex:2;"><label>Message</label><input id="mbText" type="text" placeholder="Async note for target stream..." /></div>
-      <div style="align-self:flex-end;"><button class="sec" onclick="doMailboxSend()">发送消息</button></div>
+      <div style="align-self:flex-end;"><button class="sec" onclick="runUiAction('hoOut', doMailboxSend)">发送消息</button></div>
     </div>
 
     <pre id="hoOut" style="margin-top:12px;"></pre>
@@ -211,8 +231,8 @@ function renderHtmlPage(
   <section id="panel-fsck" class="card panel">
     <h3>Lineage 状态与四步 fsck 核验重建</h3>
     <div class="row">
-      <button onclick="runFsck(false)">运行 4 步 thp fsck</button>
-      <button class="sec" onclick="runFsck(true)">删除 SQLite 并重建 (fsck --rebuild)</button>
+      <button onclick="runUiAction('fsckOut', () => runFsck(false))">运行 4 步 thp fsck</button>
+      <button class="sec" onclick="runUiAction('fsckOut', () => runFsck(true))">删除 SQLite 并重建 (fsck --rebuild)</button>
     </div>
     <pre id="fsckOut"></pre>
   </section>
@@ -223,6 +243,63 @@ document.getElementById('projectId').value = ${safeProj} || 'threadpass-bootstra
 document.getElementById('threadId').value = ${safeThr} || '';
 let latestMarkdown = '';
 let latestStreams = [];
+
+function showAlert(msg, kind) {
+  const el = document.getElementById('uiAlert');
+  if (!msg) {
+    el.className = 'alert';
+    el.textContent = '';
+    return;
+  }
+  el.className = 'alert show ' + (kind === 'ok' ? 'ok' : 'err');
+  el.textContent = String(msg);
+}
+
+async function runUiAction(outId, fn) {
+  showAlert('');
+  try {
+    await fn();
+  } catch (err) {
+    const msg = (err && err.message) ? err.message : String(err);
+    showAlert('操作失败：' + msg, 'err');
+    const outEl = document.getElementById(outId);
+    if (outEl) outEl.textContent = 'ERROR: ' + msg;
+  }
+}
+
+async function copyTextWithFeedback(text, btn) {
+  if (navigator.clipboard) {
+    await navigator.clipboard.writeText(text);
+  }
+  if (btn) {
+    const orig = btn.textContent;
+    btn.textContent = '已复制 ✓';
+    setTimeout(() => { btn.textContent = orig; }, 1500);
+  }
+}
+
+function wireDropAndFile(textareaId) {
+  const ta = document.getElementById(textareaId);
+  if (!ta) return;
+  ta.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    ta.classList.add('drag-over');
+  });
+  ta.addEventListener('dragleave', () => ta.classList.remove('drag-over'));
+  ta.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    ta.classList.remove('drag-over');
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) ta.value = await file.text();
+  });
+}
+
+async function loadFileInto(textareaId, inputEl) {
+  const file = inputEl && inputEl.files && inputEl.files[0];
+  if (file) {
+    document.getElementById(textareaId).value = await file.text();
+  }
+}
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -240,7 +317,7 @@ function showTab(id, btn) {
   document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
   document.getElementById('panel-' + id).classList.add('active');
   btn.classList.add('active');
-  if (id === 'reconcile') refreshStatus();
+  if (id === 'reconcile' || id === 'handoff') refreshStatus().catch(() => {});
 }
 
 function getIds() {
@@ -255,7 +332,7 @@ async function initThread() {
   const res = await api('/api/init', { projectId, threadId: threadId || undefined });
   document.getElementById('threadId').value = res.thread_id;
   await refreshStatus();
-  alert('Initialized thread ' + res.thread_id + ' (main=' + res.main_stream_id + ')');
+  showAlert('已初始化 Thread ' + res.thread_id + ' (main=' + res.main_stream_id + ')', 'ok');
 }
 
 async function refreshStatus() {
@@ -265,7 +342,14 @@ async function refreshStatus() {
   latestStreams = st.streams || [];
   const box = document.getElementById('streamsChecklist');
   box.textContent = '';
+  const dl = document.getElementById('streamIdsList');
+  dl.textContent = '';
   for (const s of latestStreams) {
+    const sid = String(s.stream_id || '');
+    const opt = document.createElement('option');
+    opt.value = sid;
+    dl.appendChild(opt);
+
     const div = document.createElement('div');
     div.className = 'stream-item';
     const label = document.createElement('label');
@@ -274,10 +358,10 @@ async function refreshStatus() {
     const cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.className = 'rec-src';
-    cb.value = String(s.stream_id || '');
+    cb.value = sid;
     cb.checked = !s.is_main;
     const strong = document.createElement('strong');
-    strong.textContent = ' ' + String(s.stream_id || '');
+    strong.textContent = ' ' + sid;
     label.appendChild(cb);
     label.appendChild(strong);
     const meta = document.createElement('div');
@@ -289,10 +373,10 @@ async function refreshStatus() {
   document.getElementById('fsckOut').textContent = JSON.stringify(st, null, 2);
 }
 
-async function copyAdoptPrompt() {
+async function copyAdoptPrompt(btn) {
   const src = document.getElementById('adoptSource').value.trim() || 'external_ai';
   const res = await api('/api/prompt/adopt-extract', { sourceLabel: src });
-  if (navigator.clipboard) await navigator.clipboard.writeText(res.prompt);
+  await copyTextWithFeedback(res.prompt, btn);
   document.getElementById('adoptOut').textContent = res.prompt;
 }
 
@@ -303,19 +387,20 @@ async function doAdopt() {
   const confirm = document.getElementById('adoptConfirm').checked;
   const res = await api('/api/adopt', { projectId, threadId, sourceLabel, rawText, confirmAuthorize: confirm });
   document.getElementById('adoptOut').textContent = JSON.stringify(res, null, 2);
+  showAlert('已收编流 ' + res.stream_id + ' (trust=' + res.trust_tier + ')', 'ok');
   await refreshStatus();
 }
 
 function renderParts(containerId, parts) {
   const el = document.getElementById(containerId);
-  el.innerHTML = '';
+  el.textContent = '';
   for (const p of parts) {
     const d = document.createElement('div');
     d.className = 'part-box';
     const btn = document.createElement('button');
     btn.className = 'sec';
     btn.textContent = '一键复制 Part ' + p.part_index + '/' + p.total_parts;
-    btn.onclick = () => navigator.clipboard && navigator.clipboard.writeText(p.text);
+    btn.onclick = () => copyTextWithFeedback(p.text, btn);
     const pre = document.createElement('pre');
     pre.textContent = p.text;
     d.appendChild(btn);
@@ -348,11 +433,14 @@ async function packReconcile() {
 }
 
 function downloadLatestMd() {
-  if (!latestMarkdown) return;
+  if (!latestMarkdown) {
+    showAlert('暂无可导出的信封，请先生成 Reconcile 或 Handoff 包。', 'err');
+    return;
+  }
   const blob = new Blob([latestMarkdown], { type: 'text/markdown;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'threadpass-reconcile-bundle.md';
+  a.download = 'threadpass-bundle.md';
   a.click();
 }
 
@@ -365,14 +453,15 @@ async function commitReconcile() {
     projectId, threadId, sourceStreamIds: selected, receiptRawText, confirmAuthorize
   });
   document.getElementById('recOut').textContent = JSON.stringify(res, null, 2);
+  showAlert('已合并提交到 Main (anchor=' + res.anchor_id + ')', 'ok');
   await refreshStatus();
 }
 
-async function copyCheckpointPrompt() {
+async function copyCheckpointPrompt(btn) {
   const { projectId, threadId } = getIds();
   const streamId = document.getElementById('ckptStream').value.trim() || undefined;
   const res = await api('/api/prompt/checkpoint', { projectId, threadId, streamId });
-  if (navigator.clipboard) await navigator.clipboard.writeText(res.prompt);
+  await copyTextWithFeedback(res.prompt, btn);
   document.getElementById('hoOut').textContent = res.prompt;
 }
 
@@ -390,13 +479,15 @@ async function doIngest() {
     projectId, threadId, streamId, rawText, workspaceDir, confirmAuthorize
   });
   document.getElementById('hoOut').textContent = JSON.stringify(res, null, 2);
+  showAlert('已提交检查点存档到流 ' + streamId, 'ok');
   await refreshStatus();
 }
 
 async function packHandoff() {
   const { projectId, threadId } = getIds();
   const streamId = document.getElementById('hoStream').value.trim() || undefined;
-  const res = await api('/api/handoff/pack', { projectId, threadId, streamId });
+  const perTurnLimit = Number(document.getElementById('hoLimit').value) || 24000;
+  const res = await api('/api/handoff/pack', { projectId, threadId, streamId, perTurnLimit });
   latestMarkdown = res.full_markdown;
   renderParts('hoParts', res.parts);
   document.getElementById('hoOut').textContent = JSON.stringify({
@@ -417,7 +508,7 @@ async function doFork() {
     projectId, threadId, originStreamId, workerStreamId, workspaceDir, taskBrief
   });
   const box = document.getElementById('forkPromptBox');
-  box.innerHTML = '';
+  box.textContent = '';
   if (res.worker_prompt) {
     renderParts('forkPromptBox', [{ part_index: 1, total_parts: 1, text: res.worker_prompt }]);
   }
@@ -428,6 +519,7 @@ async function doFork() {
     durability_state: res.durability_state,
     release_gated: res.release_gated
   }, null, 2);
+  showAlert('已派生子流 ' + res.worker_stream_id, 'ok');
   await refreshStatus();
 }
 
@@ -440,6 +532,7 @@ async function doMailboxSend() {
     projectId, threadId, fromStreamId, targetStreamId, text
   });
   document.getElementById('hoOut').textContent = JSON.stringify(res, null, 2);
+  showAlert('已发送异步消息 ' + res.message_id, 'ok');
   await refreshStatus();
 }
 
@@ -451,9 +544,18 @@ async function runFsck(rebuildSqlite) {
 
 async function shutdownServer() {
   await api('/api/shutdown', {});
-  document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#e2e8f0;background:#0f172a;">thp web 已安全退出（无后台常驻进程）。</div>';
+  document.body.textContent = '';
+  const msg = document.createElement('div');
+  msg.style.padding = '40px';
+  msg.style.fontFamily = 'sans-serif';
+  msg.style.color = '#e2e8f0';
+  msg.textContent = 'thp web 已安全退出（无后台常驻进程）。';
+  document.body.appendChild(msg);
 }
 
+wireDropAndFile('adoptText');
+wireDropAndFile('recReceipt');
+wireDropAndFile('ckptText');
 refreshStatus().catch(() => {});
 </script>
 </body>
@@ -687,6 +789,10 @@ export async function startThreadPassWeb(
           return;
         }
         if (reqUrl.pathname === '/api/handoff/pack') {
+          const perTurn =
+            typeof body.perTurnLimit === 'number' && body.perTurnLimit >= 1200
+              ? body.perTurnLimit
+              : 24000;
           sendJson(
             res,
             200,
@@ -694,6 +800,12 @@ export async function startThreadPassWeb(
               projectId: String(body.projectId),
               threadId: String(body.threadId),
               streamId: body.streamId ? String(body.streamId) : undefined,
+              budget: {
+                effective_context_budget: 120000,
+                per_turn_input_limit: perTurn,
+                budget_confidence: 'heuristic',
+                supports_attachments: true,
+              },
             }),
           );
           return;

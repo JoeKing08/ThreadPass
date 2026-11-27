@@ -258,6 +258,7 @@ export interface ReconciliationRecord {
   excluded_items: string[];
   provenance_only_refs: string[];
   conflicts: ReconciliationConflict[];
+  next_actions?: string[];
   strategy_id: string;
   strategy_version: string;
   input_manifest_hash: string;

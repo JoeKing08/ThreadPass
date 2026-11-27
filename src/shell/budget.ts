@@ -47,7 +47,7 @@ export class BudgetExceededError extends Error {
 }
 
 /**
- * Rough cross-tokenizer conservative token estimate (CJK chars ~1.5 tokens, ASCII ~0.35 tokens).
+ * Rough cross-tokenizer conservative token estimate (CJK chars ~1.6 tokens, ASCII ~0.4 tokens).
  */
 export function estimateConservativeTokens(text: string): number {
   let cjk = 0;
@@ -58,11 +58,63 @@ export function estimateConservativeTokens(text: string): number {
   return Math.ceil(cjk * 1.6 + nonCjk * 0.4 + 32);
 }
 
+function safeSurrogateSliceEnd(str: string, start: number, maxLen: number): number {
+  let end = Math.min(str.length, start + maxLen);
+  if (end < str.length && end > start) {
+    const prevCode = str.charCodeAt(end - 1);
+    if (prevCode >= 0xd800 && prevCode <= 0xdbff) {
+      end -= 1;
+    }
+  }
+  return end <= start ? Math.min(str.length, start + maxLen) : end;
+}
+
+/**
+ * Splits markdown into chunks along newline boundaries so fence markers and lines
+ * are never severed mid-line or mid-surrogate-pair.
+ */
+export function splitIntoLineAwareChunks(full: string, payloadMax: number): string[] {
+  const limit = Math.max(256, payloadMax);
+  const lines = full.split('\n');
+  const chunks: string[] = [];
+  let cur = '';
+
+  for (const line of lines) {
+    if (line.length > limit) {
+      if (cur.length > 0) {
+        chunks.push(cur);
+        cur = '';
+      }
+      let pos = 0;
+      while (pos < line.length) {
+        const end = safeSurrogateSliceEnd(line, pos, limit);
+        chunks.push(line.slice(pos, end));
+        pos = end;
+      }
+      continue;
+    }
+
+    const candidate = cur.length === 0 ? line : `${cur}\n${line}`;
+    if (candidate.length <= limit) {
+      cur = candidate;
+    } else {
+      chunks.push(cur);
+      cur = line;
+    }
+  }
+
+  if (cur.length > 0) {
+    chunks.push(cur);
+  }
+  return chunks.length > 0 ? chunks : [''];
+}
+
 /**
  * Applies `effective_context_budget > completeness_floor` rule, deduplicates identical
- * content blocks across multi-root sources by `content_hash`, folds lower-priority
- * sections deterministically, fails closed if priority-1 core exceeds total budget,
- * and splits into verified `Part i/N` chunks when exceeding `per_turn_input_limit`.
+ * content blocks across multi-root sources by `content_hash`, trims verbose priority-3
+ * bodies fairly before folding lower-priority sections deterministically, fails closed
+ * if priority-1 core exceeds total budget, and splits into line-aware `Part i/N` chunks
+ * when exceeding `per_turn_input_limit`.
  */
 export function packBudgetedEnvelope(
   envelopeId: string,
@@ -119,6 +171,29 @@ export function packBudgetedEnvelope(
     items.map((s) => `## ${s.title}\n\n${s.body}`).join('\n\n');
 
   let full = renderAll(working);
+
+  // Fair middle-trim pass on verbose priority-3 sections before dropping whole sources
+  if (estimateConservativeTokens(full) > budget.effective_context_budget) {
+    const trimCandidates = working
+      .filter((s) => s.priority === 3 && s.body.length > 2400)
+      .sort((a, b) => b.body.length - a.body.length);
+
+    for (const sec of trimCandidates) {
+      if (estimateConservativeTokens(full) <= budget.effective_context_budget) {
+        break;
+      }
+      const headEnd = safeSurrogateSliceEnd(sec.body, 0, 1000);
+      let tailStart = Math.max(headEnd, sec.body.length - 1000);
+      if (tailStart > 0 && tailStart < sec.body.length) {
+        const c = sec.body.charCodeAt(tailStart);
+        if (c >= 0xdc00 && c <= 0xdfff) tailStart += 1;
+      }
+      sec.body = `${sec.body.slice(0, headEnd)}\n[... MIDDLE TRIMMED FOR BUDGET; run \`thp peek\` on ${sec.pointer_ref ?? sec.key} if needed ...]\n${sec.body.slice(tailStart)}`;
+      folded.push(`${sec.key}#trimmed`);
+      full = renderAll(working);
+    }
+  }
+
   // Deterministic folding from priority 5 down to 3 until within effective_context_budget
   for (const prio of [5, 4, 3] as const) {
     if (estimateConservativeTokens(full) <= budget.effective_context_budget) {
@@ -163,14 +238,10 @@ export function packBudgetedEnvelope(
     };
   }
 
-  // Split into multi-part clipboard chunks respecting per_turn_input_limit
-  // Interactive convention: target host must wait for all parts before executing
+  // Split into line-aware multi-part clipboard chunks respecting per_turn_input_limit
   const headerReserve = 420;
   const payloadMax = Math.max(1000, budget.per_turn_input_limit - headerReserve);
-  const rawChunks: string[] = [];
-  for (let i = 0; i < full.length; i += payloadMax) {
-    rawChunks.push(full.slice(i, i + payloadMax));
-  }
+  const rawChunks = splitIntoLineAwareChunks(full, payloadMax);
   const totalParts = rawChunks.length;
   const parts = rawChunks.map((chunk, idx) => {
     const partIndex = idx + 1;

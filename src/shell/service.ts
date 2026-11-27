@@ -38,6 +38,7 @@ import { type HostBudgetSpec, type PackedEnvelopeResult } from './budget.js';
 import {
   buildEventsFromAdoptedPackage,
   parseExternalConversationInput,
+  type ParsedAdoptPackage,
 } from './ir.js';
 import {
   buildCurrentRoleBriefing,
@@ -87,6 +88,61 @@ export class ThreadPassService {
 
   constructor(engineOptions?: ConstructorParameters<typeof LocalOfflineEngine>[0]) {
     this.engine = new LocalOfflineEngine(engineOptions);
+  }
+
+  private sanitizeTextList(items: readonly string[]): { items: string[]; redactedCount: number } {
+    let redactedCount = 0;
+    const out: string[] = [];
+    for (const item of items) {
+      const r = this.engine.redactor.sanitizeText(item);
+      redactedCount += r.redactedCount;
+      out.push(r.sanitized);
+    }
+    return { items: out, redactedCount };
+  }
+
+  private sanitizeAdoptPackage(pkg: ParsedAdoptPackage): {
+    pkg: ParsedAdoptPackage;
+    redactedCount: number;
+  } {
+    let total = 0;
+    const sumRes = this.engine.redactor.sanitizeText(pkg.summary_text);
+    total += sumRes.redactedCount;
+    const quotesRes = this.sanitizeTextList(pkg.claimed_user_quotes);
+    total += quotesRes.redactedCount;
+    const decRes = this.sanitizeTextList(pkg.decisions_made);
+    total += decRes.redactedCount;
+    const filesRes = this.sanitizeTextList(pkg.files_and_artifacts);
+    total += filesRes.redactedCount;
+    const tasksRes = this.sanitizeTextList(pkg.pending_tasks);
+    total += tasksRes.redactedCount;
+    const blockersRes = this.sanitizeTextList(pkg.blockers);
+    total += blockersRes.redactedCount;
+    const qRes = this.sanitizeTextList(pkg.open_questions);
+    total += qRes.redactedCount;
+    const errRes = this.sanitizeTextList(pkg.tool_errors);
+    total += errRes.redactedCount;
+    const turns = pkg.recent_turns.map((t) => {
+      const tr = this.engine.redactor.sanitizeText(t.text);
+      total += tr.redactedCount;
+      return { ...t, text: tr.sanitized };
+    });
+
+    return {
+      redactedCount: total,
+      pkg: {
+        ...pkg,
+        summary_text: sumRes.sanitized,
+        claimed_user_quotes: quotesRes.items,
+        decisions_made: decRes.items,
+        files_and_artifacts: filesRes.items,
+        pending_tasks: tasksRes.items,
+        blockers: blockersRes.items,
+        open_questions: qRes.items,
+        tool_errors: errRes.items,
+        recent_turns: turns,
+      },
+    };
   }
 
   initThread(params: {
@@ -317,6 +373,9 @@ export class ThreadPassService {
     const warnings: string[] = [];
     const label = params.sourceLabel ?? 'external_ai';
     const pkg = parseExternalConversationInput(params.rawText, label);
+    if (pkg.parse_warnings.length > 0) {
+      warnings.push(...pkg.parse_warnings);
+    }
     const streamId = assertSafeIdentifier(
       'stream_id',
       params.streamId ??
@@ -326,6 +385,7 @@ export class ThreadPassService {
     const sanitizedRawRes = this.engine.redactor.sanitizeText(pkg.raw_text);
     const sanitizedPkgText = sanitizedRawRes.sanitized;
 
+    // Verify confirmation proof against exact raw text first, then sanitize all fields persisted at rest
     const exactSha = sha256Hex(normalizeConfirmationText(params.rawText));
     const verificationMethod =
       pkg.mode === 'model_authored' ? 'model_reported' : 'unverified_text_import';
@@ -338,12 +398,15 @@ export class ThreadPassService {
     };
     const trustTier = computeTrustTier(provenance, exactSha);
 
+    const sanitizedPkgRes = this.sanitizeAdoptPackage(pkg);
+    const safePkg = sanitizedPkgRes.pkg;
+
     const anchorId = newId('anc', 8);
     const nowIso = this.engine.clock.wallIso();
     const { events, invocation } = buildEventsFromAdoptedPackage({
       streamId,
       txnId: 'pending',
-      pkg,
+      pkg: safePkg,
       trustTier,
       provenance,
       startSeq: 1,
@@ -464,7 +527,7 @@ export class ThreadPassService {
       stream_id: streamId,
       parents: [], // Independent wild root stream
       workspace_manifest: ws,
-      summary: pkg.summary_text || `Adopted ${label} (${pkg.continuity_level})`,
+      summary: safePkg.summary_text || `Adopted ${label} (${safePkg.continuity_level})`,
       head_event_ids: events.map((e) => e.event_id),
       created_at: nowIso,
     };
@@ -541,7 +604,7 @@ export class ThreadPassService {
       mode: pkg.mode,
       continuity_level: pkg.continuity_level,
       warnings,
-      redacted_count: sanitizedRawRes.redactedCount,
+      redacted_count: Math.max(sanitizedRawRes.redactedCount, sanitizedPkgRes.redactedCount),
     };
   }
 
@@ -687,9 +750,22 @@ export class ThreadPassService {
     anchor_id: string;
     txn_id: string;
     conflicts_count: number;
+    parse_warning?: string;
   } {
     const parsed = parseReconcileReceipt(params.receiptRawText);
+    const exactReceiptSha = sha256Hex(normalizeConfirmationText(params.receiptRawText));
     const sanitizedSummary = this.engine.redactor.sanitizeText(parsed.synthesis_summary).sanitized;
+    const sanitizedAdopted = this.sanitizeTextList(parsed.adopted_items).items;
+    const sanitizedPartial = this.sanitizeTextList(parsed.partial_items).items;
+    const sanitizedExcluded = this.sanitizeTextList(parsed.excluded_items).items;
+    const sanitizedProvenanceRefs = this.sanitizeTextList(parsed.provenance_only_refs).items;
+    const sanitizedNextActions = this.sanitizeTextList(parsed.next_actions).items;
+    const sanitizedConflicts = parsed.conflicts.map((c) => ({
+      ...c,
+      topic: this.engine.redactor.sanitizeText(c.topic).sanitized,
+      positions: this.sanitizeTextList(c.positions).items,
+      resolution: this.engine.redactor.sanitizeText(c.resolution).sanitized,
+    }));
     const store = this.engine.openStore(params.projectId, params.threadId);
 
     let threadRow: ReturnType<typeof store.getThread>;
@@ -745,11 +821,12 @@ export class ThreadPassService {
       output_stream_id: threadRow.main_stream_id,
       output_anchor_id: newAnchorId,
       input_sources: inputSources,
-      adopted_items: parsed.adopted_items,
-      partial_items: parsed.partial_items,
-      excluded_items: parsed.excluded_items,
-      provenance_only_refs: parsed.provenance_only_refs,
-      conflicts: parsed.conflicts,
+      adopted_items: sanitizedAdopted,
+      partial_items: sanitizedPartial,
+      excluded_items: sanitizedExcluded,
+      provenance_only_refs: sanitizedProvenanceRefs,
+      conflicts: sanitizedConflicts,
+      next_actions: sanitizedNextActions,
       strategy_id: 'explicit_human_or_main_reconciliation',
       strategy_version: SCHEMA_VERSION,
       input_manifest_hash: canonicalSha256(depManifest),
@@ -770,7 +847,6 @@ export class ThreadPassService {
       adapter_version: TRUST_ADAPTER_VERSION,
       confirmation_proof: params.confirmationProof,
     };
-    const exactReceiptSha = sha256Hex(normalizeConfirmationText(params.receiptRawText));
     const reconcileTrustTier = computeTrustTier(reconcileProvenance, exactReceiptSha);
 
     const injectEvent: EventRecord = {
@@ -800,10 +876,10 @@ export class ThreadPassService {
       parents: mainRow.head_anchor_id ? [mainRow.head_anchor_id] : [],
       workspace_manifest: ws,
       reconciliation_record_ref: reconciliationId,
-      summary: sanitizedSummary.slice(0, 300),
+      summary: sanitizedSummary.slice(0, 600),
       head_event_ids: [injectEventId],
       input_dependency_refs: [depManifest.input_dependency_id],
-      provenance_refs: parsed.provenance_only_refs,
+      provenance_refs: sanitizedProvenanceRefs,
       created_at: nowIso,
     };
 
@@ -832,7 +908,7 @@ export class ThreadPassService {
         reconciliation_id: reconciliationId,
         output_anchor_id: newAnchorId,
         input_sources: inputSources,
-        conflicts_count: parsed.conflicts.length,
+        conflicts_count: sanitizedConflicts.length,
       },
     };
 
@@ -850,7 +926,7 @@ export class ThreadPassService {
       ],
       journal_events: [journalEv],
       input_dependency_manifests: [depManifest],
-      provenance_refs: parsed.provenance_only_refs,
+      provenance_refs: sanitizedProvenanceRefs,
     });
 
     return {
@@ -858,7 +934,8 @@ export class ThreadPassService {
       main_stream_id: threadRow.main_stream_id,
       anchor_id: newAnchorId,
       txn_id: res.txn_id,
-      conflicts_count: parsed.conflicts.length,
+      conflicts_count: sanitizedConflicts.length,
+      ...(parsed.parse_warning ? { parse_warning: parsed.parse_warning } : {}),
     };
   }
 
@@ -1068,7 +1145,13 @@ export class ThreadPassService {
     ackBatchId?: string;
     ackMessageIds?: string[];
     workspaceDir?: string;
-  }): { anchor_id: string; txn_id: string; accepted_mailbox_ids: string[] } {
+  }): {
+    anchor_id: string;
+    txn_id: string;
+    accepted_mailbox_ids: string[];
+    warnings: string[];
+    redacted_count: number;
+  } {
     const store = this.engine.openStore(params.projectId, params.threadId);
     let headAnchorId: string | null = null;
     let lastSeq = 0;
@@ -1145,10 +1228,12 @@ export class ThreadPassService {
       confirmation_proof: params.confirmationProof,
     };
     const trustTier = computeTrustTier(provenance, exactSha);
+    const sanitizedPkgRes = this.sanitizeAdoptPackage(pkg);
+    const safePkg = sanitizedPkgRes.pkg;
     const { events, invocation } = buildEventsFromAdoptedPackage({
       streamId: params.streamId,
       txnId: 'pending',
-      pkg,
+      pkg: safePkg,
       trustTier,
       provenance,
       startSeq: lastSeq + 1,
@@ -1162,7 +1247,7 @@ export class ThreadPassService {
       stream_id: params.streamId,
       parents: headAnchorId ? [headAnchorId] : [],
       workspace_manifest: captureWorkspaceManifest(params.workspaceDir),
-      summary: pkg.summary_text || `Ingested reply onto ${params.streamId}`,
+      summary: safePkg.summary_text || `Ingested reply onto ${params.streamId}`,
       head_event_ids: events.map((e) => e.event_id),
       created_at: nowIso,
     };
@@ -1185,6 +1270,8 @@ export class ThreadPassService {
       anchor_id: newAnchorId,
       txn_id: res.txn_id,
       accepted_mailbox_ids: acceptedMailboxIds,
+      warnings: pkg.parse_warnings,
+      redacted_count: sanitizedPkgRes.redactedCount,
     };
   }
 
@@ -1391,9 +1478,14 @@ export class ThreadPassService {
     if (!releaseGated) {
       // Strictly separate feed surface from global archive capsule snapshot,
       // while including recent fenced events from the origin checkpoint so scoped workers have real context.
-      const originEvents = this.engine
-        .readCommittedStreamLines(params.projectId, params.threadId, sourceAnchor.stream_id)
-        .filter((l): l is EventRecord => l.kind === 'event')
+      const originLines = this.engine.readCommittedStreamLines(
+        params.projectId,
+        params.threadId,
+        sourceAnchor.stream_id,
+      );
+      const allOriginEvents = originLines.filter((l): l is EventRecord => l.kind === 'event');
+      const omittedOriginCount = Math.max(0, allOriginEvents.length - 4);
+      const originEventLines = allOriginEvents
         .slice(-4)
         .map((ev) => {
           const rawBody =
@@ -1407,11 +1499,22 @@ export class ThreadPassService {
                     ? ev.payload.text ?? ''
                     : ev.payload.text ?? '';
           return `[${ev.event_id}][${ev.payload.type}][tier=${ev.trust_tier}] ${rawBody.slice(0, 800)}`;
-        })
-        .join('\n');
+        });
+      if (omittedOriginCount > 0) {
+        originEventLines.unshift(`[... ${omittedOriginCount} earlier parent event(s) omitted ...]`);
+      }
+      const originEvents = originEventLines.join('\n');
+
+      let latestNextActions: string[] = [];
+      for (const line of originLines) {
+        if (line.kind === 'control' && line.payload.type === 'reconciliation_record') {
+          latestNextActions = line.payload.record.next_actions ?? [];
+        }
+      }
 
       const scopedBody = [
         `Origin summary: ${sourceAnchor.summary ?? '(none)'}`,
+        latestNextActions.length > 0 ? `Origin next_actions:\n- ${latestNextActions.join('\n- ')}` : '',
         originEvents ? `Recent checkpoint events:\n${originEvents}` : '',
       ]
         .filter(Boolean)
@@ -1431,7 +1534,11 @@ export class ThreadPassService {
         anchorOrRef: sourceAnchor.anchor_id,
         bodyText: scopedBody,
       });
-      workerPrompt = `${roleHeader}\n\n## Scoped Parent Context\n\n${scopedCtx}\n\n## Permission Boundary\n- ${capsule.permission_boundary.join('\n- ')}`;
+      const returnReminder = [
+        `When your subtask finishes, provide your findings/changes AND include ONE \`\`\`json checkpoint block citing:`,
+        `- \`threadpass_handoff: true\`, \`source_label: "${workerStreamId}"\`, \`base_anchor_id: "${workerAnchorId}"\`, \`dispatch_id: "${dispatchId}"\`, \`summary_text\`, \`decisions_made\`, \`files_and_artifacts\`, \`pending_tasks\`, \`blockers\`, \`tool_errors\`.`,
+      ].join('\n');
+      workerPrompt = `${roleHeader}\n\n## Scoped Parent Context\n\n${scopedCtx}\n\n## Permission Boundary\n- ${capsule.permission_boundary.join('\n- ')}\n\n## Expected Artifacts\n- ${capsule.expected_artifacts.join('\n- ')}\n\n## Return Format Reminder\n${returnReminder}`;
       assertOutboundEgressSafe(this.engine.redactor, workerPrompt);
     }
 
