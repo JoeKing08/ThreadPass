@@ -73,8 +73,13 @@ function safeSurrogateSliceEnd(str: string, start: number, maxLen: number): numb
  * Splits markdown into chunks along newline boundaries so fence markers and lines
  * are never severed mid-line or mid-surrogate-pair.
  */
-export function splitIntoLineAwareChunks(full: string, payloadMax: number): string[] {
-  const limit = Math.max(256, payloadMax);
+export function splitIntoLineAwareChunks(
+  full: string,
+  payloadMax: number,
+  minLimit = 256,
+): string[] {
+  const floor = Math.max(16, Math.min(256, minLimit));
+  const limit = Math.max(floor, payloadMax);
   const lines = full.split('\n');
   const chunks: string[] = [];
   let cur = '';
@@ -121,7 +126,8 @@ export function splitIntoFenceAwareChunks(full: string, payloadMax: number): str
   let i = 0;
   while (i < rawLines.length) {
     const line = rawLines[i];
-    const xmlOpen = line.match(/^<(archived_reference_[a-f0-9]+)\b[^>]*>$/);
+    const trimmedLine = line.trim();
+    const xmlOpen = trimmedLine.match(/^<(archived_reference_[a-f0-9]+)\b[^>]*>$/);
     if (xmlOpen) {
       const closeTag = `</${xmlOpen[1]}>`;
       const buf: string[] = [line];
@@ -143,7 +149,7 @@ export function splitIntoFenceAwareChunks(full: string, payloadMax: number): str
       }
     }
 
-    const legacyOpen = line.match(/^<<<(UNTRUSTED_DATA_[A-Z0-9]+)\b/);
+    const legacyOpen = trimmedLine.match(/^<<<(UNTRUSTED_DATA_[A-Z0-9]+)\b/);
     if (legacyOpen) {
       const closeMarker = `<<<END_${legacyOpen[1]}>>>`;
       const buf: string[] = [line];
@@ -179,13 +185,13 @@ export function splitIntoFenceAwareChunks(full: string, payloadMax: number): str
 
     if (unit.kind === 'xml_fence') {
       const fLines = unit.text.split('\n');
-      const openLine = fLines[0];
-      const closeLine = fLines[fLines.length - 1];
+      const openLine = fLines[0].trim();
+      const closeLine = fLines[fLines.length - 1].trim();
       const inner = fLines.slice(1, -1).join('\n');
-      const segAttrBudget = ' segment="999/999"'.length;
+      const segAttrBudget = ' segment="9999/9999"'.length;
       const innerMax = limit - (openLine.length + segAttrBudget + closeLine.length + 2);
-      if (innerMax >= 64) {
-        const innerSlices = splitIntoLineAwareChunks(inner, innerMax);
+      if (innerMax >= 16) {
+        const innerSlices = splitIntoLineAwareChunks(inner, innerMax, 16);
         const total = innerSlices.length;
         for (let idx = 0; idx < total; idx++) {
           const segOpen = openLine.replace(/>$/, ` segment="${idx + 1}/${total}">`);
@@ -200,8 +206,8 @@ export function splitIntoFenceAwareChunks(full: string, payloadMax: number): str
       const footer = fLines[fLines.length - 1];
       const inner = fLines.slice(headerCount, -1).join('\n');
       const innerMax = limit - (header.length + footer.length + 2);
-      if (innerMax >= 64) {
-        const innerSlices = splitIntoLineAwareChunks(inner, innerMax);
+      if (innerMax >= 16) {
+        const innerSlices = splitIntoLineAwareChunks(inner, innerMax, 16);
         for (const s of innerSlices) {
           boundedUnits.push(`${header}\n${s}\n${footer}`);
         }

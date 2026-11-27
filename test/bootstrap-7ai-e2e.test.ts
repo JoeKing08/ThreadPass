@@ -24,6 +24,7 @@ import {
   issueConfirmationProof,
   normalizeConfirmationText,
   renderNonInstructionFence,
+  sanitizeXmlAttr,
 } from '../src/shell/trust.js';
 import { startThreadPassWeb } from '../src/shell/web.js';
 
@@ -2245,6 +2246,305 @@ test('M1-M4 audit fixes: strict multipart guards, unverified model locator isola
       assert.deepEqual(opens, closes, `Unbalanced XML reference tags inside part ${p.part_index}`);
     }
   } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Audit fixes: small per_turn_input_limit (700) XML fences, continuation multipart chunks, initThread placeholder guard, and Web selective conflict confirm', async () => {
+  const home = makeTempHome('b-audit-fixes');
+  const svc = new ThreadPassService({ homeDir: home });
+  const web = await startThreadPassWeb({ service: svc, idleTimeoutMs: 60_000 });
+  try {
+    // 1. initThread ignores placeholder hostSessionId ('null')
+    const init = svc.initThread({
+      projectId: 'proj_b',
+      threadId: 'thr_b',
+      mainStreamId: 'strm_main',
+      hostSessionId: 'null',
+    });
+    const initStore = svc.engine.openStore('proj_b', 'thr_b');
+    try {
+      assert.equal(initStore.lookupHostBinding('null'), null);
+    } finally {
+      initStore.close();
+    }
+
+    // 2. Small per_turn_input_limit (700, innerMax < 256) with long special-char label MUST NOT overflow or sever XML tags
+    const longLabel = `src_"&_${'L'.repeat(120)}`;
+    svc.adoptExternal({
+      projectId: 'proj_b',
+      threadId: 'thr_b',
+      sourceLabel: longLabel,
+      streamId: 'strm_long_label',
+      rawText: 'assistant: ' + Array.from({ length: 18 }, (_, i) => `Line ${i}: ${'Q'.repeat(45)}`).join('\n'),
+    });
+    const tightPack = svc.packHandoff({
+      projectId: 'proj_b',
+      threadId: 'thr_b',
+      streamId: 'strm_long_label',
+      budget: {
+        effective_context_budget: 100_000,
+        per_turn_input_limit: 700,
+        budget_confidence: 'heuristic',
+        supports_attachments: false,
+      },
+    });
+    assert.ok(tightPack.parts.length >= 2);
+    for (const p of tightPack.parts) {
+      assert.ok(p.text.length <= 700, `Part ${p.part_index} exceeded 700 chars: ${p.text.length}`);
+      const opens = [...p.text.matchAll(/<(archived_reference_[a-f0-9]+)\b/g)].map((m) => m[1]);
+      const closes = [...p.text.matchAll(/<\/(archived_reference_[a-f0-9]+)>/g)].map((m) => m[1]);
+      assert.deepEqual(opens, closes, `Unbalanced XML reference tags inside part ${p.part_index}`);
+    }
+
+    // 3. Multipart continuation parts omitting repeated domain header keys still assemble cleanly
+    const contAdoptRaw = [
+      '```json\n' +
+        JSON.stringify({
+          threadpass_handoff: true,
+          part_group_id: 'grp_cont_adopt',
+          part_index: 1,
+          total_parts: null,
+          is_final: false,
+          summary_text: 'Initial summary chunk',
+        }) +
+        '\n```',
+      '```json\n' +
+        JSON.stringify({
+          part_group_id: 'grp_cont_adopt',
+          part_index: 2,
+          total_parts: null,
+          is_final: true,
+          pending_tasks: ['Continuation task preserved'],
+        }) +
+        '\n```',
+    ].join('\n\n');
+    const parsedContAdopt = parseExternalConversationInput(contAdoptRaw, 'cont_test');
+    assert.deepEqual(parsedContAdopt.assembled_parts, { group_id: 'grp_cont_adopt', total_parts: 2 });
+    assert.deepEqual(parsedContAdopt.pending_tasks, ['Continuation task preserved']);
+
+    const contRecRaw = [
+      '```json\n' +
+        JSON.stringify({
+          reconciliation_receipt: true,
+          part_group_id: 'grp_cont_rec',
+          part_index: 1,
+          total_parts: 2,
+          is_final: false,
+          adopted_items: ['strm_long_label'],
+          synthesis_summary: 'Merged cont part 1',
+        }) +
+        '\n```',
+      '```json\n' +
+        JSON.stringify({
+          part_group_id: 'grp_cont_rec',
+          part_index: 2,
+          total_parts: 2,
+          is_final: true,
+          next_actions: ['Follow-up from continuation part'],
+        }) +
+        '\n```',
+    ].join('\n\n');
+    const parsedContRec = parseReconcileReceipt(contRecRaw);
+    assert.deepEqual(parsedContRec.assembled_parts, { group_id: 'grp_cont_rec', total_parts: 2 });
+    assert.deepEqual(parsedContRec.next_actions, ['Follow-up from continuation part']);
+
+    // 4. Web /api/reconcile/commit honors confirmedConflictTopics selectively
+    const recPack = svc.packReconcile({
+      projectId: 'proj_b',
+      threadId: 'thr_b',
+      sourceStreamIds: ['strm_long_label'],
+    });
+    const receiptText = JSON.stringify({
+      reconciliation_receipt: true,
+      pack_envelope_id: recPack.envelope_id,
+      adopted_items: ['strm_long_label'],
+      conflicts: [
+        { topic: 'Topic A', kind: 'semantic', positions: ['1', '2'], resolution: 'Pick 1' },
+        { topic: 'Topic B', kind: 'semantic', positions: ['x', 'y'], resolution: 'Pick x' },
+      ],
+      synthesis_summary: 'Selective web conflict test',
+    });
+    const hdrs = { 'Content-Type': 'application/json', 'X-ThreadPass-Token': web.token };
+    const prep = (await (
+      await fetch(`http://127.0.0.1:${web.port}/api/confirm/prepare`, {
+        method: 'POST',
+        headers: hdrs,
+        body: JSON.stringify({ contentText: receiptText, purpose: 'authorize_instruction' }),
+      })
+    ).json()) as { challenge_id: string; content_sha256: string };
+
+    const commitRes = await fetch(`http://127.0.0.1:${web.port}/api/reconcile/commit`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_b',
+        threadId: 'thr_b',
+        sourceStreamIds: ['strm_long_label'],
+        packEnvelopeId: recPack.envelope_id,
+        receiptRawText: receiptText,
+        confirmedConflictTopics: ['Topic A'],
+        confirmChallengeId: prep.challenge_id,
+        confirmContentSha256: prep.content_sha256,
+      }),
+    });
+    assert.equal(commitRes.status, 200);
+
+    const mainLines = svc.peekStream('proj_b', 'thr_b', init.main_stream_id);
+    const recLine = mainLines.find((l) => l.kind === 'control' && l.payload.type === 'reconciliation_record');
+    assert.ok(recLine && recLine.kind === 'control' && recLine.payload.type === 'reconciliation_record');
+    assert.equal(recLine.payload.record.conflicts[0].topic, 'Topic A');
+    assert.equal(recLine.payload.record.conflicts[0].human_confirmed, true);
+    assert.equal(recLine.payload.record.conflicts[1].topic, 'Topic B');
+    assert.equal(recLine.payload.record.conflicts[1].human_confirmed, false);
+  } finally {
+    await web.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Regression checks for continuation filter, adversarial XML attr escaping, and confirmedConflictTopics guard', async () => {
+  const home = makeTempHome('regressions-extra');
+  const svc = new ThreadPassService({ homeDir: home });
+  const web = await startThreadPassWeb({ service: svc, idleTimeoutMs: 60_000 });
+  try {
+    // 1. Single-part ThreadPass JSON alongside unrelated pagination JSON with part_index must succeed
+    const withPaginationProse = [
+      'Pagination example for UI: ```json\n{"page": 1, "part_index": 1, "total_parts": 3}\n```',
+      'ThreadPass payload:\n```json\n' +
+        JSON.stringify({
+          threadpass_handoff: true,
+          summary_text: 'Single-part handoff beside unrelated JSON',
+          pending_tasks: ['Ship fix'],
+        }) +
+        '\n```',
+    ].join('\n\n');
+    const parsedSingle = parseExternalConversationInput(withPaginationProse, 'prose_pagination');
+    assert.equal(parsedSingle.mode, 'model_authored');
+    assert.equal(parsedSingle.summary_text, 'Single-part handoff beside unrelated JSON');
+
+    // 2. Orphaned Part 2 continuation chunks without Part 1 fail closed on both adopt and reconcile parsers
+    const orphanAdopt = JSON.stringify({
+      part_group_id: 'grp_orphan_adopt',
+      part_index: 2,
+      total_parts: 2,
+      is_final: true,
+      pending_tasks: ['Orphan task without part 1'],
+    });
+    assert.throws(
+      () => parseExternalConversationInput(orphanAdopt, 'orphan_test'),
+      (err: unknown) => err instanceof IncompleteMultipartOutputError && /missing part\(s\) 1/i.test(String(err)),
+    );
+
+    const orphanRec = '```json\n' +
+      JSON.stringify({
+        part_group_id: 'grp_orphan_rec',
+        part_index: 2,
+        total_parts: 2,
+        is_final: true,
+        next_actions: ['Orphan action without part 1'],
+      }) +
+      '\n```';
+    assert.throws(
+      () => parseReconcileReceipt(orphanRec),
+      (err: unknown) => err instanceof IncompleteMultipartOutputError && /missing part\(s\) 1/i.test(String(err)),
+    );
+
+    // 3. sanitizeXmlAttr enforces escaped length ceiling, intact XML entities, and valid UTF-16 code points
+    const escapedAttr = sanitizeXmlAttr(`a&b"<c>'${'🚀'.repeat(40)}`, 60);
+    assert.ok(escapedAttr.length <= 60);
+    assert.equal(Buffer.from(escapedAttr, 'utf8').toString('utf8'), escapedAttr);
+    assert.ok(!/&[a-z0-9#]*$/i.test(escapedAttr));
+
+    // Extreme floor budget (per_turn_input_limit=676) handles adversarial attribute escaping cleanly
+    const fenced = renderNonInstructionFence({
+      sourceLabel: '"""&&&<<<>>>\'\'\''.repeat(8),
+      trustTier: 'untrusted_unknown',
+      anchorOrRef: '&&&<<<>>>"""\'\'\''.repeat(8),
+      bodyText: Array.from({ length: 24 }, (_, idx) => `Line ${idx + 1}: verified segment body content`).join('\n'),
+    });
+    const packed = packBudgetedEnvelope(
+      'env_adv_xml',
+      [
+        {
+          key: 'adv_fenced',
+          priority: 2,
+          title: 'Adversarial Fenced Block',
+          body: fenced,
+          content_hash: sha256Hex(fenced),
+        },
+      ],
+      {
+        effective_context_budget: 24_000,
+        per_turn_input_limit: 676,
+        budget_confidence: 'exact',
+        supports_attachments: false,
+      },
+    );
+    assert.ok(packed.parts.length >= 2);
+    for (const part of packed.parts) {
+      assert.ok(part.text.length <= 676);
+      const opens = [...part.text.matchAll(/<(archived_reference_[a-f0-9]+)\b/g)].map((m) => m[1]);
+      const closes = [...part.text.matchAll(/<\/(archived_reference_[a-f0-9]+)>/g)].map((m) => m[1]);
+      assert.deepEqual(opens, closes, `Unbalanced XML reference tags inside part ${part.part_index}`);
+    }
+
+    // 4. confirmedConflictTopics without ConfirmationProof fails closed on Service & Web API + Web HTML exposes recConfirmTopics
+    svc.initThread({
+      projectId: 'proj_topics_guard',
+      threadId: 'thr_topics_guard',
+      summary: 'Topic guard check',
+    });
+    const strm = svc.adoptExternal({
+      projectId: 'proj_topics_guard',
+      threadId: 'thr_topics_guard',
+      streamId: 'strm_branch',
+      sourceLabel: 'branch_ai',
+      rawText: 'Branch proposal A',
+    });
+    const pack = svc.packReconcile({
+      projectId: 'proj_topics_guard',
+      threadId: 'thr_topics_guard',
+      sourceStreamIds: [strm.stream_id],
+    });
+    const recText = JSON.stringify({
+      reconciliation_receipt: true,
+      pack_envelope_id: pack.envelope_id,
+      adopted_items: [strm.stream_id],
+      conflicts: [{ topic: 'Topic A', kind: 'semantic', positions: ['1', '2'], resolution: 'Pick 1' }],
+      synthesis_summary: 'Conflict summary',
+    });
+    assert.throws(
+      () =>
+        svc.commitReconcile({
+          projectId: 'proj_topics_guard',
+          threadId: 'thr_topics_guard',
+          sourceStreamIds: [strm.stream_id],
+          packEnvelopeId: pack.envelope_id,
+          receiptRawText: recText,
+          confirmedConflictTopics: ['Topic A'],
+        }),
+      /without a valid human_authority ConfirmationProof/,
+    );
+
+    const webRes = await fetch(`http://127.0.0.1:${web.port}/api/reconcile/commit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-ThreadPass-Token': web.token },
+      body: JSON.stringify({
+        projectId: 'proj_topics_guard',
+        threadId: 'thr_topics_guard',
+        sourceStreamIds: [strm.stream_id],
+        packEnvelopeId: pack.envelope_id,
+        receiptRawText: recText,
+        confirmedConflictTopics: ['Topic A'],
+      }),
+    });
+    assert.equal(webRes.status, 400);
+
+    const uiHtml = await (await fetch(`http://127.0.0.1:${web.port}/?token=${web.token}`)).text();
+    assert.ok(uiHtml.includes('id="recConfirmTopics"'));
+  } finally {
+    await web.close();
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

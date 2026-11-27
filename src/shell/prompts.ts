@@ -586,7 +586,6 @@ export function parseReconcileReceipt(rawText: string): ParsedReconcileReceipt {
     };
   }
 
-  void IncompleteMultipartOutputError;
   return {
     adopted_items: [],
     partial_items: [],

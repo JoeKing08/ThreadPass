@@ -3,9 +3,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { canonicalSha256, sha256Hex } from '../src/core/canonical.js';
+import { canonicalSha256, deterministicEventId, newId, sha256Hex } from '../src/core/canonical.js';
 import type { ClockPort } from '../src/core/ports.js';
-import { SCHEMA_VERSION, type TransactionFinalizationCertificate, type TransactionManifest } from '../src/core/types.js';
+import {
+  SCHEMA_VERSION,
+  type EventRecord,
+  type LineageAnchor,
+  type TransactionFinalizationCertificate,
+  type TransactionManifest,
+} from '../src/core/types.js';
 import {
   ImmutableTargetCorruptedError,
   publishImmutable,
@@ -24,6 +30,7 @@ import {
   SimulatedCrashError,
 } from '../src/profile/local-offline/txn-engine.js';
 import { ThreadPassService, ForeignCanonicalDetectedError } from '../src/shell/service.js';
+import { captureWorkspaceManifest } from '../src/shell/workspace.js';
 
 function makeTempHome(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `thp-test-${label}-`));
@@ -940,6 +947,199 @@ test('Transcript locators cap inline prompt list at 12, export transcript-index.
 
     const stAfter = svc.getStatus('proj_tloc', 'thr_tloc');
     assert.equal(stAfter.transcript_locators.length, 15);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Cross-stream transcript locators isolate identical blobs/paths across distinct streams across fsck --rebuild', () => {
+  const home = makeTempHome('tloc-cross-stream');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+    svc.initThread({ projectId: 'proj_iso', threadId: 'thr_iso', mainStreamId: 'strm_main' });
+
+    const sharedUpload = 'User: identical export\nAssistant: identical reply\n';
+    svc.adoptExternal({
+      projectId: 'proj_iso',
+      threadId: 'thr_iso',
+      streamId: 'strm_up_a',
+      sourceLabel: 'upload_a',
+      rawText: 'assistant: stream A summary',
+      uploadedTranscriptText: sharedUpload,
+      uploadedTranscriptFilename: 'chat_a.txt',
+    });
+    svc.adoptExternal({
+      projectId: 'proj_iso',
+      threadId: 'thr_iso',
+      streamId: 'strm_up_b',
+      sourceLabel: 'upload_b',
+      rawText: 'assistant: stream B summary',
+      uploadedTranscriptText: sharedUpload,
+      uploadedTranscriptFilename: 'chat_b.txt',
+    });
+
+    const sharedPath = path.join(home, 'shared_session.jsonl');
+    fs.writeFileSync(sharedPath, '{"msg":"shared"}\n', 'utf8');
+    svc.adoptExternal({
+      projectId: 'proj_iso',
+      threadId: 'thr_iso',
+      streamId: 'strm_loc_c',
+      sourceLabel: 'local_c',
+      rawText: 'assistant: stream C summary',
+      transcriptFilePath: sharedPath,
+    });
+    svc.adoptExternal({
+      projectId: 'proj_iso',
+      threadId: 'thr_iso',
+      streamId: 'strm_loc_d',
+      sourceLabel: 'local_d',
+      rawText: 'assistant: stream D summary',
+      transcriptFilePath: sharedPath,
+    });
+
+    const before = svc.getStatus('proj_iso', 'thr_iso');
+    assert.deepEqual(
+      before.transcript_locators.map((l) => l.stream_id).sort(),
+      ['strm_loc_c', 'strm_loc_d', 'strm_up_a', 'strm_up_b'],
+    );
+
+    const rebuilt = svc.runFsck('proj_iso', 'thr_iso', { rebuildSqlite: true });
+    assert.equal(rebuilt.ok, true);
+    const after = svc.getStatus('proj_iso', 'thr_iso');
+    assert.deepEqual(
+      after.transcript_locators.map((l) => l.stream_id).sort(),
+      ['strm_loc_c', 'strm_loc_d', 'strm_up_a', 'strm_up_b'],
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('commitIntentTransaction atomically blocks duplicate confirmation_proof nonce reuse inside SQLite lock', () => {
+  const home = makeTempHome('atomic-nonce');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+    svc.initThread({ projectId: 'proj_nonce', threadId: 'thr_nonce', mainStreamId: 'strm_main' });
+
+    const text = 'assistant: authorize once atomically';
+    const proof = svc.issueLocalConfirmationProof(text, 'authorize_instruction', 'local_cli');
+
+    const makeRawTxn = (streamId: string) => {
+      const nowIso = new Date().toISOString();
+      const evId = deterministicEventId(streamId, sha256Hex(`${streamId}|${text}`));
+      const ancId = newId('anc', 8);
+      const ev: EventRecord = {
+        schema_version: SCHEMA_VERSION,
+        kind: 'event',
+        event_id: evId,
+        stream_id: streamId,
+        seq: 1,
+        commit_txn_id: 'pending',
+        trust_tier: 'human_authority',
+        provenance: {
+          capture_origin: 'test_direct',
+          verification_method: 'unverified_text_import',
+          source_event_ref: streamId,
+          adapter_version: '1.0.0',
+          confirmation_proof: proof,
+        },
+        created_at: nowIso,
+        payload: { type: 'human_message', text },
+      };
+      const anchor: LineageAnchor = {
+        anchor_id: ancId,
+        thread_id: 'thr_nonce',
+        stream_id: streamId,
+        parents: [],
+        workspace_manifest: captureWorkspaceManifest(),
+        summary: text,
+        head_event_ids: [evId],
+        created_at: nowIso,
+      };
+      return svc.engine.executeTransaction('proj_nonce', {
+        thread_id: 'thr_nonce',
+        affected_streams: [
+          {
+            stream_id: streamId,
+            expected_parent_head: null,
+            anchor,
+            events: [ev],
+          },
+        ],
+      });
+    };
+
+    const res1 = makeRawTxn('strm_nonce_1');
+    assert.ok(res1.txn_id);
+
+    assert.throws(
+      () => makeRawTxn('strm_nonce_2'),
+      (err: unknown) => err instanceof CommitConflictError && /already consumed/.test(String(err)),
+    );
+
+    // Stream strm_nonce_2 lease must also be cleanly released after CommitConflictError so immediate retry works
+    const freshProof = svc.issueLocalConfirmationProof(text, 'authorize_instruction', 'local_cli');
+    const retryAdopt = svc.adoptExternal({
+      projectId: 'proj_nonce',
+      threadId: 'thr_nonce',
+      streamId: 'strm_nonce_2',
+      sourceLabel: 'retry_after_abort',
+      rawText: text,
+      confirmationProof: freshProof,
+    });
+    assert.equal(retryAdopt.trust_tier, 'human_authority');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('upsertTranscriptLocator preserves optional locator_json metadata on partial re-upsert', () => {
+  const home = makeTempHome('locator-merge');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+    svc.initThread({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+      summary: 'Verify locator_json metadata retention',
+    });
+    const store = svc.engine.openExistingStore('proj_loc', 'thr_loc');
+    try {
+      store.upsertTranscriptLocator('thr_loc', {
+        locator_id: 'loc_1',
+        stream_id: 'strm_cloud_1',
+        anchor_id: 'anc_1',
+        source_label: 'claude_cloud',
+        host_kind: 'cloud_remote',
+        cloud_provider: 'claude_web',
+        host_session_id: 'sess_preserve_123',
+        remote_uri: 'https://claude.ai/chat/preserve-123',
+        recorded_at: '2026-01-01T00:00:00.000Z',
+        locator_origin: 'operator_verified',
+      });
+
+      // Partial re-upsert omitting optional metadata (same cloud_provider + host_session_id so locator_key matches, remote_uri omitted)
+      store.upsertTranscriptLocator('thr_loc', {
+        locator_id: 'loc_2',
+        stream_id: 'strm_cloud_1',
+        source_label: 'claude_cloud',
+        host_kind: 'cloud_remote',
+        cloud_provider: 'claude_web',
+        host_session_id: 'sess_preserve_123',
+        recorded_at: '2026-01-02T00:00:00.000Z',
+        locator_origin: 'operator_verified',
+      });
+
+      const locators = store.listTranscriptLocators('thr_loc');
+      assert.equal(locators.length, 1);
+      assert.equal(locators[0].locator_id, 'loc_2');
+      assert.equal(locators[0].anchor_id, 'anc_1');
+      assert.equal(locators[0].cloud_provider, 'claude_web');
+      assert.equal(locators[0].host_session_id, 'sess_preserve_123');
+      assert.equal(locators[0].remote_uri, 'https://claude.ai/chat/preserve-123');
+      assert.equal(locators[0].recorded_at, '2026-01-02T00:00:00.000Z');
+    } finally {
+      store.close();
+    }
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

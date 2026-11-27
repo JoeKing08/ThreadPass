@@ -23,6 +23,7 @@ import {
   SCHEMA_VERSION,
   type BlobManifestEntry,
   type CommitIntentProof,
+  type ConfirmationProof,
   type ControlRecord,
   type EventRecord,
   type FsckTxnStatus,
@@ -172,6 +173,37 @@ export function isPidAlive(pid: number): boolean {
     const code = (err as NodeJS.ErrnoException).code;
     return code === 'EPERM';
   }
+}
+
+function collectSpecConfirmationProofs(spec: TransactionSpec): ConfirmationProof[] {
+  const byNonce = new Map<string, ConfirmationProof>();
+  const register = (proof?: ConfirmationProof) => {
+    if (!proof?.nonce) return;
+    const prev = byNonce.get(proof.nonce);
+    if (prev) {
+      if (
+        prev.content_sha256 !== proof.content_sha256 ||
+        prev.purpose !== proof.purpose
+      ) {
+        throw new CommitConflictError(
+          `Conflicting reuse of confirmation proof nonce ${proof.nonce} inside transaction`,
+        );
+      }
+      return;
+    }
+    byNonce.set(proof.nonce, proof);
+  };
+  for (const sInput of spec.affected_streams) {
+    for (const ev of sInput.events) {
+      register(ev.provenance.confirmation_proof);
+    }
+    for (const ctrl of sInput.controls ?? []) {
+      if (ctrl.payload.type === 'reconciliation_record') {
+        register(ctrl.payload.record.confirmation_proof);
+      }
+    }
+  }
+  return [...byNonce.values()];
 }
 
 export class ThreadDirLayout {
@@ -1133,6 +1165,18 @@ export class LocalOfflineEngine {
         );
       }
 
+      // Atomically claim any single-use confirmation proof nonces inside SQLite BEGIN IMMEDIATE
+      // to eliminate concurrent replay TOCTOU races before entering committed_pending_publish.
+      const specProofs = collectSpecConfirmationProofs(ctx.spec);
+      for (const cp of specProofs) {
+        if (store.hasConsumedConfirmationNonce(cp.nonce)) {
+          throw new CommitConflictError(
+            `Confirmation proof nonce ${cp.nonce} was already consumed (atomic replay guard)`,
+          );
+        }
+        store.consumeConfirmationNonce(cp, nowIso);
+      }
+
       store.db
         .prepare(
           `UPDATE txn_log SET state = 'committed_pending_publish', manifest_hash = ?, updated_at = ? WHERE txn_id = ?`,
@@ -1338,10 +1382,11 @@ export class LocalOfflineEngine {
     certificate: TransactionFinalizationCertificate;
   } {
     const store = this.openStore(projectId, spec.thread_id);
+    let ctx: PreparedTxnContext | undefined;
     try {
       // Recover any prior interrupted transactions before starting new work
       this.recoverPendingTransactions(projectId, spec.thread_id, { store });
-      const ctx = this.reserveTransaction(store, projectId, spec);
+      ctx = this.reserveTransaction(store, projectId, spec);
       this.prepareTransaction(store, ctx);
       if (faultHooks?.afterPrepareBeforeCommitIntent) {
         faultHooks.afterPrepareBeforeCommitIntent(ctx);
@@ -1356,6 +1401,27 @@ export class LocalOfflineEngine {
       }
       const cert = this.finalizeTransaction(store, ctx, faultHooks);
       return { txn_id: ctx.txn_id, manifest: ctx.manifest, certificate: cert };
+    } catch (err) {
+      if (ctx && !ctx.commit_intent_proof && !(err instanceof SimulatedCrashError)) {
+        const abortCtx = ctx;
+        try {
+          store.runImmediate(() => {
+            store.db
+              .prepare(
+                `UPDATE txn_log SET state = 'aborted', updated_at = ?
+                 WHERE txn_id = ? AND state = 'preparing' AND owner_token = ? AND fencing_epoch = ?`,
+              )
+              .run(this.clock.wallIso(), abortCtx.txn_id, abortCtx.owner_token, abortCtx.fencing_epoch);
+            store.db
+              .prepare(`DELETE FROM stream_leases WHERE txn_id = ? AND owner_token = ?`)
+              .run(abortCtx.txn_id, abortCtx.owner_token);
+          });
+          this.cleanupTxnStaging(this.getLayout(projectId, spec.thread_id), abortCtx.txn_id);
+        } catch {
+          // Best-effort abort cleanup before rethrowing original error
+        }
+      }
+      throw err;
     } finally {
       store.close();
     }

@@ -151,7 +151,7 @@ Usage:
   thp prompt checkpoint --project <id> --thread <id> [--stream <id>]
   thp adopt --project <id> --thread <id> --source <label> (--file <path>... | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--machine <host>] [--cloud-host <provider>] [--remote-uri <url>] [--host-session-id <id>] [--upload-transcript <path>]
   thp reconcile pack --project <id> --thread <id> [--sources s1,s2,...] [--goal <text>] [--workspace <dir>] [--attachment]
-  thp reconcile commit --project <id> --thread <id> [--pack <envelope_id>] [--sources s1,s2,...] (--file <path>... | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
+  thp reconcile commit --project <id> --thread <id> [--pack <envelope_id>] [--sources s1,s2,...] (--file <path>... | --text <str>) [--authorize] [--confirm-topics <t1,t2>] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
   thp handoff pack --project <id> --thread <id> [--stream <id>] [--goal <text>] [--workspace <dir>] [--attachment]
   thp ingest --project <id> --thread <id> --stream <id> (--file <path>... | --text <str>) [--base-anchor <anchor_id>] [--authorize] [--ack-batch <batch_id> --ack-msgs m1,m2] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
   thp fork --project <id> --thread <id> --task <brief> [--origin <stream>] [--worker <stream>] [--workspace <dir>] [--act-as-main] [--transcript-file <path>] [--cloud-host <provider>]
@@ -248,12 +248,16 @@ async function main(): Promise<void> {
     const proof = await maybeIssueCliConfirmationProof(svc, flags, rawText);
     const tOpts = readTranscriptOptions(flags);
     const sourcesStr = strFlag(flags, 'sources');
+    const confirmTopicsStr = strFlag(flags, 'confirm-topics');
     const out = svc.commitReconcile({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
       sourceStreamIds: sourcesStr ? sourcesStr.split(',').filter(Boolean) : [],
       packEnvelopeId: strFlag(flags, 'pack'),
       receiptRawText: rawText,
+      confirmedConflictTopics: confirmTopicsStr
+        ? confirmTopicsStr.split(',').map((s) => s.trim()).filter(Boolean)
+        : undefined,
       confirmationProof: proof,
       workspaceDir: strFlag(flags, 'workspace'),
       ...tOpts,

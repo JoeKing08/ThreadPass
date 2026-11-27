@@ -14,21 +14,23 @@ import type {
 } from '../../core/types.js';
 
 export function computeTranscriptLocatorKey(loc: HostTranscriptLocator): string {
+  const sid = loc.stream_id;
   if (loc.host_kind === 'local_file' && loc.file_path) {
     const normPath = loc.file_path.trim().replace(/\\/g, '/');
     const origin = loc.locator_origin ?? 'operator_verified';
     return sha256Hex(
-      `local|${origin}|${(loc.machine_device_id ?? '').trim()}|${(loc.machine_hostname ?? '').trim()}|${normPath}`,
+      `local|${sid}|${origin}|${(loc.machine_device_id ?? '').trim()}|${(loc.machine_hostname ?? '').trim()}|${normPath}`,
     );
   }
   if (loc.host_kind === 'web_uploaded_blob' && loc.uploaded_blob_sha256) {
-    return sha256Hex(`blob|${loc.uploaded_blob_sha256}`);
+    return sha256Hex(`blob|${sid}|${loc.uploaded_blob_sha256}`);
   }
   if (loc.host_kind === 'cloud_remote') {
+    const origin = loc.locator_origin ?? 'operator_verified';
     const ident = (loc.host_session_id ?? loc.remote_uri ?? loc.stream_id).trim();
-    return sha256Hex(`cloud|${(loc.cloud_provider ?? '').trim()}|${ident}`);
+    return sha256Hex(`cloud|${sid}|${origin}|${(loc.cloud_provider ?? '').trim()}|${ident}`);
   }
-  return sha256Hex(`placeholder|${loc.stream_id}|${loc.source_label}`);
+  return sha256Hex(`placeholder|${sid}|${loc.source_label}`);
 }
 
 export class SystemClock implements ClockPort {
@@ -498,6 +500,33 @@ export class StateStore {
 
   upsertTranscriptLocator(threadId: string, loc: HostTranscriptLocator): void {
     const key = computeTranscriptLocatorKey(loc);
+    const existingRow = this.db
+      .prepare('SELECT locator_json FROM transcript_locators WHERE locator_key = ?')
+      .get(key) as { locator_json: string } | undefined;
+    let merged: HostTranscriptLocator = loc;
+    if (existingRow) {
+      try {
+        const existing = JSON.parse(existingRow.locator_json) as HostTranscriptLocator;
+        merged = {
+          ...existing,
+          ...loc,
+          anchor_id: loc.anchor_id ?? existing.anchor_id,
+          machine_hostname: loc.machine_hostname ?? existing.machine_hostname,
+          machine_device_id: loc.machine_device_id ?? existing.machine_device_id,
+          file_path: loc.file_path ?? existing.file_path,
+          cloud_provider: loc.cloud_provider ?? existing.cloud_provider,
+          host_session_id: loc.host_session_id ?? existing.host_session_id,
+          remote_uri: loc.remote_uri ?? existing.remote_uri,
+          uploaded_blob_sha256: loc.uploaded_blob_sha256 ?? existing.uploaded_blob_sha256,
+          uploaded_blob_rel: loc.uploaded_blob_rel ?? existing.uploaded_blob_rel,
+          uploaded_filename: loc.uploaded_filename ?? existing.uploaded_filename,
+          recorded_at:
+            loc.recorded_at >= existing.recorded_at ? loc.recorded_at : existing.recorded_at,
+        };
+      } catch {
+        merged = loc;
+      }
+    }
     this.db
       .prepare(
         `INSERT INTO transcript_locators(
@@ -508,30 +537,40 @@ export class StateStore {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(locator_key) DO UPDATE SET
           locator_id = excluded.locator_id,
+          stream_id = excluded.stream_id,
           anchor_id = COALESCE(excluded.anchor_id, transcript_locators.anchor_id),
           source_label = excluded.source_label,
+          machine_hostname = COALESCE(excluded.machine_hostname, transcript_locators.machine_hostname),
+          machine_device_id = COALESCE(excluded.machine_device_id, transcript_locators.machine_device_id),
+          file_path = COALESCE(excluded.file_path, transcript_locators.file_path),
+          cloud_provider = COALESCE(excluded.cloud_provider, transcript_locators.cloud_provider),
+          host_session_id = COALESCE(excluded.host_session_id, transcript_locators.host_session_id),
+          remote_uri = COALESCE(excluded.remote_uri, transcript_locators.remote_uri),
+          uploaded_blob_sha256 = COALESCE(excluded.uploaded_blob_sha256, transcript_locators.uploaded_blob_sha256),
+          uploaded_blob_rel = COALESCE(excluded.uploaded_blob_rel, transcript_locators.uploaded_blob_rel),
+          uploaded_filename = COALESCE(excluded.uploaded_filename, transcript_locators.uploaded_filename),
           locator_json = excluded.locator_json,
           recorded_at = MAX(transcript_locators.recorded_at, excluded.recorded_at)`,
       )
       .run(
         key,
-        loc.locator_id,
+        merged.locator_id,
         threadId,
-        loc.stream_id,
-        loc.anchor_id ?? null,
-        loc.source_label,
-        loc.host_kind,
-        loc.machine_hostname ?? null,
-        loc.machine_device_id ?? null,
-        loc.file_path ?? null,
-        loc.cloud_provider ?? null,
-        loc.host_session_id ?? null,
-        loc.remote_uri ?? null,
-        loc.uploaded_blob_sha256 ?? null,
-        loc.uploaded_blob_rel ?? null,
-        loc.uploaded_filename ?? null,
-        JSON.stringify(loc),
-        loc.recorded_at,
+        merged.stream_id,
+        merged.anchor_id ?? null,
+        merged.source_label,
+        merged.host_kind,
+        merged.machine_hostname ?? null,
+        merged.machine_device_id ?? null,
+        merged.file_path ?? null,
+        merged.cloud_provider ?? null,
+        merged.host_session_id ?? null,
+        merged.remote_uri ?? null,
+        merged.uploaded_blob_sha256 ?? null,
+        merged.uploaded_blob_rel ?? null,
+        merged.uploaded_filename ?? null,
+        JSON.stringify(merged),
+        merged.recorded_at,
       );
   }
 

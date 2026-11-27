@@ -197,6 +197,7 @@ function renderHtmlPage(
     </div>
     <div class="row" style="margin-top:8px;">
       <div style="flex:1; min-width:220px;"><label>Bound Reconcile Pack ID（生成信封时自动填入，防止来源漂移）</label><input id="recPackId" type="text" placeholder="env_xxx" /></div>
+      <div style="flex:1; min-width:220px;"><label>仅确认指定冲突主题（可选，逗号分隔；留空且勾选确认则确认全部）</label><input id="recConfirmTopics" type="text" placeholder="Topic A, Topic B" /></div>
     </div>
     <div class="row" style="margin-top:8px;">
       <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
@@ -536,13 +537,18 @@ async function commitReconcile() {
   const selected = Array.from(document.querySelectorAll('.rec-src:checked')).map(c => c.value);
   const receiptRawText = document.getElementById('recReceipt').value;
   const packEnvelopeId = document.getElementById('recPackId').value.trim() || undefined;
+  const confirmTopicsRaw = document.getElementById('recConfirmTopics').value.trim();
+  const confirmedConflictTopics = confirmTopicsRaw
+    ? confirmTopicsRaw.split(',').map(s => s.trim()).filter(Boolean)
+    : undefined;
   const confirmAuthorize = document.getElementById('recConfirm').checked;
   const authFields = confirmAuthorize ? await prepareWebAuthChallenge(receiptRawText) : {};
   const transcriptFilePath = document.getElementById('recTranscriptPath').value.trim() || undefined;
   const cloudProvider = document.getElementById('recCloudHost').value.trim() || undefined;
   const upload = await readOptionalUpload('recUploadFile');
   const res = await api('/api/reconcile/commit', {
-    projectId, threadId, sourceStreamIds: selected, receiptRawText, packEnvelopeId, ...authFields,
+    projectId, threadId, sourceStreamIds: selected, receiptRawText, packEnvelopeId,
+    confirmedConflictTopics, ...authFields,
     transcriptFilePath, cloudProvider, ...upload
   });
   document.getElementById('recOut').textContent = JSON.stringify(res, null, 2);
@@ -1044,6 +1050,11 @@ export async function startThreadPassWeb(
                 typeof body.packEnvelopeId === 'string' && body.packEnvelopeId.trim()
                   ? body.packEnvelopeId.trim()
                   : undefined,
+              confirmedConflictTopics: Array.isArray(body.confirmedConflictTopics)
+                ? body.confirmedConflictTopics.map(String)
+                : undefined,
+              confirmAllConflicts:
+                typeof body.confirmAllConflicts === 'boolean' ? body.confirmAllConflicts : undefined,
               confirmationProof: proof,
               transcriptFilePath:
                 typeof body.transcriptFilePath === 'string' && body.transcriptFilePath.trim()
@@ -1107,6 +1118,10 @@ export async function startThreadPassWeb(
                 typeof body.originStreamId === 'string' && body.originStreamId.trim()
                   ? body.originStreamId.trim()
                   : undefined,
+              sourceAnchorId:
+                typeof body.sourceAnchorId === 'string' && body.sourceAnchorId.trim()
+                  ? body.sourceAnchorId.trim()
+                  : undefined,
               workerStreamId:
                 typeof body.workerStreamId === 'string' && body.workerStreamId.trim()
                   ? body.workerStreamId.trim()
@@ -1125,13 +1140,27 @@ export async function startThreadPassWeb(
                 typeof body.transcriptFilePath === 'string' && body.transcriptFilePath.trim()
                   ? body.transcriptFilePath.trim()
                   : undefined,
+              machineHostname:
+                typeof body.machineHostname === 'string' && body.machineHostname.trim()
+                  ? body.machineHostname.trim()
+                  : undefined,
               cloudProvider:
                 typeof body.cloudProvider === 'string' && body.cloudProvider.trim()
                   ? body.cloudProvider.trim()
                   : undefined,
+              remoteUri:
+                typeof body.remoteUri === 'string' && body.remoteUri.trim()
+                  ? body.remoteUri.trim()
+                  : undefined,
               hostSessionId:
                 typeof body.hostSessionId === 'string' && body.hostSessionId.trim()
                   ? body.hostSessionId.trim()
+                  : undefined,
+              uploadedTranscriptText:
+                typeof body.uploadedTranscriptText === 'string' ? body.uploadedTranscriptText : undefined,
+              uploadedTranscriptFilename:
+                typeof body.uploadedTranscriptFilename === 'string' && body.uploadedTranscriptFilename.trim()
+                  ? body.uploadedTranscriptFilename.trim()
                   : undefined,
             }),
           );

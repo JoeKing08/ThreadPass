@@ -245,15 +245,34 @@ export function formatOriginLabel(tier: ReferenceOriginSummary): string {
   }
 }
 
-export function sanitizeXmlAttr(val: string, maxLen = 120): string {
-  return val
-    .replace(/[\r\n]+/g, ' ')
-    .slice(0, maxLen)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+export function sanitizeXmlAttr(val: string, maxEscapedLen = 60): string {
+  const normalized = val.replace(/[\r\n]+/g, ' ');
+  let out = '';
+  for (const ch of normalized) {
+    let esc: string;
+    switch (ch) {
+      case '&':
+        esc = '&amp;';
+        break;
+      case '<':
+        esc = '&lt;';
+        break;
+      case '>':
+        esc = '&gt;';
+        break;
+      case '"':
+        esc = '&quot;';
+        break;
+      case "'":
+        esc = '&apos;';
+        break;
+      default:
+        esc = ch;
+    }
+    if (out.length + esc.length > maxEscapedLen) break;
+    out += esc;
+  }
+  return out;
 }
 
 /**
@@ -277,7 +296,7 @@ export function renderNonInstructionFence(params: {
       '[escaped_marker]',
     );
   return [
-    `<${tagName} source="${sanitizeXmlAttr(params.sourceLabel)}" origin="${formatOriginLabel(params.trustTier)}" ref="${sanitizeXmlAttr(params.anchorOrRef)}">`,
+    `<${tagName} source="${sanitizeXmlAttr(params.sourceLabel, 50)}" origin="${formatOriginLabel(params.trustTier)}" ref="${sanitizeXmlAttr(params.anchorOrRef, 60)}">`,
     neutralized,
     `</${tagName}>`,
   ].join('\n');

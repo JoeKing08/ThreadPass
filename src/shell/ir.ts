@@ -124,6 +124,36 @@ function scanBalancedJsonObjects(text: string): Record<string, unknown>[] {
   return results;
 }
 
+const CONTINUATION_PAYLOAD_KEYS = new Set<string>([
+  'summary_text',
+  'summary',
+  'recent_turns',
+  'claimed_user_quotes',
+  'decisions_made',
+  'files_and_artifacts',
+  'open_questions',
+  'pending_tasks',
+  'blockers',
+  'tool_errors',
+  'referenced_ids',
+  'mailbox_ack',
+  'base_anchor_id',
+  'host_session_id',
+  'transcript_file_path',
+  'machine_hostname',
+  'cloud_provider',
+  'remote_uri',
+  'source_label',
+  'pack_envelope_id',
+  'adopted_items',
+  'partial_items',
+  'excluded_items',
+  'provenance_only_refs',
+  'next_actions',
+  'conflicts',
+  'synthesis_summary',
+]);
+
 /**
  * Extracts one or more structured JSON objects without relying on non-greedy code-fence regexes,
  * so embedded triple backticks inside JSON strings, bare fences, multipart chunks, or prose
@@ -147,6 +177,16 @@ export function extractStructuredJsonObjects(
     expectedKeys.length === 0 ||
     expectedKeys.some((k) => Object.prototype.hasOwnProperty.call(obj, k));
 
+  const hasContinuationPayloadKey = (obj: Record<string, unknown>): boolean =>
+    Object.keys(obj).some((k) => CONTINUATION_PAYLOAD_KEYS.has(k));
+
+  const isThreadPassDomainOrContinuation = (obj: Record<string, unknown>): boolean =>
+    hasExpectedKey(obj) || (hasMultipartFields(obj) && hasContinuationPayloadKey(obj));
+
+  const filterDomainOrContinuation = (
+    candidates: readonly Record<string, unknown>[],
+  ): Record<string, unknown>[] => candidates.filter(isThreadPassDomainOrContinuation);
+
   const looksLikeJson = expectedKeys.some((k) =>
     new RegExp(`"${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s*:`).test(trimmed),
   );
@@ -158,13 +198,11 @@ export function extractStructuredJsonObjects(
   ) {
     try {
       const parsed: unknown = JSON.parse(trimmed);
-      if (isPlainObject(parsed) && hasExpectedKey(parsed)) {
+      if (isPlainObject(parsed) && isThreadPassDomainOrContinuation(parsed)) {
         return { objects: [parsed], looksLikeJson: true };
       }
       if (Array.isArray(parsed)) {
-        const matched = parsed.filter(
-          (item): item is Record<string, unknown> => isPlainObject(item) && hasExpectedKey(item),
-        );
+        const matched = filterDomainOrContinuation(parsed.filter(isPlainObject));
         if (matched.length > 0) {
           return { objects: matched, looksLikeJson: true };
         }
@@ -177,7 +215,7 @@ export function extractStructuredJsonObjects(
   // 2. Scan inside tagged ```json or bare ``` code fence blocks using a line state machine
   // so closing ``` fences of ```ts blocks are never mistaken for opening JSON fences.
   const lines = trimmed.split(/\r?\n/);
-  const fencedMatches: Record<string, unknown>[] = [];
+  const fencedCandidates: Record<string, unknown>[] = [];
   let inFence = false;
   let fenceLang = '';
   let fenceBuf: string[] = [];
@@ -186,8 +224,7 @@ export function extractStructuredJsonObjects(
     if (fenceLang === '' || fenceLang === 'json') {
       const inner = fenceBuf.join('\n').trimStart();
       if (inner.startsWith('{') || inner.startsWith('[')) {
-        const objs = scanBalancedJsonObjects(inner).filter(hasExpectedKey);
-        fencedMatches.push(...objs);
+        fencedCandidates.push(...scanBalancedJsonObjects(inner));
       }
     }
     fenceLang = '';
@@ -212,12 +249,13 @@ export function extractStructuredJsonObjects(
   if (inFence) {
     collectFromFence();
   }
+  const fencedMatches = filterDomainOrContinuation(fencedCandidates);
   if (fencedMatches.length > 0) {
     return { objects: fencedMatches, looksLikeJson: true };
   }
 
   // 3. Scan top-level balanced JSON objects anywhere in rawText
-  const topLevel = scanBalancedJsonObjects(trimmed).filter(hasExpectedKey);
+  const topLevel = filterDomainOrContinuation(scanBalancedJsonObjects(trimmed));
   if (topLevel.length > 0) {
     return { objects: topLevel, looksLikeJson: true };
   }
@@ -245,7 +283,7 @@ export function extractStructuredJsonObject(
   };
 }
 
-function hasMultipartFields(obj: Record<string, unknown>): boolean {
+export function hasMultipartFields(obj: Record<string, unknown>): boolean {
   return (
     (obj.part_index !== undefined && obj.part_index !== null) ||
     (obj.total_parts !== undefined && obj.total_parts !== null) ||

@@ -54,6 +54,7 @@ import {
 import { type HostBudgetSpec, type PackedEnvelopeResult } from './budget.js';
 import {
   buildEventsFromAdoptedPackage,
+  normalizeHostSessionId,
   normalizeOptionalMetaString,
   parseExternalConversationInput,
   type AssembledMultipartInfo,
@@ -503,12 +504,13 @@ export class ThreadPassService {
       data: { main_stream_id: mainStreamId },
     };
 
+    const safeHostSessionId = normalizeHostSessionId(params.hostSessionId);
     const transcriptArtifacts = this.prepareTranscriptArtifacts({
       streamId: mainStreamId,
       anchorId,
       sourceLabel: mainStreamId,
       nowIso,
-      operatorOptions: params,
+      operatorOptions: { ...params, hostSessionId: safeHostSessionId },
       requirePlaceholderIfEmpty: false,
     });
 
@@ -528,8 +530,8 @@ export class ThreadPassService {
       ],
       journal_events: [mainDesigEvent],
       ...(Object.keys(transcriptArtifacts.blobs).length > 0 ? { blobs: transcriptArtifacts.blobs } : {}),
-      ...(params.hostSessionId
-        ? { host_bindings: [{ host_session_id: params.hostSessionId, stream_id: mainStreamId }] }
+      ...(safeHostSessionId
+        ? { host_bindings: [{ host_session_id: safeHostSessionId, stream_id: mainStreamId }] }
         : {}),
     });
 
@@ -713,7 +715,7 @@ export class ThreadPassService {
 
     const anchorId = newId('anc', 8);
     const nowIso = this.engine.clock.wallIso();
-    const operatorHostSessionId = normalizeOptionalMetaString(params.hostSessionId);
+    const operatorHostSessionId = normalizeHostSessionId(params.hostSessionId);
     if (!operatorHostSessionId && pkg.host_session_id) {
       warnings.push(
         `Ignored model-reported host_session_id (${pkg.host_session_id}) for active host binding; recorded as unverified locator metadata only.`,
@@ -1002,6 +1004,11 @@ export class ThreadPassService {
         throw new Error(`Thread ${params.threadId} not found`);
       }
       const mainStreamRow = store.getStream(threadRow.main_stream_id);
+      if (mainStreamRow?.health === 'quarantined') {
+        throw new Error(
+          `Main stream ${threadRow.main_stream_id} has health=quarantined; resolve fsck before packing reconcile`,
+        );
+      }
       mainBaseAnchorId = mainStreamRow?.head_anchor_id ?? null;
       const allStreams = store.listStreams(params.threadId);
       const selectedIds =
@@ -1370,6 +1377,16 @@ export class ThreadPassService {
       input_dependency_id: newId('idm', 8),
       items: depItems,
     };
+
+    if (
+      params.confirmedConflictTopics &&
+      params.confirmedConflictTopics.length > 0 &&
+      (!proofAccepted || reconcileTrustTier !== 'human_authority')
+    ) {
+      throw new Error(
+        'Cannot confirm specific conflict topics (confirmedConflictTopics) without a valid human_authority ConfirmationProof',
+      );
+    }
 
     const sanitizedConflicts = parsed.conflicts.map((c) => {
       const topic = this.engine.redactor.sanitizeText(c.topic).sanitized;
