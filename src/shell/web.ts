@@ -1,6 +1,7 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { newHighEntropyToken, sha256Hex } from '../core/canonical.js';
+import { loadTrustedDeviceKeys } from '../profile/local-offline/crypto-keys.js';
 import type { ThreadPassService } from './service.js';
 import { normalizeConfirmationText } from './trust.js';
 
@@ -126,16 +127,22 @@ function renderHtmlPage(
   <div id="uiAlert" class="alert" role="status"></div>
 
   <div class="bar row">
-    <div style="flex:1; min-width:180px;"><label>Project ID</label><input id="projectId" type="text" /></div>
-    <div style="flex:1; min-width:180px;"><label>Thread ID</label><input id="threadId" type="text" /></div>
-    <div style="align-self:flex-end;"><button onclick="runUiAction('adoptOut', initThread)">新建 / 初始化 Main</button></div>
+    <div style="flex:1; min-width:150px;"><label>Project ID</label><input id="projectId" type="text" /></div>
+    <div style="flex:1; min-width:150px;"><label>Thread ID</label><input id="threadId" type="text" /></div>
+    <div style="flex:2; min-width:200px;"><label>Main 初始化目标（可选 Summary）</label><input id="initSummary" type="text" placeholder="Initialize ThreadPass Main coordination stream." /></div>
+    <div style="align-self:flex-end; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+      <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
+        <input id="initConfirm" type="checkbox" /> 确认目标并授权
+      </label>
+      <button onclick="runUiAction('adoptOut', initThread)">新建 / 初始化 Main</button>
+    </div>
   </div>
 
   <div class="tabs">
     <button class="tab active" onclick="showTab('adopt', this)">1. 收编外部 AI (Adopt)</button>
     <button class="tab" onclick="showTab('reconcile', this)">2. 多源合并 (Reconcile)</button>
     <button class="tab" onclick="showTab('handoff', this)">3. 备份、续聊与派发 (Checkpoint / Handoff / Fork / Mailbox)</button>
-    <button class="tab" onclick="showTab('fsck', this)">4. 谱系与校验 (Lineage & fsck)</button>
+    <button class="tab" onclick="showTab('fsck', this)">4. 谱系、校验与运维 (Lineage / fsck / Grant / Peek / GC / Device)</button>
   </div>
 
   <section id="panel-adopt" class="card panel active">
@@ -252,6 +259,7 @@ function renderHtmlPage(
     <h3>C. 派生独立 Subagent 子流 (Atomic Fork)</h3>
     <div class="row">
       <div style="flex:1;"><label>Origin Stream（留空默认 Main）</label><input id="forkOrigin" type="text" list="streamIdsList" /></div>
+      <div style="flex:1;"><label>Source Anchor ID（可选，留空取 Origin 当前头）</label><input id="forkSourceAnchor" type="text" placeholder="anc_xxx" /></div>
       <div style="flex:1;"><label>Worker Stream Name（可选，如 sub_a）</label><input id="forkWorker" type="text" placeholder="sub_a" /></div>
       <div style="flex:1;"><label>独立工作区 / worktree 目录（可选）</label><input id="forkWs" type="text" /></div>
     </div>
@@ -259,9 +267,12 @@ function renderHtmlPage(
       <div style="flex:1;"><label>派生子流任务描述 (Fork Task Brief)</label><input id="forkTask" type="text" placeholder="Implement sub-module X" /></div>
       <div style="align-self:flex-end;"><button onclick="runUiAction('hoOut', doFork)">原子派发 Fork</button></div>
     </div>
-    <div class="row" style="margin-top:6px;">
+    <div class="row" style="margin-top:6px; gap:16px;">
       <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
         <input id="forkConfirm" type="checkbox" /> 人工审阅任务说明并签发 human_authority 授权凭证
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
+        <input id="forkActAsMain" type="checkbox" /> 以 Main 协调权威直接从子流分叉 (actAsMain)
       </label>
     </div>
     <div class="row" style="margin-top:8px;">
@@ -288,12 +299,66 @@ function renderHtmlPage(
   </section>
 
   <section id="panel-fsck" class="card panel">
-    <h3>Lineage 状态与四步 fsck 核验重建</h3>
+    <h3>A. Lineage 状态、四步 fsck 核验重建与 Blob 回收 (GC)</h3>
     <div class="row">
       <button onclick="runUiAction('fsckOut', () => runFsck(false))">运行 4 步 thp fsck</button>
       <button class="sec" onclick="runUiAction('fsckOut', () => runFsck(true))">删除 SQLite 并重建 (fsck --rebuild)</button>
+      <div style="width:160px;"><label>GC 宽限期 (gracePeriodMs)</label><input id="gcGraceMs" type="text" value="0" /></div>
+      <div style="align-self:flex-end;"><button class="sec" onclick="runUiAction('fsckOut', runGc)">清理孤儿与过期暂存 (GC)</button></div>
     </div>
-    <pre id="fsckOut"></pre>
+
+    <hr style="border-color:#334155;margin:16px 0;" />
+    <h3>B. 只读流明细查阅 (Peek)</h3>
+    <div class="row">
+      <div style="flex:1;"><label>Stream ID</label><input id="peekStream" type="text" list="streamIdsList" placeholder="选择或输入 stream_id" /></div>
+      <div style="align-self:flex-end;"><button class="sec" onclick="runUiAction('fsckOut', doPeek)">查看流明细 (Peek)</button></div>
+    </div>
+
+    <hr style="border-color:#334155;margin:16px 0;" />
+    <h3>C. 子流派发授权管理 (Escrow Grants)</h3>
+    <div class="row">
+      <div style="flex:1;"><label>Grantee Stream ID</label><input id="grantGrantee" type="text" list="streamIdsList" placeholder="sub_a" /></div>
+      <div style="width:120px;"><label>Max Spawns</label><input id="grantMaxSpawns" type="text" value="2" /></div>
+      <div style="flex:1;"><label>Issuer Stream（留空默认 Main）</label><input id="grantIssuer" type="text" list="streamIdsList" placeholder="main" /></div>
+      <div style="flex:1;"><label>Parent Grant ID（可选）</label><input id="grantParent" type="text" placeholder="gr_xxx" /></div>
+      <div style="width:110px;"><label>Max Depth</label><input id="grantMaxDepth" type="text" value="0" /></div>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
+        <input id="grantCanRedelegate" type="checkbox" /> 允许受控再委派 (canRedelegate)
+      </label>
+      <button onclick="runUiAction('fsckOut', doGrantIssue)">签发子流授权 (Grant Issue)</button>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <div style="flex:1;"><label>Grant ID（撤销目标）</label><input id="revokeGrantId" type="text" placeholder="gr_xxx" /></div>
+      <div style="flex:2;"><label>撤销原因（可选）</label><input id="revokeReason" type="text" placeholder="Task completed / policy change" /></div>
+      <div style="align-self:flex-end;"><button class="danger" onclick="runUiAction('fsckOut', doGrantRevoke)">永久撤销授权 (Grant Revoke)</button></div>
+    </div>
+
+    <hr style="border-color:#334155;margin:16px 0;" />
+    <h3>D. 多设备信任密钥管理 (Trusted Devices)</h3>
+    <div class="row">
+      <button class="sec" onclick="runUiAction('fsckOut', doDeviceShow)">查看本机与信任设备 (Device Show)</button>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <div style="flex:1;"><label>Peer Device ID</label><input id="devPinId" type="text" placeholder="dev_xxx" /></div>
+      <div style="flex:2;"><label>Public Key SPKI Base64</label><input id="devPinPubkey" type="text" placeholder="MCowBQYDK2VwAyEA..." /></div>
+      <div style="flex:1;"><label>Thread Scope（可选）</label><input id="devPinThread" type="text" placeholder="留空为 project 级" /></div>
+      <div style="align-self:flex-end;"><button onclick="runUiAction('fsckOut', doDevicePin)">钉入设备公钥 (Device Pin)</button></div>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <div style="flex:1;"><label>目标 Device ID</label><input id="devRevId" type="text" placeholder="dev_xxx" /></div>
+      <div style="width:160px;">
+        <label>目标状态</label>
+        <select id="devRevStatus" style="width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:8px 10px;">
+          <option value="revoked">revoked (吊销)</option>
+          <option value="retired">retired (正常轮换)</option>
+        </select>
+      </div>
+      <div style="align-self:flex-end;"><button class="danger" onclick="runUiAction('fsckOut', doDeviceRevoke)">更新设备状态 (Revoke / Retire)</button></div>
+    </div>
+
+    <pre id="fsckOut" style="margin-top:12px;"></pre>
   </section>
 </main>
 <script>
@@ -397,10 +462,19 @@ function getIds() {
 
 async function initThread() {
   const { projectId, threadId } = getIds();
-  const res = await api('/api/init', { projectId, threadId: threadId || undefined });
+  const summary = document.getElementById('initSummary').value.trim() || undefined;
+  const confirmInit = document.getElementById('initConfirm').checked;
+  const summaryText = summary || 'Initialize ThreadPass Main coordination stream.';
+  const authFields = confirmInit ? await prepareWebAuthChallenge(summaryText) : {};
+  const res = await api('/api/init', {
+    projectId,
+    threadId: threadId || undefined,
+    summary,
+    ...authFields
+  });
   document.getElementById('threadId').value = res.thread_id;
   await refreshStatus();
-  showAlert('已初始化 Thread ' + res.thread_id + ' (main=' + res.main_stream_id + ')', 'ok');
+  showAlert('已初始化 Thread ' + res.thread_id + ' (main=' + res.main_stream_id + ', trust=' + res.trust_tier + ')', 'ok');
 }
 
 async function refreshStatus() {
@@ -617,15 +691,17 @@ async function packHandoff() {
 async function doFork() {
   const { projectId, threadId } = getIds();
   const originStreamId = document.getElementById('forkOrigin').value.trim() || undefined;
+  const sourceAnchorId = document.getElementById('forkSourceAnchor').value.trim() || undefined;
   const workerStreamId = document.getElementById('forkWorker').value.trim() || undefined;
   const workspaceDir = document.getElementById('forkWs').value.trim() || undefined;
   const taskBrief = document.getElementById('forkTask').value;
   const confirmFork = document.getElementById('forkConfirm').checked;
+  const actAsMain = document.getElementById('forkActAsMain').checked;
   const authFields = confirmFork ? await prepareWebAuthChallenge(taskBrief.trim() || 'Execute scoped subtask') : {};
   const transcriptFilePath = document.getElementById('forkTranscriptPath').value.trim() || undefined;
   const cloudProvider = document.getElementById('forkCloudHost').value.trim() || undefined;
   const res = await api('/api/fork', {
-    projectId, threadId, originStreamId, workerStreamId, workspaceDir, taskBrief, ...authFields,
+    projectId, threadId, originStreamId, sourceAnchorId, workerStreamId, workspaceDir, taskBrief, actAsMain, ...authFields,
     transcriptFilePath, cloudProvider
   });
   const box = document.getElementById('forkPromptBox');
@@ -664,6 +740,75 @@ async function runFsck(rebuildSqlite) {
   const { projectId, threadId } = getIds();
   const res = await api('/api/fsck', { projectId, threadId, rebuildSqlite });
   document.getElementById('fsckOut').textContent = JSON.stringify(res, null, 2);
+}
+
+async function runGc() {
+  const { projectId, threadId } = getIds();
+  const graceRaw = document.getElementById('gcGraceMs').value.trim();
+  const gracePeriodMs = graceRaw === '' ? 0 : Number(graceRaw);
+  const res = await api('/api/gc', { projectId, threadId, gracePeriodMs });
+  document.getElementById('fsckOut').textContent = JSON.stringify(res, null, 2);
+  showAlert('GC 完成 (removed=' + (res.deleted_blobs ? res.deleted_blobs.length : 0) + ')', 'ok');
+}
+
+async function doPeek() {
+  const { projectId, threadId } = getIds();
+  const streamId = document.getElementById('peekStream').value.trim();
+  const res = await api('/api/peek', { projectId, threadId, streamId });
+  document.getElementById('fsckOut').textContent = JSON.stringify(res, null, 2);
+}
+
+async function doGrantIssue() {
+  const { projectId, threadId } = getIds();
+  const granteeStreamId = document.getElementById('grantGrantee').value.trim();
+  const maxTotalSpawns = Number(document.getElementById('grantMaxSpawns').value);
+  const issuerStreamId = document.getElementById('grantIssuer').value.trim() || undefined;
+  const parentGrantId = document.getElementById('grantParent').value.trim() || undefined;
+  const maxDepthRaw = document.getElementById('grantMaxDepth').value.trim();
+  const maxDepth = maxDepthRaw === '' ? 0 : Number(maxDepthRaw);
+  const canRedelegate = document.getElementById('grantCanRedelegate').checked;
+  const res = await api('/api/grant/issue', {
+    projectId, threadId, granteeStreamId, maxTotalSpawns, issuerStreamId, parentGrantId, maxDepth, canRedelegate
+  });
+  document.getElementById('fsckOut').textContent = JSON.stringify(res, null, 2);
+  showAlert('已签发子流授权 ' + res.grant_id, 'ok');
+  await refreshStatus();
+}
+
+async function doGrantRevoke() {
+  const { projectId, threadId } = getIds();
+  const grantId = document.getElementById('revokeGrantId').value.trim();
+  const reason = document.getElementById('revokeReason').value.trim() || undefined;
+  const res = await api('/api/grant/revoke', { projectId, threadId, grantId, reason });
+  document.getElementById('fsckOut').textContent = JSON.stringify(res, null, 2);
+  showAlert('已永久撤销授权 ' + grantId, 'ok');
+  await refreshStatus();
+}
+
+async function doDeviceShow() {
+  const res = await api('/api/device/show', {});
+  document.getElementById('fsckOut').textContent = JSON.stringify(res, null, 2);
+}
+
+async function doDevicePin() {
+  const { projectId, threadId } = getIds();
+  const deviceId = document.getElementById('devPinId').value.trim();
+  const publicKeySpkiB64 = document.getElementById('devPinPubkey').value.trim();
+  const scopeThreadId = document.getElementById('devPinThread').value.trim() || undefined;
+  const res = await api('/api/device/pin', {
+    projectId, threadId: scopeThreadId, deviceId, publicKeySpkiB64
+  });
+  document.getElementById('fsckOut').textContent = JSON.stringify(res, null, 2);
+  showAlert('已钉入设备公钥 ' + deviceId, 'ok');
+}
+
+async function doDeviceRevoke() {
+  const { projectId } = getIds();
+  const deviceId = document.getElementById('devRevId').value.trim();
+  const status = document.getElementById('devRevStatus').value;
+  const res = await api('/api/device/revoke', { projectId, deviceId, status });
+  document.getElementById('fsckOut').textContent = JSON.stringify(res, null, 2);
+  showAlert('已更新设备 ' + deviceId + ' 状态为 ' + status, 'ok');
 }
 
 async function shutdownServer() {
@@ -1163,6 +1308,7 @@ export async function startThreadPassWeb(
               confirmationProof: proof,
               requireDisasterRedundant: Boolean(body.requireDisasterRedundant),
               disasterVerified: Boolean(body.disasterVerified),
+              actAsMain: Boolean(body.actAsMain),
               transcriptFilePath:
                 typeof body.transcriptFilePath === 'string' && body.transcriptFilePath.trim()
                   ? body.transcriptFilePath.trim()
@@ -1200,6 +1346,117 @@ export async function startThreadPassWeb(
             svc.runFsck(reqBodyStr(body, 'projectId'), reqBodyStr(body, 'threadId'), {
               rebuildSqlite: Boolean(body.rebuildSqlite),
             }),
+          );
+          return;
+        }
+        if (reqUrl.pathname === '/api/peek') {
+          const streamId = reqBodyStr(body, 'streamId');
+          const lines = svc.peekStream(reqBodyStr(body, 'projectId'), reqBodyStr(body, 'threadId'), streamId);
+          sendJson(res, 200, { stream_id: streamId, count: lines.length, lines });
+          return;
+        }
+        if (reqUrl.pathname === '/api/grant/issue') {
+          if (
+            typeof body.maxTotalSpawns !== 'number' ||
+            !Number.isInteger(body.maxTotalSpawns) ||
+            body.maxTotalSpawns < 1
+          ) {
+            throw new Error('maxTotalSpawns must be a finite integer >= 1');
+          }
+          let maxDepth = 0;
+          if (body.maxDepth !== undefined) {
+            if (typeof body.maxDepth !== 'number' || !Number.isInteger(body.maxDepth) || body.maxDepth < 0) {
+              throw new Error('maxDepth must be a finite integer >= 0');
+            }
+            maxDepth = body.maxDepth;
+          }
+          sendJson(
+            res,
+            200,
+            svc.issueDispatchGrant({
+              projectId: reqBodyStr(body, 'projectId'),
+              threadId: reqBodyStr(body, 'threadId'),
+              issuerStreamId:
+                typeof body.issuerStreamId === 'string' && body.issuerStreamId.trim()
+                  ? body.issuerStreamId.trim()
+                  : undefined,
+              granteeStreamId: reqBodyStr(body, 'granteeStreamId'),
+              parentGrantId:
+                typeof body.parentGrantId === 'string' && body.parentGrantId.trim()
+                  ? body.parentGrantId.trim()
+                  : undefined,
+              maxTotalSpawns: body.maxTotalSpawns,
+              maxDepth,
+              canRedelegate: Boolean(body.canRedelegate),
+            }),
+          );
+          return;
+        }
+        if (reqUrl.pathname === '/api/grant/revoke') {
+          sendJson(
+            res,
+            200,
+            svc.revokeDispatchGrant({
+              projectId: reqBodyStr(body, 'projectId'),
+              threadId: reqBodyStr(body, 'threadId'),
+              grantId: reqBodyStr(body, 'grantId'),
+              reason: typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim() : undefined,
+            }),
+          );
+          return;
+        }
+        if (reqUrl.pathname === '/api/gc') {
+          let gracePeriodMs = 0;
+          if (body.gracePeriodMs !== undefined) {
+            if (
+              typeof body.gracePeriodMs !== 'number' ||
+              !Number.isInteger(body.gracePeriodMs) ||
+              body.gracePeriodMs < 0
+            ) {
+              throw new Error('gracePeriodMs must be a finite integer >= 0');
+            }
+            gracePeriodMs = body.gracePeriodMs;
+          }
+          sendJson(
+            res,
+            200,
+            svc.engine.gcOrphanBlobs(reqBodyStr(body, 'projectId'), reqBodyStr(body, 'threadId'), {
+              gracePeriodMs,
+            }),
+          );
+          return;
+        }
+        if (reqUrl.pathname === '/api/device/show') {
+          sendJson(res, 200, {
+            device_id: svc.engine.identity.device_id,
+            public_key_spki_b64: svc.engine.identity.public_key_spki_b64,
+            home_dir: svc.engine.homeDir,
+            trusted_keys: loadTrustedDeviceKeys(svc.engine.homeDir).keys,
+          });
+          return;
+        }
+        if (reqUrl.pathname === '/api/device/pin') {
+          sendJson(
+            res,
+            200,
+            svc.pinDeviceKey(
+              reqBodyStr(body, 'projectId'),
+              reqBodyStr(body, 'deviceId'),
+              reqBodyStr(body, 'publicKeySpkiB64'),
+              typeof body.threadId === 'string' && body.threadId.trim() ? body.threadId.trim() : undefined,
+            ),
+          );
+          return;
+        }
+        if (reqUrl.pathname === '/api/device/revoke') {
+          const status = body.status === undefined ? 'revoked' : String(body.status);
+          if (status !== 'revoked' && status !== 'retired') {
+            throw new Error("device status must be 'revoked' or 'retired'");
+          }
+          sendJson(
+            res,
+            200,
+            svc.revokeOrRetireDeviceKey(reqBodyStr(body, 'projectId'), reqBodyStr(body, 'deviceId'), status),
           );
           return;
         }

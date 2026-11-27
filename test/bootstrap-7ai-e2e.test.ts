@@ -2990,3 +2990,212 @@ test('Trust boundary hardening: initThread summary defaults to unverified_import
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('Web GUI & API full CLI parity: init confirm, peek, grant issue/revoke + nested fork, gc validation, and device show/pin/revoke', async () => {
+  const home = makeTempHome('web-full-parity');
+  const svc = new ThreadPassService({ homeDir: home });
+  const web = await startThreadPassWeb({ service: svc, idleTimeoutMs: 60_000 });
+  try {
+    // 1. HTML exposes every CLI parity control and stays strictly free of innerHTML
+    const html = await (await fetch(`http://127.0.0.1:${web.port}/?token=${web.token}`)).text();
+    for (const id of [
+      'initSummary',
+      'initConfirm',
+      'forkSourceAnchor',
+      'forkActAsMain',
+      'peekStream',
+      'gcGraceMs',
+      'grantGrantee',
+      'revokeGrantId',
+      'devPinId',
+      'devRevId',
+    ]) {
+      assert.ok(html.includes(`id="${id}"`), `Missing Web UI element id="${id}"`);
+    }
+    assert.equal(html.toLowerCase().includes('innerhtml'), false);
+
+    const hdrs = { 'Content-Type': 'application/json', 'X-ThreadPass-Token': web.token };
+
+    // 2. Confirmed /api/init via 2-step challenge elevates summary to human_authority
+    const initGoal = 'Web parity confirmed goal';
+    const prepInit = (await (
+      await fetch(`http://127.0.0.1:${web.port}/api/confirm/prepare`, {
+        method: 'POST',
+        headers: hdrs,
+        body: JSON.stringify({ contentText: initGoal, purpose: 'authorize_instruction' }),
+      })
+    ).json()) as { challenge_id: string; content_sha256: string };
+    const initRes = (await (
+      await fetch(`http://127.0.0.1:${web.port}/api/init`, {
+        method: 'POST',
+        headers: hdrs,
+        body: JSON.stringify({
+          projectId: 'proj_web_parity',
+          threadId: 'thr_web_parity',
+          summary: initGoal,
+          confirmChallengeId: prepInit.challenge_id,
+          confirmContentSha256: prepInit.content_sha256,
+        }),
+      })
+    ).json()) as { main_stream_id: string; anchor_id: string; trust_tier: string };
+    assert.equal(initRes.trust_tier, 'human_authority');
+
+    // 3. /api/peek reads committed lines on Main
+    const peekRes = (await (
+      await fetch(`http://127.0.0.1:${web.port}/api/peek`, {
+        method: 'POST',
+        headers: hdrs,
+        body: JSON.stringify({
+          projectId: 'proj_web_parity',
+          threadId: 'thr_web_parity',
+          streamId: initRes.main_stream_id,
+        }),
+      })
+    ).json()) as { stream_id: string; count: number; lines: unknown[] };
+    assert.equal(peekRes.stream_id, initRes.main_stream_id);
+    assert.ok(peekRes.count >= 2);
+    assert.equal(peekRes.lines.length, peekRes.count);
+
+    // 4. Fork sub_a -> /api/grant/issue (1 spawn) -> nested fork succeeds -> 2nd fails -> /api/grant/revoke -> actAsMain fork succeeds
+    const forkSubARes = await fetch(`http://127.0.0.1:${web.port}/api/fork`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_web_parity',
+        threadId: 'thr_web_parity',
+        workerStreamId: 'sub_a',
+        taskBrief: 'Subtask A root',
+      }),
+    });
+    assert.equal(forkSubARes.status, 200);
+
+    const grantIssueRes = (await (
+      await fetch(`http://127.0.0.1:${web.port}/api/grant/issue`, {
+        method: 'POST',
+        headers: hdrs,
+        body: JSON.stringify({
+          projectId: 'proj_web_parity',
+          threadId: 'thr_web_parity',
+          granteeStreamId: 'sub_a',
+          maxTotalSpawns: 1,
+          maxDepth: 1,
+          canRedelegate: false,
+        }),
+      })
+    ).json()) as { grant_id: string };
+    assert.ok(grantIssueRes.grant_id);
+
+    const nested1 = await fetch(`http://127.0.0.1:${web.port}/api/fork`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_web_parity',
+        threadId: 'thr_web_parity',
+        originStreamId: 'sub_a',
+        workerStreamId: 'sub_a_1',
+        taskBrief: 'Nested child 1',
+      }),
+    });
+    assert.equal(nested1.status, 200);
+
+    const nested2Fail = await fetch(`http://127.0.0.1:${web.port}/api/fork`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_web_parity',
+        threadId: 'thr_web_parity',
+        originStreamId: 'sub_a',
+        workerStreamId: 'sub_a_2',
+        taskBrief: 'Should exceed quota',
+      }),
+    });
+    assert.equal(nested2Fail.status, 400);
+
+    const revokeRes = await fetch(`http://127.0.0.1:${web.port}/api/grant/revoke`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_web_parity',
+        threadId: 'thr_web_parity',
+        grantId: grantIssueRes.grant_id,
+        reason: 'Done with sub_a delegation',
+      }),
+    });
+    assert.equal(revokeRes.status, 200);
+
+    const actAsMainRes = await fetch(`http://127.0.0.1:${web.port}/api/fork`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_web_parity',
+        threadId: 'thr_web_parity',
+        originStreamId: 'sub_a',
+        workerStreamId: 'sub_a_main',
+        actAsMain: true,
+        taskBrief: 'Operator main fork from sub_a after revoke',
+      }),
+    });
+    assert.equal(actAsMainRes.status, 200);
+
+    // 5. /api/gc accepts >= 0 and rejects negative gracePeriodMs
+    const gcOk = await fetch(`http://127.0.0.1:${web.port}/api/gc`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({ projectId: 'proj_web_parity', threadId: 'thr_web_parity', gracePeriodMs: 0 }),
+    });
+    assert.equal(gcOk.status, 200);
+    const gcBad = await fetch(`http://127.0.0.1:${web.port}/api/gc`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({ projectId: 'proj_web_parity', threadId: 'thr_web_parity', gracePeriodMs: -1 }),
+    });
+    assert.equal(gcBad.status, 400);
+
+    // 6. /api/device/show, /api/device/pin, and /api/device/revoke roundtrip cleanly
+    const devShow1 = (await (
+      await fetch(`http://127.0.0.1:${web.port}/api/device/show`, {
+        method: 'POST',
+        headers: hdrs,
+        body: '{}',
+      })
+    ).json()) as { device_id: string; public_key_spki_b64: string; trusted_keys: Array<{ device_id: string; status: string }> };
+    assert.equal(devShow1.device_id, svc.engine.identity.device_id);
+
+    const pinRes = await fetch(`http://127.0.0.1:${web.port}/api/device/pin`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({
+        projectId: 'proj_web_parity',
+        deviceId: 'dev_peer_web',
+        publicKeySpkiB64: devShow1.public_key_spki_b64,
+      }),
+    });
+    assert.equal(pinRes.status, 200);
+
+    const retireRes = await fetch(`http://127.0.0.1:${web.port}/api/device/revoke`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({ projectId: 'proj_web_parity', deviceId: 'dev_peer_web', status: 'retired' }),
+    });
+    assert.equal(retireRes.status, 200);
+
+    const revokeDevRes = await fetch(`http://127.0.0.1:${web.port}/api/device/revoke`, {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({ projectId: 'proj_web_parity', deviceId: 'dev_peer_web', status: 'revoked' }),
+    });
+    assert.equal(revokeDevRes.status, 200);
+
+    const devShow2 = (await (
+      await fetch(`http://127.0.0.1:${web.port}/api/device/show`, {
+        method: 'POST',
+        headers: hdrs,
+        body: '{}',
+      })
+    ).json()) as { trusted_keys: Array<{ device_id: string; status: string }> };
+    assert.equal(devShow2.trusted_keys.find((k) => k.device_id === 'dev_peer_web')?.status, 'revoked');
+  } finally {
+    await web.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

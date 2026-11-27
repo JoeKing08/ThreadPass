@@ -7,7 +7,9 @@
   - **宿主原生会话**：IDE/CLI/Web 里的具体窗口或本地/云端对话记录，只是临时承载逻辑流的工作载体。
   - **当前主 Agent**：此时此刻正在替逻辑主会话值班干活的那一个 AI 实例（哪怕全场只有 1 个 AI，它也只是“当前主 Agent”，换窗口/换模型不换主会话）。
 - **宿主会话日志定位、Web 可选上传与可达性标记：** 支持在 `adopt` / `ingest` / `reconcile commit` / `fork` 时记录带机器归属（`hostname + device_id + file_path`）的原生会话文件路径（`--transcript-file`）、从 Web 上传并自动脱敏归档会话副本（`--upload-transcript`）或标注纯云端来源（`--cloud-host` / `--host-session-id`）。打包信封时会自动标注本机可 `grep`、异机、已上传或仅云端占位等可达性状态，溢出时写入 `transcript-index.json`。
-- **双向分片、身份保持与安全闭环强化：** 支持超大信封按完整 XML `<archived_reference_...>` 围栏与 `<handoff_chunk>` 分片输出，并支持模型回传**对象级多片 JSON**（强制每片携带 `part_group_id`、`part_index`、`is_final`，内置 64 片 / 4 MiB 上限）；`reconcile commit` 强制绑定 `packReconcile` 发布的不可变来源快照（`--pack`），`ingest` 强制核对 `base_anchor_id` 防过期基线覆盖；`human_authority` 与冲突确认（`human_confirmed`）必须经过本地 Ed25519 一次性挑战防重放签发，绝不采信模型自声明或未验证定位符路径。
+- **双端交互闭环与全量功能齐平（`thp` CLI / `thp web`）：** 支持统一粘贴往返闭环，并提供按需唤起、用完即退的本机临时图形壳 `thp web`（仅监听 `127.0.0.1`、高熵会话 Token），完整覆盖 `init` / `status` / `adopt` / `reconcile` / `handoff` / `ingest` / `fork` / `mailbox` / `grant` / `peek` / `gc` / `device` / `fsck` 全部工作流与运维能力。
+- **双向分片、身份保持与严格确认闭环：** 支持超大信封按完整 XML `<archived_reference_...>` 围栏与 `<handoff_chunk>` 分片输出，并支持模型回传**对象级多片 JSON**（强制每片携带 `part_group_id`、`part_index`、`is_final`，内置 64 片 / 4 MiB 上限）；`reconcile commit` 强制绑定 `packReconcile` 发布的不可变来源快照（`--pack`），已发布流上的结构化 `ingest` 强制核对 `base_anchor_id` 防过期基线覆盖；`init` / `adopt` / `ingest` / `reconcile` / `fork` / `mailbox` 默认不授予真人授权等级，`human_authority` 与冲突确认（`human_confirmed`）必须经过本机 Ed25519 一次性挑战防重放签发，绝不采信模型自声明、调用参数或未验证定位符路径。
+- **设备级一次性确认凭证防重放：** 已消费确认凭证记录于本机 Thread 库 `consumed_confirmation_nonces` 与设备级 `confirmation-nonces.sqlite`（`BEGIN IMMEDIATE` 原子占位，防并发与跨 Thread / Project 重放）。恢复提示：`fsck --rebuild` 按单个 `thread_id` 执行，若设备级 `confirmation-nonces.sqlite` 丢失，须对相关各个 `thread_id` 分别执行 `fsck --rebuild` 以回填全部历史凭证。
 
 ## 三层目录结构
 
@@ -40,25 +42,28 @@ node dist/src/shell/cli.js web --project ThreadPass --thread main_dev
 或使用纯 CLI：
 
 ```bash
-# 1. 初始化项目与 Main
+# 1. 初始化项目与 Main（可选 --authorize 需在交互式终端手动确认目标）
 node dist/src/shell/cli.js init --project ThreadPass --thread main_dev --workspace .
 
-# 2. 复制提取模板并收编 7 个外部 AI（亦支持直接粘贴原始对话兜底）
+# 2. 复制提取模板并收编外部 AI（亦支持直接粘贴原始对话兜底）
 node dist/src/shell/cli.js prompt adopt-extract --source ai_1
-node dist/src/shell/cli.js adopt --project ThreadPass --thread main_dev --source ai_1 --file ai_1.txt
+node dist/src/shell/cli.js adopt --project ThreadPass --thread main_dev --source ai_1 --file ai_1.txt --transcript-file /path/to/log.jsonl
 
-# 3. 多源 Reconcile 打包与回执落盘
+# 3. 多源 Reconcile 打包与回执落盘（--pack 绑定 Pack 信封；--confirm-topics 可按主题确认冲突）
 node dist/src/shell/cli.js reconcile pack --project ThreadPass --thread main_dev --attachment
-node dist/src/shell/cli.js reconcile commit --project ThreadPass --thread main_dev --sources s1,s2 --file receipt.json --authorize --confirm-interactive
+node dist/src/shell/cli.js reconcile commit --project ThreadPass --thread main_dev --pack <env_id> --file receipt.json --authorize
 
-# 4. 阶段备份回 Main（支持 prompt checkpoint 生成）
+# 4. 阶段备份回 Main（结构化 checkpoint 强制携带 --base-anchor 或 payload.base_anchor_id）
 node dist/src/shell/cli.js prompt checkpoint --project ThreadPass --thread main_dev
-node dist/src/shell/cli.js ingest --project ThreadPass --thread main_dev --stream <main_stream_id> --file ckpt.json --authorize --confirm-interactive --workspace .
+node dist/src/shell/cli.js ingest --project ThreadPass --thread main_dev --stream <main_stream_id> --base-anchor <anchor_id> --file ckpt.json --authorize --workspace .
 
-# 5. 原子派发独立 Subagent
+# 5. 原子派发独立 Subagent 与 Escrow 授权管理
 node dist/src/shell/cli.js fork --project ThreadPass --thread main_dev --worker sub_a --task "Subtask A" --workspace ./wt-a
-node dist/src/shell/cli.js fork --project ThreadPass --thread main_dev --worker sub_b --task "Subtask B" --workspace ./wt-b
+node dist/src/shell/cli.js grant issue --project ThreadPass --thread main_dev --grantee sub_a --max-spawns 2
 
-# 6. 四步校验与 SQLite 重建
+# 6. 只读查阅、设备密钥管理、清理与四步校验重建
+node dist/src/shell/cli.js peek --project ThreadPass --thread main_dev --stream <main_stream_id>
+node dist/src/shell/cli.js device show
+node dist/src/shell/cli.js gc --project ThreadPass --thread main_dev --grace-ms 0
 node dist/src/shell/cli.js fsck --project ThreadPass --thread main_dev --rebuild
 ```
