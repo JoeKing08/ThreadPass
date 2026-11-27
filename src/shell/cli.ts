@@ -67,6 +67,20 @@ function reqFlag(flags: Record<string, string | boolean>, name: string): string 
   return v;
 }
 
+function intFlag(
+  flags: Record<string, string | boolean>,
+  name: string,
+  minValue = 0,
+): number | undefined {
+  const raw = strFlag(flags, name);
+  if (raw === undefined) return undefined;
+  const num = Number(raw);
+  if (!Number.isInteger(num) || num < minValue) {
+    throw new Error(`Invalid --${name} (${raw}): must be an integer >= ${minValue}`);
+  }
+  return num;
+}
+
 function readInputText(parsed: ParsedArgs): string {
   if (parsed.files.length > 0) {
     return parsed.files.map((f) => fs.readFileSync(f, 'utf8')).join('\n\n');
@@ -145,7 +159,7 @@ function printHelp(): void {
   console.log(`ThreadPass CLI (thp) — Pure Node.js local-offline kernel & prompt shell
 
 Usage:
-  thp init --project <id> [--thread <id>] [--main <stream>] [--workspace <dir>] [--summary <text>]
+  thp init --project <id> [--thread <id>] [--main <stream>] [--workspace <dir>] [--summary <text>] [--host-session-id <id>] [--transcript-file <path>] [--cloud-host <provider>] [--upload-transcript <path>]
   thp status --project <id> --thread <id>
   thp prompt adopt-extract [--source <label>]
   thp prompt checkpoint --project <id> --thread <id> [--stream <id>]
@@ -154,7 +168,7 @@ Usage:
   thp reconcile commit --project <id> --thread <id> [--pack <envelope_id>] [--sources s1,s2,...] (--file <path>... | --text <str>) [--authorize] [--confirm-topics <t1,t2>] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
   thp handoff pack --project <id> --thread <id> [--stream <id>] [--goal <text>] [--workspace <dir>] [--attachment]
   thp ingest --project <id> --thread <id> --stream <id> (--file <path>... | --text <str>) [--base-anchor <anchor_id>] [--authorize] [--ack-batch <batch_id> --ack-msgs m1,m2] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
-  thp fork --project <id> --thread <id> --task <brief> [--origin <stream>] [--worker <stream>] [--workspace <dir>] [--act-as-main] [--transcript-file <path>] [--cloud-host <provider>]
+  thp fork --project <id> --thread <id> --task <brief> [--origin <stream>] [--source-anchor <anchor_id>] [--worker <stream>] [--workspace <dir>] [--act-as-main] [--transcript-file <path>] [--machine <host>] [--cloud-host <provider>] [--remote-uri <url>] [--host-session-id <id>] [--upload-transcript <path>]
   thp grant issue --project <id> --thread <id> --grantee <stream> --max-spawns <n> [--issuer <stream>] [--parent-grant <id>] [--max-depth <n>] [--can-redelegate]
   thp grant revoke --project <id> --thread <id> --grant <id> [--reason <text>]
   thp mailbox send --project <id> --thread <id> --from <stream> --to <stream> --text <msg>
@@ -179,12 +193,14 @@ async function main(): Promise<void> {
   const sub = positional[1];
 
   if (cmd === 'init') {
+    const tOpts = readTranscriptOptions(flags);
     const out = svc.initThread({
       projectId: reqFlag(flags, 'project'),
       threadId: strFlag(flags, 'thread'),
       mainStreamId: strFlag(flags, 'main'),
       workspaceDir: strFlag(flags, 'workspace'),
       summary: strFlag(flags, 'summary'),
+      ...tOpts,
     });
     console.log(JSON.stringify(out, null, 2));
     return;
@@ -307,6 +323,7 @@ async function main(): Promise<void> {
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
       originStreamId: strFlag(flags, 'origin'),
+      sourceAnchorId: strFlag(flags, 'source-anchor'),
       workerStreamId: strFlag(flags, 'worker'),
       taskBrief: reqFlag(flags, 'task'),
       workspaceDir: strFlag(flags, 'workspace'),
@@ -320,14 +337,19 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'grant' && sub === 'issue') {
+    const maxSpawns = intFlag(flags, 'max-spawns', 1);
+    if (maxSpawns === undefined) {
+      throw new Error('Missing required option --max-spawns');
+    }
+    const maxDepth = intFlag(flags, 'max-depth', 0);
     const out = svc.issueDispatchGrant({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
       issuerStreamId: strFlag(flags, 'issuer'),
       granteeStreamId: reqFlag(flags, 'grantee'),
       parentGrantId: strFlag(flags, 'parent-grant'),
-      maxTotalSpawns: Number(reqFlag(flags, 'max-spawns')),
-      maxDepth: strFlag(flags, 'max-depth') ? Number(strFlag(flags, 'max-depth')) : undefined,
+      maxTotalSpawns: maxSpawns,
+      maxDepth,
       canRedelegate: flags['can-redelegate'] === true,
     });
     console.log(JSON.stringify(out, null, 2));
@@ -346,11 +368,12 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'gc') {
+    const graceMs = intFlag(flags, 'grace-ms', 0) ?? 0;
     const out = svc.engine.gcOrphanBlobs(
       reqFlag(flags, 'project'),
       reqFlag(flags, 'thread'),
       {
-        gracePeriodMs: strFlag(flags, 'grace-ms') ? Number(strFlag(flags, 'grace-ms')) : 0,
+        gracePeriodMs: graceMs,
       },
     );
     console.log(JSON.stringify(out, null, 2));
@@ -424,7 +447,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'web') {
-    const idleMs = strFlag(flags, 'idle-ms') ? Number(strFlag(flags, 'idle-ms')) : 15 * 60 * 1000;
+    const idleMs = intFlag(flags, 'idle-ms', 0) ?? 15 * 60 * 1000;
     const handle = await startThreadPassWeb({
       service: svc,
       initialProjectId: strFlag(flags, 'project'),

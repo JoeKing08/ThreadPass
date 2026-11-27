@@ -2370,6 +2370,9 @@ export class ThreadPassService {
       if (!sRow.head_anchor_id) {
         throw new Error(`Sender stream ${params.fromStreamId} missing`);
       }
+      if (!store.getStream(params.targetStreamId)) {
+        throw new Error(`Target stream ${params.targetStreamId} not found in thread ${params.threadId}`);
+      }
       const anc = store.getAnchor(sRow.head_anchor_id);
       if (!anc) throw new Error(`Sender anchor ${sRow.head_anchor_id} missing`);
       headAnchor = anc;

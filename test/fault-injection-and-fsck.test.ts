@@ -7,8 +7,11 @@ import { canonicalSha256, deterministicEventId, newId, sha256Hex } from '../src/
 import type { ClockPort } from '../src/core/ports.js';
 import {
   SCHEMA_VERSION,
+  type ControlRecord,
   type EventRecord,
+  type InvocationRecord,
   type LineageAnchor,
+  type NotifyReceiptRecord,
   type TransactionFinalizationCertificate,
   type TransactionManifest,
 } from '../src/core/types.js';
@@ -28,6 +31,7 @@ import {
   CommitConflictError,
   LocalOfflineEngine,
   SimulatedCrashError,
+  manifestDigestPayload,
 } from '../src/profile/local-offline/txn-engine.js';
 import { ThreadPassService, ForeignCanonicalDetectedError } from '../src/shell/service.js';
 import { captureWorkspaceManifest } from '../src/shell/workspace.js';
@@ -1188,9 +1192,234 @@ test('upsertTranscriptLocator preserves optional locator_json metadata on partia
       assert.equal(phLocs.length, 1);
       assert.equal(phLocs[0].locator_origin, 'operator_verified');
       assert.equal(phLocs[0].note, 'Verified placeholder');
+
+      // listTranscriptLocators respects timezone-aware chronological DESC order (+08:00 vs Z)
+      store.upsertTranscriptLocator('thr_loc', {
+        locator_id: 'loc_tz_early',
+        stream_id: 'strm_tz_early',
+        source_label: 'tz_early',
+        host_kind: 'placeholder_unavailable',
+        recorded_at: '2026-01-02T01:00:00+08:00', // == 2026-01-01T17:00:00Z
+        locator_origin: 'operator_verified',
+      });
+      store.upsertTranscriptLocator('thr_loc', {
+        locator_id: 'loc_utc_later',
+        stream_id: 'strm_utc_later',
+        source_label: 'utc_later',
+        host_kind: 'placeholder_unavailable',
+        recorded_at: '2026-01-01T18:00:00.000Z', // strictly newer than +08:00 01:00
+        locator_origin: 'operator_verified',
+      });
+      const orderedIds = store.listTranscriptLocators('thr_loc').map((l) => l.stream_id);
+      assert.ok(orderedIds.indexOf('strm_utc_later') < orderedIds.indexOf('strm_tz_early'));
     } finally {
       store.close();
     }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Archived invocations carry resolved commit_txn_id and fsck --rebuild preserves mailbox committed_receipt regardless of txn_id order', () => {
+  const home = makeTempHome('inv-txn-and-mbox-rebuild');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+    const init = svc.initThread({ projectId: 'proj_mb', threadId: 'thr_mb', mainStreamId: 'strm_main' });
+
+    // 1. Adopted/ingested invocations on disk MUST carry resolved txn_* id, never 'pending'
+    svc.adoptExternal({
+      projectId: 'proj_mb',
+      threadId: 'thr_mb',
+      streamId: 'strm_sender',
+      sourceLabel: 'sender_ai',
+      rawText: JSON.stringify({
+        threadpass_handoff: true,
+        summary_text: 'Adopted stream with invocation',
+        recent_turns: [
+          { role: 'user', text: 'Do task A' },
+          { role: 'assistant', text: 'Completed task A' },
+        ],
+      }),
+    });
+    const senderLines = svc.peekStream('proj_mb', 'thr_mb', 'strm_sender');
+    const invocations = senderLines.filter((l): l is InvocationRecord => l.kind === 'invocation');
+    assert.equal(invocations.length, 1);
+    assert.match(invocations[0].commit_txn_id, /^txn_/);
+
+    // 2. Construct deterministic verified txns where offer ('txn_aaa_offer') and ack ('txn_bbb_ack')
+    //    sort lexicographically BEFORE sender's cross_stream_message ('txn_zzz_send').
+    const layout = svc.engine.getLayout('proj_mb', 'thr_mb');
+    const identity = loadOrCreateDeviceIdentity(home);
+    const nowIso = '2026-01-05T00:00:00.000Z';
+    const ws = captureWorkspaceManifest();
+    const stBefore = svc.getStatus('proj_mb', 'thr_mb');
+    const mainHead = stBefore.streams.find((s) => s.stream_id === init.main_stream_id)?.head_anchor_id!;
+    const senderHead = stBefore.streams.find((s) => s.stream_id === 'strm_sender')?.head_anchor_id!;
+
+    const publishSyntheticTxn = (
+      txnId: string,
+      streamId: string,
+      seq: number,
+      parentAnchorId: string,
+      records: Array<EventRecord | ControlRecord>,
+    ) => {
+      const anchorId = newId('anc', 8);
+      const anchor: LineageAnchor = {
+        anchor_id: anchorId,
+        thread_id: 'thr_mb',
+        stream_id: streamId,
+        parents: [parentAnchorId],
+        workspace_manifest: ws,
+        summary: `Synthetic ${txnId}`,
+        head_event_ids: records.filter((r): r is EventRecord => r.kind === 'event').map((e) => e.event_id),
+        created_at: nowIso,
+      };
+      const anchorCtrl: ControlRecord = {
+        schema_version: SCHEMA_VERSION,
+        kind: 'control',
+        control_id: newId('ctrl', 8),
+        stream_id: streamId,
+        commit_txn_id: txnId,
+        created_at: nowIso,
+        payload: { type: 'anchor', anchor },
+      };
+      const shardRel = path.posix.join(
+        'history',
+        'committed',
+        streamId,
+        `${String(seq).padStart(6, '0')}_${txnId}.jsonl`,
+      );
+      const content = `${[...records, anchorCtrl].map((r) => JSON.stringify(r)).join('\n')}\n`;
+      const shardSha = sha256Hex(content);
+      const shardAbs = path.join(layout.rootDir, ...shardRel.split('/'));
+      fs.mkdirSync(path.dirname(shardAbs), { recursive: true });
+      fs.writeFileSync(shardAbs, content, 'utf8');
+
+      const unsignedManifest: Omit<TransactionManifest, 'manifest_hash'> = {
+        schema_version: SCHEMA_VERSION,
+        txn_id: txnId,
+        project_id: 'proj_mb',
+        thread_id: 'thr_mb',
+        affected_streams: [streamId],
+        expected_parent_heads: { [streamId]: parentAnchorId },
+        expected_journal_head: null,
+        shards: [{ relative_path: shardRel, sha256: shardSha, stream_id: streamId, seq }],
+        blobs: [],
+        input_dependency_refs: [],
+        provenance_refs: [],
+        created_at: nowIso,
+      };
+      const manifestHash = manifestDigestPayload(unsignedManifest);
+      const fullManifest: TransactionManifest = { ...unsignedManifest, manifest_hash: manifestHash };
+      fs.writeFileSync(path.join(layout.txnsCommittedDir, `${txnId}.manifest.json`), JSON.stringify(fullManifest));
+      const intentProof = signCommitIntentProof(identity, {
+        txn_id: txnId,
+        project_id: 'proj_mb',
+        thread_id: 'thr_mb',
+        manifest_hash: manifestHash,
+        expected_parent_heads: { [streamId]: parentAnchorId },
+        expected_journal_head: null,
+        fencing_epoch: 100 + seq,
+        issued_at: nowIso,
+      });
+      const cert: TransactionFinalizationCertificate = {
+        schema_version: SCHEMA_VERSION,
+        txn_id: txnId,
+        manifest_hash: manifestHash,
+        commit_intent_proof: intentProof,
+        publication_closure_proof: {
+          txn_id: txnId,
+          manifest_hash: manifestHash,
+          verified_objects_count: 1,
+          verified_at: nowIso,
+          closure_digest: shardSha,
+        },
+        finalized_at: nowIso,
+      };
+      fs.writeFileSync(path.join(layout.txnsCommittedDir, `${txnId}.finalized.json`), JSON.stringify(cert));
+      return anchorId;
+    };
+
+    const msgId = 'msg_out_of_order_1';
+    const batchId = 'batch_out_of_order_1';
+    const offerAnchor = publishSyntheticTxn('txn_aaa_offer', init.main_stream_id, 2, mainHead, [
+      {
+        schema_version: SCHEMA_VERSION,
+        kind: 'control',
+        control_id: 'ctrl_offer_1',
+        stream_id: init.main_stream_id,
+        commit_txn_id: 'txn_aaa_offer',
+        created_at: nowIso,
+        payload: {
+          type: 'notify_receipt',
+          receipt: {
+            receipt_type: 'offered',
+            batch_id: batchId,
+            target_stream_id: init.main_stream_id,
+            target_base_anchor_id: mainHead,
+            message_ids: [msgId],
+            lease_until_mono_ns: '999999999999999',
+            recorded_at: nowIso,
+          } satisfies NotifyReceiptRecord,
+        },
+      },
+    ]);
+    publishSyntheticTxn('txn_bbb_ack', init.main_stream_id, 3, offerAnchor, [
+      {
+        schema_version: SCHEMA_VERSION,
+        kind: 'control',
+        control_id: 'ctrl_ack_1',
+        stream_id: init.main_stream_id,
+        commit_txn_id: 'txn_bbb_ack',
+        created_at: nowIso,
+        payload: {
+          type: 'notify_receipt',
+          receipt: {
+            receipt_type: 'committed_receipt',
+            batch_id: batchId,
+            target_stream_id: init.main_stream_id,
+            target_base_anchor_id: offerAnchor,
+            message_ids: [msgId],
+            recorded_at: nowIso,
+          } satisfies NotifyReceiptRecord,
+        },
+      },
+    ]);
+    publishSyntheticTxn('txn_zzz_send', 'strm_sender', 2, senderHead, [
+      {
+        schema_version: SCHEMA_VERSION,
+        kind: 'event',
+        event_id: deterministicEventId('strm_sender', msgId),
+        stream_id: 'strm_sender',
+        seq: 5,
+        commit_txn_id: 'txn_zzz_send',
+        trust_tier: 'human_authority',
+        provenance: {
+          capture_origin: 'thp_mailbox',
+          verification_method: 'local_cli_direct',
+          source_event_ref: msgId,
+          adapter_version: '1.0.0',
+        },
+        created_at: nowIso,
+        payload: {
+          type: 'cross_stream_message',
+          message_id: msgId,
+          from_stream_id: 'strm_sender',
+          from_anchor_id: senderHead,
+          target_stream_id: init.main_stream_id,
+          text: 'Must stay committed_receipt after rebuild',
+        },
+      },
+    ]);
+
+    const rebuilt = svc.runFsck('proj_mb', 'thr_mb', { rebuildSqlite: true });
+    assert.equal(rebuilt.ok, true);
+    const hoAfterRebuild = svc.packHandoff({
+      projectId: 'proj_mb',
+      threadId: 'thr_mb',
+      streamId: init.main_stream_id,
+    });
+    assert.equal(hoAfterRebuild.offered_batch_id, undefined);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

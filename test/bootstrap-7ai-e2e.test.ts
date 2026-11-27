@@ -2732,6 +2732,27 @@ test('Regression checks for continuation filter, adversarial XML attr escaping, 
       .pop();
     assert.ok(guardRec && guardRec.kind === 'control' && guardRec.payload.type === 'reconciliation_record');
     assert.equal(guardRec.payload.record.conflicts[0].human_confirmed, true);
+
+    // 12. sendMailboxMessage rejects non-existent targetStreamId, and CLI validates integer flags / fork --source-anchor
+    assert.throws(
+      () =>
+        svc.sendMailboxMessage({
+          projectId: 'proj_topics_guard',
+          threadId: 'thr_topics_guard',
+          fromStreamId: mainStreamId,
+          targetStreamId: 'strm_nonexistent_target',
+          text: 'Should reject missing target',
+        }),
+      /Target stream strm_nonexistent_target not found/,
+    );
+    const cliDistPath = path.resolve('dist', 'src', 'shell', 'cli.js');
+    const badGc = spawnSync(
+      process.execPath,
+      [cliDistPath, 'gc', '--project', 'proj_topics_guard', '--thread', 'thr_topics_guard', '--grace-ms', 'abc'],
+      { encoding: 'utf8', env: { ...process.env, THREADPASS_HOME: home } },
+    );
+    assert.notEqual(badGc.status, 0);
+    assert.match(`${badGc.stderr}\n${badGc.stdout}`, /Invalid --grace-ms/);
   } finally {
     await web.close();
     fs.rmSync(home, { recursive: true, force: true });

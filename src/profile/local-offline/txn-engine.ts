@@ -860,7 +860,7 @@ export class LocalOfflineEngine {
       }
       if (sInput.invocations) {
         for (const inv of sInput.invocations) {
-          lines.push(inv);
+          lines.push({ ...inv, commit_txn_id: txnId });
         }
       }
       if (sInput.controls) {
@@ -1713,8 +1713,8 @@ export class LocalOfflineEngine {
           `UPDATE mailbox_proj
            SET status = CASE WHEN status = 'committed_receipt' THEN 'committed_receipt' ELSE ? END,
                batch_id = CASE WHEN status = 'committed_receipt' THEN batch_id ELSE ? END,
-               lease_until_mono_ns = ?,
-               updated_at = ?
+               lease_until_mono_ns = CASE WHEN status = 'committed_receipt' THEN NULL ELSE ? END,
+               updated_at = CASE WHEN status = 'committed_receipt' THEN updated_at ELSE ? END
            WHERE message_id = ? AND target_stream_id = ?`,
         )
         .run(
@@ -2058,6 +2058,7 @@ export class LocalOfflineEngine {
         journalEvents: JournalEventRecord[];
         requiredInputDeps: InputDependencyManifest[];
         snapshotBlobRefs: string[];
+        notifyReceipts: NotifyReceiptRecord[];
       }
     >();
 
@@ -2076,6 +2077,7 @@ export class LocalOfflineEngine {
         journalEvents: [] as JournalEventRecord[],
         requiredInputDeps: [] as InputDependencyManifest[],
         snapshotBlobRefs: [] as string[],
+        notifyReceipts: [] as NotifyReceiptRecord[],
       };
 
       if (!fs.existsSync(certPath) || !fs.existsSync(manifestPath)) {
@@ -2161,6 +2163,8 @@ export class LocalOfflineEngine {
               for (const src of rec.payload.manifest.sources) {
                 entry.snapshotBlobRefs.push(src.snapshot_blob_ref);
               }
+            } else if (rec.payload.type === 'notify_receipt') {
+              entry.notifyReceipts.push(rec.payload.receipt);
             }
           }
         }
@@ -2460,6 +2464,13 @@ export class LocalOfflineEngine {
               healthMap,
               divergentHeadsMap,
             );
+          }
+          // Pass 2: Re-apply notify_receipt state transitions after all cross_stream_message rows
+          // across independent sender streams have been populated (avoids random txn_id ordering loss).
+          for (const d of verifiedTxns) {
+            for (const nr of d.notifyReceipts) {
+              this.applyNotifyReceiptProj(rebuiltStore, nr);
+            }
           }
           if (divergentJournalHeads.length > 1) {
             rebuiltStore.db

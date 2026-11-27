@@ -592,13 +592,29 @@ export class StateStore {
     const rows = (threadId
       ? this.db
           .prepare(
-            'SELECT locator_json FROM transcript_locators WHERE thread_id = ? ORDER BY recorded_at DESC, locator_key ASC',
+            'SELECT locator_key, locator_json FROM transcript_locators WHERE thread_id = ?',
           )
           .all(threadId)
       : this.db
-          .prepare('SELECT locator_json FROM transcript_locators ORDER BY recorded_at DESC, locator_key ASC')
-          .all()) as Array<{ locator_json: string }>;
-    return rows.map((r) => JSON.parse(r.locator_json) as HostTranscriptLocator);
+          .prepare('SELECT locator_key, locator_json FROM transcript_locators')
+          .all()) as Array<{ locator_key: string; locator_json: string }>;
+    return rows
+      .map((r) => ({
+        key: r.locator_key,
+        loc: JSON.parse(r.locator_json) as HostTranscriptLocator,
+      }))
+      .sort((a, b) => {
+        const aMs = Date.parse(a.loc.recorded_at);
+        const bMs = Date.parse(b.loc.recorded_at);
+        if (Number.isFinite(aMs) && Number.isFinite(bMs)) {
+          if (bMs !== aMs) return bMs - aMs;
+        } else {
+          const cmp = b.loc.recorded_at.localeCompare(a.loc.recorded_at);
+          if (cmp !== 0) return cmp;
+        }
+        return a.key.localeCompare(b.key);
+      })
+      .map((r) => r.loc);
   }
 
   hasConsumedConfirmationNonce(nonce: string): boolean {
