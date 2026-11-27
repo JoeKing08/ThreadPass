@@ -48,6 +48,14 @@ function readJsonBody(req: http.IncomingMessage, maxBytes = 4 * 1024 * 1024): Pr
   });
 }
 
+function reqBodyStr(body: Record<string, unknown>, key: string): string {
+  const val = body[key];
+  if (typeof val !== 'string' || !val.trim()) {
+    throw new Error(`Missing required field: ${key}`);
+  }
+  return val.trim();
+}
+
 function sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
@@ -63,9 +71,10 @@ function renderHtmlPage(
   initialProjectId: string,
   initialThreadId: string,
 ): string {
-  const safeToken = JSON.stringify(token);
-  const safeProj = JSON.stringify(initialProjectId);
-  const safeThr = JSON.stringify(initialThreadId);
+  const safeScriptJson = (v: string) => JSON.stringify(v).replace(/</g, '\\u003c');
+  const safeToken = safeScriptJson(token);
+  const safeProj = safeScriptJson(initialProjectId);
+  const safeThr = safeScriptJson(initialThreadId);
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -438,10 +447,12 @@ function downloadLatestMd() {
     return;
   }
   const blob = new Blob([latestMarkdown], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  a.href = url;
   a.download = 'threadpass-bundle.md';
   a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function commitReconcile() {
@@ -640,9 +651,15 @@ export async function startThreadPassWeb(
             res,
             200,
             svc.initThread({
-              projectId: String(body.projectId || 'threadpass-bootstrap'),
-              threadId: body.threadId ? String(body.threadId) : undefined,
-              workspaceDir: body.workspaceDir ? String(body.workspaceDir) : undefined,
+              projectId:
+                typeof body.projectId === 'string' && body.projectId.trim()
+                  ? body.projectId.trim()
+                  : 'threadpass-bootstrap',
+              threadId: typeof body.threadId === 'string' && body.threadId.trim() ? body.threadId.trim() : undefined,
+              workspaceDir:
+                typeof body.workspaceDir === 'string' && body.workspaceDir.trim()
+                  ? body.workspaceDir.trim()
+                  : undefined,
             }),
           );
           return;
@@ -651,14 +668,16 @@ export async function startThreadPassWeb(
           sendJson(
             res,
             200,
-            svc.getStatus(String(body.projectId), String(body.threadId)),
+            svc.getStatus(reqBodyStr(body, 'projectId'), reqBodyStr(body, 'threadId')),
           );
           return;
         }
         if (reqUrl.pathname === '/api/prompt/adopt-extract') {
           sendJson(res, 200, {
             prompt: svc.getAdoptExtractPrompt(
-              body.sourceLabel ? String(body.sourceLabel) : undefined,
+              typeof body.sourceLabel === 'string' && body.sourceLabel.trim()
+                ? body.sourceLabel.trim()
+                : undefined,
             ),
           });
           return;
@@ -668,9 +687,9 @@ export async function startThreadPassWeb(
             res,
             200,
             svc.getCheckpointPrompt(
-              String(body.projectId),
-              String(body.threadId),
-              body.streamId ? String(body.streamId) : undefined,
+              reqBodyStr(body, 'projectId'),
+              reqBodyStr(body, 'threadId'),
+              typeof body.streamId === 'string' && body.streamId.trim() ? body.streamId.trim() : undefined,
             ),
           );
           return;
@@ -688,16 +707,19 @@ export async function startThreadPassWeb(
             res,
             200,
             svc.ingestReply({
-              projectId: String(body.projectId),
-              threadId: String(body.threadId),
-              streamId: String(body.streamId),
+              projectId: reqBodyStr(body, 'projectId'),
+              threadId: reqBodyStr(body, 'threadId'),
+              streamId: reqBodyStr(body, 'streamId'),
               rawText,
               confirmationProof: proof,
-              ackBatchId: body.ackBatchId ? String(body.ackBatchId) : undefined,
+              ackBatchId: typeof body.ackBatchId === 'string' && body.ackBatchId.trim() ? body.ackBatchId.trim() : undefined,
               ackMessageIds: Array.isArray(body.ackMessageIds)
                 ? body.ackMessageIds.map(String)
                 : undefined,
-              workspaceDir: body.workspaceDir ? String(body.workspaceDir) : undefined,
+              workspaceDir:
+                typeof body.workspaceDir === 'string' && body.workspaceDir.trim()
+                  ? body.workspaceDir.trim()
+                  : undefined,
             }),
           );
           return;
@@ -707,10 +729,10 @@ export async function startThreadPassWeb(
             res,
             200,
             svc.sendMailboxMessage({
-              projectId: String(body.projectId),
-              threadId: String(body.threadId),
-              fromStreamId: String(body.fromStreamId),
-              targetStreamId: String(body.targetStreamId),
+              projectId: reqBodyStr(body, 'projectId'),
+              threadId: reqBodyStr(body, 'threadId'),
+              fromStreamId: reqBodyStr(body, 'fromStreamId'),
+              targetStreamId: reqBodyStr(body, 'targetStreamId'),
               text: String(body.text ?? ''),
             }),
           );
@@ -729,9 +751,12 @@ export async function startThreadPassWeb(
             res,
             200,
             svc.adoptExternal({
-              projectId: String(body.projectId),
-              threadId: String(body.threadId),
-              sourceLabel: body.sourceLabel ? String(body.sourceLabel) : 'web_adopt',
+              projectId: reqBodyStr(body, 'projectId'),
+              threadId: reqBodyStr(body, 'threadId'),
+              sourceLabel:
+                typeof body.sourceLabel === 'string' && body.sourceLabel.trim()
+                  ? body.sourceLabel.trim()
+                  : 'web_adopt',
               rawText,
               confirmationProof: proof,
               allowForeignCanonical: Boolean(body.allowForeignCanonical),
@@ -740,20 +765,23 @@ export async function startThreadPassWeb(
           return;
         }
         if (reqUrl.pathname === '/api/reconcile/pack') {
-          const perTurn =
-            typeof body.perTurnLimit === 'number' && body.perTurnLimit >= 1200
-              ? body.perTurnLimit
-              : 24000;
+          let perTurn = 24000;
+          if (body.perTurnLimit !== undefined) {
+            if (typeof body.perTurnLimit !== 'number' || !Number.isFinite(body.perTurnLimit) || body.perTurnLimit < 700) {
+              throw new Error('perTurnLimit must be a number >= 700');
+            }
+            perTurn = body.perTurnLimit;
+          }
           sendJson(
             res,
             200,
             svc.packReconcile({
-              projectId: String(body.projectId),
-              threadId: String(body.threadId),
+              projectId: reqBodyStr(body, 'projectId'),
+              threadId: reqBodyStr(body, 'threadId'),
               sourceStreamIds: Array.isArray(body.sourceStreamIds)
                 ? body.sourceStreamIds.map(String)
                 : undefined,
-              mainGoal: body.mainGoal ? String(body.mainGoal) : undefined,
+              mainGoal: typeof body.mainGoal === 'string' && body.mainGoal.trim() ? body.mainGoal.trim() : undefined,
               budget: {
                 effective_context_budget: 120000,
                 per_turn_input_limit: perTurn,
@@ -777,8 +805,8 @@ export async function startThreadPassWeb(
             res,
             200,
             svc.commitReconcile({
-              projectId: String(body.projectId),
-              threadId: String(body.threadId),
+              projectId: reqBodyStr(body, 'projectId'),
+              threadId: reqBodyStr(body, 'threadId'),
               sourceStreamIds: Array.isArray(body.sourceStreamIds)
                 ? body.sourceStreamIds.map(String)
                 : [],
@@ -789,17 +817,20 @@ export async function startThreadPassWeb(
           return;
         }
         if (reqUrl.pathname === '/api/handoff/pack') {
-          const perTurn =
-            typeof body.perTurnLimit === 'number' && body.perTurnLimit >= 1200
-              ? body.perTurnLimit
-              : 24000;
+          let perTurn = 24000;
+          if (body.perTurnLimit !== undefined) {
+            if (typeof body.perTurnLimit !== 'number' || !Number.isFinite(body.perTurnLimit) || body.perTurnLimit < 700) {
+              throw new Error('perTurnLimit must be a number >= 700');
+            }
+            perTurn = body.perTurnLimit;
+          }
           sendJson(
             res,
             200,
             svc.packHandoff({
-              projectId: String(body.projectId),
-              threadId: String(body.threadId),
-              streamId: body.streamId ? String(body.streamId) : undefined,
+              projectId: reqBodyStr(body, 'projectId'),
+              threadId: reqBodyStr(body, 'threadId'),
+              streamId: typeof body.streamId === 'string' && body.streamId.trim() ? body.streamId.trim() : undefined,
               budget: {
                 effective_context_budget: 120000,
                 per_turn_input_limit: perTurn,
@@ -815,12 +846,24 @@ export async function startThreadPassWeb(
             res,
             200,
             svc.forkDispatch({
-              projectId: String(body.projectId),
-              threadId: String(body.threadId),
-              originStreamId: body.originStreamId ? String(body.originStreamId) : undefined,
-              workerStreamId: body.workerStreamId ? String(body.workerStreamId) : undefined,
-              workspaceDir: body.workspaceDir ? String(body.workspaceDir) : undefined,
-              taskBrief: String(body.taskBrief ?? 'Execute scoped subtask'),
+              projectId: reqBodyStr(body, 'projectId'),
+              threadId: reqBodyStr(body, 'threadId'),
+              originStreamId:
+                typeof body.originStreamId === 'string' && body.originStreamId.trim()
+                  ? body.originStreamId.trim()
+                  : undefined,
+              workerStreamId:
+                typeof body.workerStreamId === 'string' && body.workerStreamId.trim()
+                  ? body.workerStreamId.trim()
+                  : undefined,
+              workspaceDir:
+                typeof body.workspaceDir === 'string' && body.workspaceDir.trim()
+                  ? body.workspaceDir.trim()
+                  : undefined,
+              taskBrief:
+                typeof body.taskBrief === 'string' && body.taskBrief.trim()
+                  ? body.taskBrief.trim()
+                  : 'Execute scoped subtask',
               requireDisasterRedundant: Boolean(body.requireDisasterRedundant),
               disasterVerified: Boolean(body.disasterVerified),
             }),
@@ -831,7 +874,7 @@ export async function startThreadPassWeb(
           sendJson(
             res,
             200,
-            svc.runFsck(String(body.projectId), String(body.threadId), {
+            svc.runFsck(reqBodyStr(body, 'projectId'), reqBodyStr(body, 'threadId'), {
               rebuildSqlite: Boolean(body.rebuildSqlite),
             }),
           );
@@ -860,6 +903,7 @@ export async function startThreadPassWeb(
         idleTimer = undefined;
       }
       server.close(() => resolve());
+      server.closeAllConnections?.();
     });
 
   const resetIdleTimer = () => {

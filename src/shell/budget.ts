@@ -109,6 +109,140 @@ export function splitIntoLineAwareChunks(full: string, payloadMax: number): stri
   return chunks.length > 0 ? chunks : [''];
 }
 
+function splitFenceAwareBlocks(body: string): string[] {
+  const lines = body.split('\n');
+  const blocks: string[] = [];
+  let activeFenceTag: string | null = null;
+  let curLines: string[] = [];
+
+  const flushCur = () => {
+    if (curLines.length > 0) {
+      const joined = curLines.join('\n');
+      if (joined.trim().length > 0) {
+        blocks.push(joined);
+      }
+      curLines = [];
+    }
+  };
+
+  for (const line of lines) {
+    if (activeFenceTag) {
+      curLines.push(line);
+      if (line.trim() === `<<<END_${activeFenceTag}>>>`) {
+        flushCur();
+        activeFenceTag = null;
+      }
+      continue;
+    }
+
+    const openMatch = line.match(/^<<<(UNTRUSTED_DATA_[A-Z0-9]+)\b/);
+    if (openMatch) {
+      flushCur();
+      activeFenceTag = openMatch[1];
+      curLines.push(line);
+      continue;
+    }
+
+    if (line.trim() === '') {
+      flushCur();
+      continue;
+    }
+
+    curLines.push(line);
+  }
+  flushCur();
+  return blocks;
+}
+
+function trimSingleFenceBlock(
+  block: string,
+  pointerRef: string,
+  keepPerSide = 900,
+): string {
+  const marker = `\n[... MIDDLE TRIMMED FOR BUDGET; run \`thp peek\` on ${pointerRef} if needed ...]\n`;
+  const lines = block.split('\n');
+  const hasOuterFence =
+    lines.length >= 3 &&
+    lines[0].startsWith('<<<UNTRUSTED_DATA_') &&
+    lines[lines.length - 1].startsWith('<<<END_UNTRUSTED_DATA_');
+  if (!hasOuterFence) {
+    return block;
+  }
+  const headerLines = lines[1].startsWith('[SECURITY NOTICE:')
+    ? lines.slice(0, 2)
+    : lines.slice(0, 1);
+  const footerLine = lines[lines.length - 1];
+  const inner = lines.slice(headerLines.length, -1).join('\n');
+  if (inner.length <= keepPerSide * 2 + 120) {
+    return block;
+  }
+  const headEnd = safeSurrogateSliceEnd(inner, 0, keepPerSide);
+  let tailStart = Math.max(headEnd, inner.length - keepPerSide);
+  if (tailStart > 0 && tailStart < inner.length) {
+    const c = inner.charCodeAt(tailStart);
+    if (c >= 0xdc00 && c <= 0xdfff) tailStart += 1;
+  }
+  return `${headerLines.join('\n')}\n${inner.slice(0, headEnd)}${marker}${inner.slice(tailStart)}\n${footerLine}`;
+}
+
+function trimBodySafely(body: string, pointerRef: string): string {
+  const marker = `\n[... MIDDLE TRIMMED FOR BUDGET; run \`thp peek\` on ${pointerRef} if needed ...]\n`;
+  // Keep each <<<UNTRUSTED_DATA_...>>> ... <<<END_...>>> block atomic even across internal blank lines
+  const blocks = splitFenceAwareBlocks(body);
+  const fencedCount = blocks.filter((b) => b.startsWith('<<<UNTRUSTED_DATA_')).length;
+  if (blocks.length >= 3 && fencedCount >= 2) {
+    const headBlocks: string[] = [blocks[0]];
+    const tailBlocks: string[] = [blocks[blocks.length - 1]];
+    let headLen = blocks[0].length;
+    let tailLen = blocks[blocks.length - 1].length;
+    let left = 1;
+    let right = blocks.length - 2;
+    // Always reserve at least 1 block between [left, right] to drop so fences are never severed
+    while (left < right && headLen + blocks[left].length + 2 <= 900) {
+      headBlocks.push(blocks[left]);
+      headLen += blocks[left].length + 2;
+      left += 1;
+    }
+    while (right > left && tailLen + blocks[right].length + 2 <= 900) {
+      tailBlocks.unshift(blocks[right]);
+      tailLen += blocks[right].length + 2;
+      right -= 1;
+    }
+    if (left <= right) {
+      return `${headBlocks.join('\n\n')}${marker}${tailBlocks.join('\n\n')}`;
+    }
+  }
+
+  // If body is wrapped in a single outer fence (e.g. packReconcileEnvelope), preserve opening/closing fence lines
+  if (blocks.length === 1 && fencedCount === 1) {
+    const trimmedSingle = trimSingleFenceBlock(body, pointerRef, 900);
+    if (trimmedSingle.length < body.length) {
+      return trimmedSingle;
+    }
+  }
+
+  // For 2-block (or small multi-block) fenced bodies where middle dropping didn't trigger,
+  // trim inside each oversized block rather than slicing across fence boundaries.
+  if (fencedCount >= 1) {
+    const trimmedBlocks = blocks.map((blk) =>
+      blk.startsWith('<<<UNTRUSTED_DATA_') ? trimSingleFenceBlock(blk, pointerRef, 450) : blk,
+    );
+    const joined = trimmedBlocks.join('\n\n');
+    if (joined.length < body.length) {
+      return joined;
+    }
+    return body;
+  }
+
+  const headEnd = safeSurrogateSliceEnd(body, 0, 1000);
+  let tailStart = Math.max(headEnd, body.length - 1000);
+  if (tailStart > 0 && tailStart < body.length) {
+    const c = body.charCodeAt(tailStart);
+    if (c >= 0xdc00 && c <= 0xdfff) tailStart += 1;
+  }
+  return `${body.slice(0, headEnd)}${marker}${body.slice(tailStart)}`;
+}
+
 /**
  * Applies `effective_context_budget > completeness_floor` rule, deduplicates identical
  * content blocks across multi-root sources by `content_hash`, trims verbose priority-3
@@ -170,53 +304,62 @@ export function packBudgetedEnvelope(
   const renderAll = (items: readonly BudgetedSection[]) =>
     items.map((s) => `## ${s.title}\n\n${s.body}`).join('\n\n');
 
+  const headerReserve = 420;
+  const estimatePartCount = (text: string): number => {
+    if (text.length <= budget.per_turn_input_limit) return 1;
+    const payloadMax = Math.max(256, budget.per_turn_input_limit - headerReserve);
+    return splitIntoLineAwareChunks(text, payloadMax).length;
+  };
+  const estimateTotalTokensWithChunkOverhead = (text: string): number => {
+    const partCount = estimatePartCount(text);
+    const overheadTokens = partCount > 1 ? partCount * 110 : 0;
+    return estimateConservativeTokens(text) + overheadTokens;
+  };
+
   let full = renderAll(working);
 
   // Fair middle-trim pass on verbose priority-3 sections before dropping whole sources
-  if (estimateConservativeTokens(full) > budget.effective_context_budget) {
+  if (estimateTotalTokensWithChunkOverhead(full) > budget.effective_context_budget) {
     const trimCandidates = working
       .filter((s) => s.priority === 3 && s.body.length > 2400)
       .sort((a, b) => b.body.length - a.body.length);
 
     for (const sec of trimCandidates) {
-      if (estimateConservativeTokens(full) <= budget.effective_context_budget) {
+      if (estimateTotalTokensWithChunkOverhead(full) <= budget.effective_context_budget) {
         break;
       }
-      const headEnd = safeSurrogateSliceEnd(sec.body, 0, 1000);
-      let tailStart = Math.max(headEnd, sec.body.length - 1000);
-      if (tailStart > 0 && tailStart < sec.body.length) {
-        const c = sec.body.charCodeAt(tailStart);
-        if (c >= 0xdc00 && c <= 0xdfff) tailStart += 1;
+      const trimmedBody = trimBodySafely(sec.body, sec.pointer_ref ?? sec.key);
+      if (trimmedBody.length < sec.body.length) {
+        sec.body = trimmedBody;
+        folded.push(`${sec.key}#trimmed`);
+        full = renderAll(working);
       }
-      sec.body = `${sec.body.slice(0, headEnd)}\n[... MIDDLE TRIMMED FOR BUDGET; run \`thp peek\` on ${sec.pointer_ref ?? sec.key} if needed ...]\n${sec.body.slice(tailStart)}`;
-      folded.push(`${sec.key}#trimmed`);
-      full = renderAll(working);
     }
   }
 
   // Deterministic folding from priority 5 down to 3 until within effective_context_budget
   for (const prio of [5, 4, 3] as const) {
-    if (estimateConservativeTokens(full) <= budget.effective_context_budget) {
+    if (estimateTotalTokensWithChunkOverhead(full) <= budget.effective_context_budget) {
       break;
     }
     for (const sec of working) {
       if (sec.priority !== prio) continue;
-      if (estimateConservativeTokens(full) <= budget.effective_context_budget) break;
+      if (estimateTotalTokensWithChunkOverhead(full) <= budget.effective_context_budget) break;
       folded.push(sec.key);
       sec.body = `[FOLDED_FOR_BUDGET: pointer=${sec.pointer_ref ?? sec.key}; original_sha256=${sec.content_hash.slice(0, 16)}; run \`thp peek\` or inspect full bundle if needed]`;
       full = renderAll(working);
     }
   }
 
-  if (estimateConservativeTokens(full) > budget.effective_context_budget) {
+  const finalEstimatedTokens = estimateTotalTokensWithChunkOverhead(full);
+  if (finalEstimatedTokens > budget.effective_context_budget) {
     throw new BudgetExceededError(
-      `Core sections exceed target effective_context_budget (${estimateConservativeTokens(full)} > ${budget.effective_context_budget}, confidence=${budget.budget_confidence}). Refusing silent truncation (fail-closed).`,
+      `Core sections exceed target effective_context_budget (${finalEstimatedTokens} > ${budget.effective_context_budget}, confidence=${budget.budget_confidence}). Refusing silent truncation (fail-closed).`,
     );
   }
 
   const manifestHash = sha256Hex(full);
   const utf8Bytes = Buffer.byteLength(full, 'utf8');
-  const estimatedTokens = estimateConservativeTokens(full);
 
   if (full.length <= budget.per_turn_input_limit) {
     return {
@@ -224,7 +367,7 @@ export function packBudgetedEnvelope(
       full_markdown: full,
       manifest_hash: manifestHash,
       utf8_bytes: utf8Bytes,
-      estimated_tokens: estimatedTokens,
+      estimated_tokens: finalEstimatedTokens,
       parts: [
         {
           part_index: 1,
@@ -239,8 +382,12 @@ export function packBudgetedEnvelope(
   }
 
   // Split into line-aware multi-part clipboard chunks respecting per_turn_input_limit
-  const headerReserve = 420;
-  const payloadMax = Math.max(1000, budget.per_turn_input_limit - headerReserve);
+  if (budget.per_turn_input_limit < headerReserve + 256) {
+    throw new BudgetExceededError(
+      `per_turn_input_limit (${budget.per_turn_input_limit}) is too small to carry ThreadPass chunk headers (minimum ${headerReserve + 256}).`,
+    );
+  }
+  const payloadMax = budget.per_turn_input_limit - headerReserve;
   const rawChunks = splitIntoLineAwareChunks(full, payloadMax);
   const totalParts = rawChunks.length;
   const parts = rawChunks.map((chunk, idx) => {
@@ -269,7 +416,7 @@ export function packBudgetedEnvelope(
     full_markdown: full,
     manifest_hash: manifestHash,
     utf8_bytes: utf8Bytes,
-    estimated_tokens: estimatedTokens,
+    estimated_tokens: finalEstimatedTokens,
     parts,
     folded_sections: folded,
     deduplicated_sections: deduplicated,

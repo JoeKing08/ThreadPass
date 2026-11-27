@@ -7,7 +7,13 @@ import {
   newId,
   sha256Hex,
 } from '../../core/canonical.js';
-import type { ClockPort } from '../../core/ports.js';
+import type {
+  ClockPort,
+  CoordinationPort,
+  StoragePort,
+  SyncPackageDescriptor,
+  SyncTransportPort,
+} from '../../core/ports.js';
 import {
   projectJournalState,
   projectMailboxState,
@@ -30,6 +36,7 @@ import {
   type TransactionFinalizationCertificate,
   type TransactionManifest,
   type TrustedDeviceKey,
+  type WorkspaceManifest,
 } from '../../core/types.js';
 import {
   ensureExclusiveAcl,
@@ -45,7 +52,7 @@ import {
   verifyCommitIntentProofSignature,
   type LocalDeviceIdentity,
 } from './crypto-keys.js';
-import { isOpaqueBinary, SlidingWindowRedactor } from './redaction.js';
+import { isOpaqueBinary, redactRemoteUrlCredentials, SlidingWindowRedactor } from './redaction.js';
 import { StateStore, SystemClock } from './state-store.js';
 
 export class FencingViolationError extends Error {
@@ -136,6 +143,7 @@ export interface FsckReport {
   txn_reports: FsckTxnReport[];
   stream_health: Record<string, StreamProjectionHealth>;
   divergent_stream_heads: Record<string, string[]>;
+  divergent_journal_heads: string[];
   journal_conflicts: ReturnType<typeof projectJournalState>['conflicts'];
 }
 
@@ -240,6 +248,8 @@ export class LocalOfflineEngine {
   public readonly clock: ClockPort;
   public readonly identity: LocalDeviceIdentity;
   public readonly redactor: SlidingWindowRedactor;
+  private readonly verifiedAclDirs = new Set<string>();
+  private readonly probedHardLinkDirs = new Set<string>();
 
   constructor(options: {
     homeDir?: string;
@@ -248,9 +258,42 @@ export class LocalOfflineEngine {
   } = {}) {
     this.homeDir = resolveThreadPassHome(options.homeDir);
     this.clock = options.clock ?? new SystemClock();
-    ensureExclusiveAcl(this.homeDir, 'dir');
+    this.ensureDirAclCached(this.homeDir);
     this.identity = loadOrCreateDeviceIdentity(this.homeDir);
     this.redactor = new SlidingWindowRedactor(options.customSecrets);
+  }
+
+  private ensureDirAclCached(dirPath: string): void {
+    if (this.verifiedAclDirs.has(dirPath) && fs.existsSync(dirPath)) {
+      return;
+    }
+    ensureExclusiveAcl(dirPath, 'dir');
+    this.verifiedAclDirs.add(dirPath);
+  }
+
+  ensureLayoutReady(layout: ThreadDirLayout): void {
+    this.ensureDirAclCached(layout.homeDir);
+    this.ensureDirAclCached(layout.projectDir);
+    this.ensureDirAclCached(layout.rootDir);
+    for (const dir of [
+      layout.historyStagingDir,
+      layout.historyCommittedDir,
+      layout.journalStagingDir,
+      layout.journalCommittedDir,
+      layout.blobsStagingDir,
+      layout.blobsObjectsDir,
+      layout.txnsStagingDir,
+      layout.txnsCommittedDir,
+      layout.bundlesDir,
+    ]) {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+    }
+    if (!this.probedHardLinkDirs.has(layout.txnsCommittedDir)) {
+      probeHardLinkSupport(layout.txnsCommittedDir);
+      this.probedHardLinkDirs.add(layout.txnsCommittedDir);
+    }
   }
 
   getLayout(projectId: string, threadId: string): ThreadDirLayout {
@@ -259,7 +302,7 @@ export class LocalOfflineEngine {
 
   openStore(projectId: string, threadId: string): StateStore {
     const layout = this.getLayout(projectId, threadId);
-    layout.ensureDirectories();
+    this.ensureLayoutReady(layout);
     const projectJson = path.join(layout.projectDir, 'project.json');
     if (!fs.existsSync(projectJson)) {
       fs.writeFileSync(
@@ -281,6 +324,151 @@ export class LocalOfflineEngine {
       note: 'local primary device',
     });
     return new StateStore(layout.dbPath);
+  }
+
+  /**
+   * Opens an already-initialized thread store without creating empty directories
+   * or empty SQLite files for non-existent threads.
+   */
+  openExistingStore(projectId: string, threadId: string): StateStore {
+    const layout = this.getLayout(projectId, threadId);
+    if (!fs.existsSync(layout.dbPath)) {
+      throw new Error(`Thread ${threadId} is not initialized in project ${projectId}`);
+    }
+    this.ensureLayoutReady(layout);
+    pinTrustedDeviceKey(this.homeDir, {
+      device_id: this.identity.device_id,
+      project_id: projectId,
+      public_key_spki_b64: this.identity.public_key_spki_b64,
+      status: 'active',
+      note: 'local primary device',
+    });
+    return new StateStore(layout.dbPath);
+  }
+
+  /**
+   * Returns an adapter implementing Pure Core's StoragePort, CoordinationPort,
+   * and SyncTransportPort over this Local-Offline thread directory.
+   */
+  createCorePorts(
+    projectId: string,
+    threadId: string,
+  ): StoragePort & CoordinationPort & SyncTransportPort {
+    const layout = this.getLayout(projectId, threadId);
+    const openReadStore = (): StateStore | null =>
+      fs.existsSync(layout.dbPath) ? new StateStore(layout.dbPath) : null;
+
+    return {
+      getStreamHead: (streamId: string): string | null => {
+        const s = openReadStore();
+        if (!s) return null;
+        try {
+          return s.getStream(streamId)?.head_anchor_id ?? null;
+        } finally {
+          s.close();
+        }
+      },
+      getJournalHead: (tid: string): string | null => {
+        const s = openReadStore();
+        if (!s) return null;
+        try {
+          return s.getThread(tid)?.journal_head_id ?? null;
+        } finally {
+          s.close();
+        }
+      },
+      getAnchor: (anchorId: string): LineageAnchor | null => {
+        const s = openReadStore();
+        if (!s) return null;
+        try {
+          return s.getAnchor(anchorId);
+        } finally {
+          s.close();
+        }
+      },
+      readShardLines: (relativePath: string): StreamShardLine[] => {
+        const fullPath = path.resolve(layout.rootDir, ...relativePath.split('/'));
+        const relCheck = path.relative(layout.rootDir, fullPath);
+        if (relCheck.startsWith('..') || path.isAbsolute(relCheck) || !fs.existsSync(fullPath)) {
+          return [];
+        }
+        return fs
+          .readFileSync(fullPath, 'utf8')
+          .split(/\r?\n/)
+          .filter((l) => l.trim().length > 0)
+          .map((l) => JSON.parse(l) as StreamShardLine);
+      },
+      readBlob: (sha256: string): { bytes: Uint8Array; manifest?: BlobManifestEntry } | null => {
+        assertSafeIdentifier('blob_sha256', sha256);
+        const blobPath = path.join(layout.blobsObjectsDir, sha256.slice(0, 2), sha256);
+        if (!fs.existsSync(blobPath)) return null;
+        const bytes = fs.readFileSync(blobPath);
+        if (sha256Hex(bytes) !== sha256) return null;
+        let manifest: BlobManifestEntry | undefined;
+        const s = openReadStore();
+        if (s) {
+          try {
+            const row = s.db
+              .prepare('SELECT manifest_json FROM blobs_index WHERE sha256 = ?')
+              .get(sha256) as { manifest_json: string } | undefined;
+            if (row) manifest = JSON.parse(row.manifest_json) as BlobManifestEntry;
+          } finally {
+            s.close();
+          }
+        }
+        return { bytes, manifest };
+      },
+      listJournalEvents: (tid: string): JournalEventRecord[] => {
+        const s = openReadStore();
+        if (!s) return [];
+        try {
+          return s.listJournalEvents(tid);
+        } finally {
+          s.close();
+        }
+      },
+      collectSyncableWhitelist: (tid: string): SyncPackageDescriptor => {
+        const manifests: TransactionManifest[] = [];
+        const certificates: TransactionFinalizationCertificate[] = [];
+        const approvedBlobHashes = new Set<string>();
+        const excludedLocalOnlyHashes = new Set<string>();
+        if (tid !== threadId || !fs.existsSync(layout.txnsCommittedDir)) {
+          return {
+            manifests,
+            certificates,
+            approvedBlobHashes: [],
+            excludedLocalOnlyHashes: [],
+          };
+        }
+        for (const f of fs.readdirSync(layout.txnsCommittedDir).sort()) {
+          if (!f.endsWith('.manifest.json')) continue;
+          const txnId = f.slice(0, -'.manifest.json'.length);
+          const certPath = path.join(layout.txnsCommittedDir, `${txnId}.finalized.json`);
+          if (!fs.existsSync(certPath)) continue;
+          const manifest = JSON.parse(
+            fs.readFileSync(path.join(layout.txnsCommittedDir, f), 'utf8'),
+          ) as TransactionManifest;
+          const cert = JSON.parse(
+            fs.readFileSync(certPath, 'utf8'),
+          ) as TransactionFinalizationCertificate;
+          manifests.push(manifest);
+          certificates.push(cert);
+          for (const b of manifest.blobs) {
+            if (b.manifest.sync_policy === 'approved') {
+              approvedBlobHashes.add(b.manifest.sha256);
+            } else {
+              excludedLocalOnlyHashes.add(b.manifest.sha256);
+            }
+          }
+        }
+        return {
+          manifests,
+          certificates,
+          approvedBlobHashes: [...approvedBlobHashes],
+          excludedLocalOnlyHashes: [...excludedLocalOnlyHashes],
+        };
+      },
+    };
   }
 
   /**
@@ -310,6 +498,7 @@ export class LocalOfflineEngine {
 
     const fencingEpoch = store.runImmediate(() => {
       const epoch = store.nextFencingEpoch();
+      const stalePreparingTxnIds = new Set<string>();
       for (const sid of streamIds) {
         const existingLease = store.db
           .prepare('SELECT * FROM stream_leases WHERE stream_id = ?')
@@ -324,25 +513,50 @@ export class LocalOfflineEngine {
             }
           | undefined;
         if (existingLease) {
-          const uncertain =
-            this.clock.isClockContinuityUncertain?.(
-              existingLease.clock_domain_id,
-              existingLease.boot_epoch,
-            ) ?? false;
-          const expired =
-            !uncertain &&
-            BigInt(existingLease.lease_until_mono_ns) <= this.clock.monotonicNs();
-          if (
-            existingLease.lease_state === 'active' &&
-            !uncertain &&
-            !expired &&
-            isPidAlive(existingLease.pid)
-          ) {
+          const existingTxn = store.getTxn(existingLease.txn_id);
+          if (existingTxn?.state === 'committed_pending_publish') {
             throw new CommitConflictError(
-              `Stream ${sid} is actively reserved by txn ${existingLease.txn_id} (pid=${existingLease.pid})`,
+              `Stream ${sid} is locked by committed_pending_publish txn ${existingLease.txn_id}; run recovery first`,
             );
           }
+          const bootChanged = existingLease.boot_epoch !== this.clock.bootEpoch();
+          const domainChanged = existingLease.clock_domain_id !== this.clock.clockDomainId();
+          const uncertain =
+            existingLease.lease_state === 'unknown' ||
+            (this.clock.isClockContinuityUncertain?.(
+              existingLease.clock_domain_id,
+              existingLease.boot_epoch,
+            ) ?? false);
+          const ownerAlive = isPidAlive(existingLease.pid);
+          const expired =
+            !uncertain &&
+            !bootChanged &&
+            !domainChanged &&
+            BigInt(existingLease.lease_until_mono_ns) <= this.clock.monotonicNs();
+
+          if (
+            (existingLease.lease_state === 'active' && !uncertain && !expired && ownerAlive) ||
+            (uncertain && !bootChanged && !domainChanged && ownerAlive)
+          ) {
+            throw new CommitConflictError(
+              `Stream ${sid} is reserved by txn ${existingLease.txn_id} (lease_state=${existingLease.lease_state}, uncertain=${uncertain}, pid=${existingLease.pid})`,
+            );
+          }
+          if (existingTxn && existingTxn.state === 'preparing') {
+            stalePreparingTxnIds.add(existingLease.txn_id);
+          }
         }
+      }
+
+      // Abort any expired/dead/rebooted preparing txns whose leases we are reclaiming so old owners fail CAS
+      for (const staleTxnId of stalePreparingTxnIds) {
+        const abortEpoch = store.nextFencingEpoch();
+        store.db
+          .prepare(
+            `UPDATE txn_log SET state = 'aborted', fencing_epoch = ?, updated_at = ? WHERE txn_id = ? AND state = 'preparing'`,
+          )
+          .run(abortEpoch, nowIso, staleTxnId);
+        store.db.prepare('DELETE FROM stream_leases WHERE txn_id = ?').run(staleTxnId);
       }
 
       store.db
@@ -588,9 +802,11 @@ export class LocalOfflineEngine {
     const threadRow = store.getThread(ctx.thread_id);
 
     let attachedSharedControls = false;
-    for (const sInput of [...ctx.spec.affected_streams].sort((a, b) =>
+    const sortedStreams = [...ctx.spec.affected_streams].sort((a, b) =>
       a.stream_id.localeCompare(b.stream_id),
-    )) {
+    );
+    const affectedStreamSet = new Set(sortedStreams.map((s) => s.stream_id));
+    for (const sInput of sortedStreams) {
       const existingStream = store.getStream(sInput.stream_id);
       const nextSeq = (existingStream?.last_seq ?? 0) + 1;
       const lines: StreamShardLine[] = [];
@@ -609,7 +825,38 @@ export class LocalOfflineEngine {
       }
       if (sInput.controls) {
         for (const ctrl of sInput.controls) {
-          lines.push({ ...ctrl, commit_txn_id: txnId });
+          if (ctrl.payload.type === 'workspace_manifest') {
+            lines.push({
+              ...ctrl,
+              commit_txn_id: txnId,
+              payload: {
+                type: 'workspace_manifest',
+                manifest: this.sanitizeWorkspaceManifest(ctrl.payload.manifest),
+              },
+            });
+          } else {
+            lines.push({ ...ctrl, commit_txn_id: txnId });
+          }
+        }
+      }
+      for (const hb of ctx.spec.host_bindings ?? []) {
+        if (
+          hb.stream_id === sInput.stream_id ||
+          (!affectedStreamSet.has(hb.stream_id) && !attachedSharedControls)
+        ) {
+          lines.push({
+            schema_version: SCHEMA_VERSION,
+            kind: 'control',
+            control_id: newId('ctrl', 8),
+            stream_id: hb.stream_id,
+            commit_txn_id: txnId,
+            created_at: nowIso,
+            payload: {
+              type: 'host_binding',
+              host_session_id: hb.host_session_id,
+              stream_id: hb.stream_id,
+            },
+          });
         }
       }
       if (!attachedSharedControls) {
@@ -637,12 +884,14 @@ export class LocalOfflineEngine {
           });
         }
       }
-      const safeAnchor: LineageAnchor = sInput.anchor.summary
-        ? {
-            ...sInput.anchor,
-            summary: this.redactor.sanitizeText(sInput.anchor.summary).sanitized,
-          }
-        : sInput.anchor;
+      const safeWs = this.sanitizeWorkspaceManifest(sInput.anchor.workspace_manifest);
+      const safeAnchor: LineageAnchor = {
+        ...sInput.anchor,
+        workspace_manifest: safeWs,
+        ...(sInput.anchor.summary
+          ? { summary: this.redactor.sanitizeText(sInput.anchor.summary).sanitized }
+          : {}),
+      };
       lines.push({
         schema_version: SCHEMA_VERSION,
         kind: 'control',
@@ -752,6 +1001,19 @@ export class LocalOfflineEngine {
     ctx.staged_stream_files = stagedStreamFiles;
     ctx.staged_journal_file = stagedJournalFile;
     ctx.staged_blobs = stagedBlobs;
+  }
+
+  private sanitizeWorkspaceManifest(ws: WorkspaceManifest): WorkspaceManifest {
+    const scrub = (s: string) => this.redactor.sanitizeText(s).sanitized;
+    return {
+      ...ws,
+      root_hint: ws.root_hint ? scrub(ws.root_hint) : undefined,
+      remote_url: ws.remote_url ? scrub(redactRemoteUrlCredentials(ws.remote_url)) : undefined,
+      branch: ws.branch ? scrub(ws.branch) : undefined,
+      dirty_files: ws.dirty_files.map(scrub),
+      untracked_files: ws.untracked_files.map(scrub),
+      blind_spots: ws.blind_spots.map(scrub),
+    };
   }
 
   private sanitizeEventPayload(payload: EventRecord['payload']): EventRecord['payload'] {
@@ -1112,9 +1374,9 @@ export class LocalOfflineEngine {
         `INSERT INTO threads(thread_id, project_id, main_stream_id, coordinator_epoch, journal_head_id, journal_last_seq, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(thread_id) DO UPDATE SET
-           coordinator_epoch = excluded.coordinator_epoch,
-           journal_head_id = excluded.journal_head_id,
-           journal_last_seq = excluded.journal_last_seq`,
+           coordinator_epoch = MAX(threads.coordinator_epoch, excluded.coordinator_epoch),
+           journal_head_id = COALESCE(excluded.journal_head_id, threads.journal_head_id),
+           journal_last_seq = MAX(threads.journal_last_seq, excluded.journal_last_seq)`,
       )
       .run(
         manifest.thread_id,
@@ -1126,14 +1388,17 @@ export class LocalOfflineEngine {
         manifest.created_at,
       );
 
-    // Register journal events
+    // Register journal events with strictly monotonic seq in projection to avoid collisions across synced devices
     const insertJe = store.db.prepare(
       `INSERT OR IGNORE INTO journal_events_proj(
         journal_event_id, thread_id, main_stream_id, event_type, actor_stream_id,
         commit_txn_id, coordinator_epoch, seq, event_json, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
-    let seqCursor = (existingThread?.journal_last_seq ?? 0) * 1000;
+    const maxSeqRow = store.db
+      .prepare('SELECT COALESCE(MAX(seq), 0) AS max_seq FROM journal_events_proj WHERE thread_id = ?')
+      .get(manifest.thread_id) as { max_seq: number } | undefined;
+    let seqCursor = maxSeqRow?.max_seq ?? 0;
     for (const je of parsedJournalEvents) {
       seqCursor += 1;
       insertJe.run(
@@ -1205,6 +1470,20 @@ export class LocalOfflineEngine {
             shardAnchor = rec.payload.anchor;
           } else if (rec.payload.type === 'notify_receipt') {
             this.applyNotifyReceiptProj(store, rec.payload.receipt);
+          } else if (rec.payload.type === 'host_binding') {
+            store.db
+              .prepare(
+                `INSERT INTO host_bindings(host_session_id, project_id, thread_id, stream_id, bound_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(host_session_id) DO NOTHING`,
+              )
+              .run(
+                rec.payload.host_session_id,
+                manifest.project_id,
+                manifest.thread_id,
+                rec.payload.stream_id,
+                rec.created_at,
+              );
           }
         }
       }
@@ -1220,7 +1499,7 @@ export class LocalOfflineEngine {
              VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(stream_id) DO UPDATE SET
                head_anchor_id = CASE WHEN excluded.health = 'divergent_heads' THEN NULL ELSE excluded.head_anchor_id END,
-               last_seq = excluded.last_seq,
+               last_seq = MAX(streams.last_seq, excluded.last_seq),
                health = excluded.health,
                is_main = CASE WHEN streams.is_main = 1 THEN 1 ELSE excluded.is_main END`,
           )
@@ -1625,7 +1904,10 @@ export class LocalOfflineEngine {
     } = {},
   ): FsckReport {
     const layout = this.getLayout(projectId, threadId);
-    layout.ensureDirectories();
+    if (!fs.existsSync(layout.rootDir)) {
+      throw new Error(`Thread ${threadId} is not initialized in project ${projectId}`);
+    }
+    this.ensureLayoutReady(layout);
     const trustedRegistry = loadTrustedDeviceKeys(this.homeDir);
     const trustedKeys: TrustedDeviceKey[] = trustedRegistry.keys;
     const requireSig = options.requireTrustedSignature ?? true;
@@ -2019,9 +2301,20 @@ export class LocalOfflineEngine {
       }
     }
 
-    // Evaluate Journal CALM conflicts across verified transactions
+    // Evaluate Journal CALM conflicts & offline Coordinator Journal DAG divergence
     const allVerifiedJournal = verifiedTxns.flatMap((d) => d.journalEvents);
     const jProj = projectJournalState(threadId, allVerifiedJournal);
+    const referencedJournalPreds = new Set<string>();
+    for (const je of allVerifiedJournal) {
+      for (const predId of je.causal_predecessors) {
+        referencedJournalPreds.add(predId);
+      }
+    }
+    const journalLeafHeads = allVerifiedJournal
+      .filter((je) => !referencedJournalPreds.has(je.journal_event_id))
+      .map((je) => je.journal_event_id)
+      .sort();
+    const divergentJournalHeads = journalLeafHeads.length > 1 ? journalLeafHeads : [];
 
     if (options.rebuildSqlite) {
       for (const suffix of ['', '-wal', '-shm']) {
@@ -2043,6 +2336,11 @@ export class LocalOfflineEngine {
               divergentHeadsMap,
             );
           }
+          if (divergentJournalHeads.length > 1) {
+            rebuiltStore.db
+              .prepare(`UPDATE threads SET journal_head_id = NULL WHERE thread_id = ?`)
+              .run(threadId);
+          }
           for (const d of txnData.values()) {
             if (d.report.status !== 'verified') {
               rebuiltStore.db
@@ -2062,13 +2360,15 @@ export class LocalOfflineEngine {
     const txnReports = [...txnData.values()].map((d) => d.report);
     const hasQuarantine = txnReports.some((r) => r.status !== 'verified');
     const hasDivergentHeads = Object.keys(divergentStreamHeads).length > 0;
+    const hasDivergentJournal = divergentJournalHeads.length > 1;
     return {
       thread_id: threadId,
-      ok: !hasQuarantine && !hasDivergentHeads && !jProj.has_blocking_conflict,
+      ok: !hasQuarantine && !hasDivergentHeads && !hasDivergentJournal && !jProj.has_blocking_conflict,
       rebuilt: Boolean(options.rebuildSqlite),
       txn_reports: txnReports,
       stream_health: streamHealth,
       divergent_stream_heads: divergentStreamHeads,
+      divergent_journal_heads: divergentJournalHeads,
       journal_conflicts: jProj.conflicts,
     };
   }
@@ -2085,29 +2385,95 @@ export class LocalOfflineEngine {
     const layout = this.getLayout(projectId, threadId);
     if (!fs.existsSync(layout.txnsCommittedDir)) return [];
     const entries = fs.readdirSync(layout.txnsCommittedDir);
-    const manifests: TransactionManifest[] = [];
+    const parsedTxns: Array<{
+      manifest: TransactionManifest;
+      shardLinesByStream: Map<string, StreamShardLine[]>;
+      anchors: LineageAnchor[];
+    }> = [];
+    const anchorToTxn = new Map<string, string>();
+
     for (const f of entries) {
       if (!f.endsWith('.manifest.json')) continue;
       const txnId = f.slice(0, -'.manifest.json'.length);
       if (!fs.existsSync(path.join(layout.txnsCommittedDir, `${txnId}.finalized.json`))) {
         continue; // Never expose uncommitted/unfinalized shards as active context
       }
-      manifests.push(
-        JSON.parse(
-          fs.readFileSync(path.join(layout.txnsCommittedDir, f), 'utf8'),
-        ) as TransactionManifest,
-      );
-    }
-    manifests.sort((a, b) => a.created_at.localeCompare(b.created_at));
-    const lines: StreamShardLine[] = [];
-    for (const m of manifests) {
-      for (const s of m.shards) {
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(layout.txnsCommittedDir, f), 'utf8'),
+      ) as TransactionManifest;
+      const shardLinesByStream = new Map<string, StreamShardLine[]>();
+      const anchors: LineageAnchor[] = [];
+      for (const s of manifest.shards) {
         if (streamId && s.stream_id !== streamId) continue;
         const sp = path.join(layout.rootDir, ...s.relative_path.split('/'));
         if (!fs.existsSync(sp)) continue;
+        const shardLines: StreamShardLine[] = [];
         for (const row of fs.readFileSync(sp, 'utf8').split(/\r?\n/)) {
-          if (row.trim()) lines.push(JSON.parse(row) as StreamShardLine);
+          if (!row.trim()) continue;
+          const parsed = JSON.parse(row) as StreamShardLine;
+          shardLines.push(parsed);
+          if (parsed.kind === 'control' && parsed.payload.type === 'anchor') {
+            anchors.push(parsed.payload.anchor);
+            anchorToTxn.set(parsed.payload.anchor.anchor_id, manifest.txn_id);
+          }
         }
+        shardLinesByStream.set(s.stream_id ?? '', shardLines);
+      }
+      if (shardLinesByStream.size > 0) {
+        parsedTxns.push({ manifest, shardLinesByStream, anchors });
+      }
+    }
+
+    // Order causally by anchor.parents[] first (never blindly trust wall-clock created_at across devices/same-ms runs),
+    // breaking incomparable ties deterministically by min shard.seq, created_at, and txn_id.
+    const minShardSeq = (m: TransactionManifest) => {
+      const seqs = m.shards
+        .filter((s) => !streamId || s.stream_id === streamId)
+        .map((s) => s.seq ?? Number.MAX_SAFE_INTEGER);
+      return seqs.length > 0 ? Math.min(...seqs) : Number.MAX_SAFE_INTEGER;
+    };
+    parsedTxns.sort((a, b) => {
+      const seqDiff = minShardSeq(a.manifest) - minShardSeq(b.manifest);
+      if (seqDiff !== 0) return seqDiff;
+      const timeDiff = a.manifest.created_at.localeCompare(b.manifest.created_at);
+      if (timeDiff !== 0) return timeDiff;
+      return a.manifest.txn_id.localeCompare(b.manifest.txn_id);
+    });
+
+    const ordered: typeof parsedTxns = [];
+    const placed = new Set<string>();
+    const remaining = [...parsedTxns];
+    while (remaining.length > 0) {
+      let progressed = false;
+      for (let i = 0; i < remaining.length; i++) {
+        const cand = remaining[i];
+        const depsReady = cand.anchors.every((a) =>
+          a.parents.every((p) => {
+            const pt = anchorToTxn.get(p);
+            return !pt || pt === cand.manifest.txn_id || placed.has(pt);
+          }),
+        );
+        if (depsReady) {
+          ordered.push(cand);
+          placed.add(cand.manifest.txn_id);
+          remaining.splice(i, 1);
+          progressed = true;
+          break;
+        }
+      }
+      if (!progressed) {
+        const next = remaining.shift()!;
+        ordered.push(next);
+        placed.add(next.manifest.txn_id);
+      }
+    }
+
+    const lines: StreamShardLine[] = [];
+    for (const item of ordered) {
+      for (const s of item.manifest.shards) {
+        if (streamId && s.stream_id !== streamId) continue;
+        const sl = item.shardLinesByStream.get(s.stream_id ?? '');
+        if (sl) lines.push(...sl);
       }
     }
     return lines;
@@ -2170,7 +2536,7 @@ export class LocalOfflineEngine {
     options: { gracePeriodMs?: number } = {},
   ): { deleted: string[]; retained: string[] } {
     const layout = this.getLayout(projectId, threadId);
-    const store = this.openStore(projectId, threadId);
+    const store = this.openExistingStore(projectId, threadId);
     const deleted: string[] = [];
     const retained: string[] = [];
     const graceMs = options.gracePeriodMs ?? 0;

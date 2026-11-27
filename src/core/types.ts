@@ -327,6 +327,7 @@ export type ControlPayload =
   | { type: 'session_lifecycle'; observation: LifecycleObservation }
   | { type: 'recovery_record'; record: RecoveryRecord }
   | { type: 'baton_handoff'; baton: BatonHandoffRecord }
+  | { type: 'host_binding'; host_session_id: string; stream_id: string }
   | { type: 'unknown'; original_type: string; raw_json: string; blob_ref?: string };
 
 export interface ControlRecord {

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { sha256Hex } from '../core/canonical.js';
 import { SCHEMA_VERSION, type WorkspaceManifest } from '../core/types.js';
+import { redactRemoteUrlCredentials } from '../profile/local-offline/redaction.js';
 
 /**
  * Collects a three-state `Workspace State Manifest` (`git_repo | plain_dir | none`).
@@ -59,7 +60,8 @@ export function captureWorkspaceManifest(
   if (gitRoot) {
     const branch = safeGit(resolved, ['rev-parse', '--abbrev-ref', 'HEAD']) ?? 'DETACHED';
     const headCommit = safeGit(resolved, ['rev-parse', 'HEAD']) ?? 'UNBORN';
-    const remoteUrl = safeGit(resolved, ['remote', 'get-url', 'origin']);
+    const rawRemoteUrl = safeGit(resolved, ['remote', 'get-url', 'origin']);
+    const remoteUrl = rawRemoteUrl ? redactRemoteUrlCredentials(rawRemoteUrl) : undefined;
     const statusRaw =
       safeGit(resolved, ['status', '--porcelain=v1']) ?? '';
     const dirtyFiles: string[] = [];

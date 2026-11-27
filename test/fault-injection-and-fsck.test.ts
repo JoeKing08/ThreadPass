@@ -11,13 +11,19 @@ import {
   publishImmutable,
 } from '../src/profile/local-offline/acl-and-fs.js';
 import { loadOrCreateDeviceIdentity, signCommitIntentProof } from '../src/profile/local-offline/crypto-keys.js';
-import { EgressBlockedError, SlidingWindowRedactor, assertOutboundEgressSafe } from '../src/profile/local-offline/redaction.js';
+import {
+  EgressBlockedError,
+  SlidingWindowRedactor,
+  assertOutboundEgressSafe,
+  redactRemoteUrlCredentials,
+} from '../src/profile/local-offline/redaction.js';
 import {
   FencingViolationError,
+  CommitConflictError,
   LocalOfflineEngine,
   SimulatedCrashError,
 } from '../src/profile/local-offline/txn-engine.js';
-import { ThreadPassService } from '../src/shell/service.js';
+import { ThreadPassService, ForeignCanonicalDetectedError } from '../src/shell/service.js';
 
 function makeTempHome(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `thp-test-${label}-`));
@@ -585,13 +591,293 @@ test('runFsck detects offline divergent heads on same stream_id without silent w
     assert.ok(rebuiltStore.getAnchor(repB.anchor_id));
     rebuiltStore.close();
 
-    // Unreconciled handoff on divergent stream MUST block
+    // Unreconciled handoff and ingest on divergent stream MUST both block
     assert.throws(
       () => svcA.packHandoff({ projectId: 'proj_div', threadId: 'thr_div', streamId: 'strm_main' }),
       /divergent_heads/,
     );
+    assert.throws(
+      () =>
+        svcA.ingestReply({
+          projectId: 'proj_div',
+          threadId: 'thr_div',
+          streamId: 'strm_main',
+          rawText: 'assistant: should fail while divergent',
+        }),
+      /divergent_heads/,
+    );
+
+    // commitReconcile heals both divergent Main stream heads and divergent Journal heads
+    svcA.commitReconcile({
+      projectId: 'proj_div',
+      threadId: 'thr_div',
+      sourceStreamIds: [],
+      receiptRawText: JSON.stringify({
+        reconciliation_receipt: true,
+        adopted_items: ['strm_main: joined offline heads'],
+        conflicts: [],
+        synthesis_summary: 'Unified Device A and Device B commits on Main.',
+      }),
+    });
+    const healed = svcA.runFsck('proj_div', 'thr_div', { rebuildSqlite: true });
+    assert.equal(healed.ok, true);
+    assert.equal(healed.stream_health['strm_main'], 'complete');
+    assert.deepEqual(healed.divergent_stream_heads, {});
+    assert.deepEqual(healed.divergent_journal_heads, []);
   } finally {
     fs.rmSync(homeA, { recursive: true, force: true });
     fs.rmSync(homeB, { recursive: true, force: true });
+  }
+});
+
+test('host_bindings survive fsck --rebuild and Profile Conformance ports work', () => {
+  const home = makeTempHome('hb-ports');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+    const init = svc.initThread({ projectId: 'proj_hb', threadId: 'thr_hb1' });
+    svc.initThread({ projectId: 'proj_hb', threadId: 'thr_hb2' });
+
+    const adopted = svc.adoptExternal({
+      projectId: 'proj_hb',
+      threadId: 'thr_hb1',
+      sourceLabel: 'ext',
+      rawText: 'assistant: bound session work',
+      hostSessionId: 'HS_REBUILD_42',
+    });
+
+    // Delete SQLite and rebuild from immutable shards
+    const layout = svc.engine.getLayout('proj_hb', 'thr_hb1');
+    for (const suf of ['', '-wal', '-shm']) {
+      const f = `${layout.dbPath}${suf}`;
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    }
+    const rebuilt = svc.runFsck('proj_hb', 'thr_hb1', { rebuildSqlite: true });
+    assert.equal(rebuilt.ok, true);
+
+    const storeAfter = svc.engine.openExistingStore('proj_hb', 'thr_hb1');
+    assert.equal(storeAfter.lookupHostBinding('HS_REBUILD_42')?.stream_id, adopted.stream_id);
+    storeAfter.close();
+
+    // Cross-thread adoption MUST still detect ForeignCanonicalDetectedError after rebuild!
+    assert.throws(
+      () =>
+        svc.adoptExternal({
+          projectId: 'proj_hb',
+          threadId: 'thr_hb2',
+          sourceLabel: 'ext2',
+          rawText: 'assistant: duplicate host session',
+          hostSessionId: 'HS_REBUILD_42',
+        }),
+      ForeignCanonicalDetectedError,
+    );
+
+    // Profile Conformance: StoragePort / CoordinationPort / SyncTransportPort
+    const ports = svc.engine.createCorePorts('proj_hb', 'thr_hb1');
+    const headId = ports.getStreamHead(init.main_stream_id);
+    assert.ok(headId);
+    assert.equal(ports.getAnchor(headId!)?.stream_id, init.main_stream_id);
+    assert.ok(ports.getJournalHead('thr_hb1'));
+    assert.ok(ports.listJournalEvents('thr_hb1').length >= 2);
+    const syncPkg = ports.collectSyncableWhitelist('thr_hb1');
+    assert.equal(syncPkg.manifests.length, syncPkg.certificates.length);
+    assert.ok(syncPkg.manifests.length >= 2);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reserveTransaction refuses to steal an unknown lease of a live owner and cleans up dead/expired preparing leases', () => {
+  const home = makeTempHome('lease-steal-guard');
+  const clock = new MockClock();
+  try {
+    const engine = new LocalOfflineEngine({ homeDir: home, clock });
+    const svc = new ThreadPassService({ homeDir: home, clock });
+    const init = svc.initThread({ projectId: 'proj_ls', threadId: 'thr_ls' });
+    const store = engine.openExistingStore('proj_ls', 'thr_ls');
+    const head = store.getStream(init.main_stream_id)!.head_anchor_id!;
+
+    const makeSpec = (anchorId: string) => ({
+      thread_id: 'thr_ls',
+      affected_streams: [
+        {
+          stream_id: init.main_stream_id,
+          expected_parent_head: head,
+          anchor: {
+            anchor_id: anchorId,
+            thread_id: 'thr_ls',
+            stream_id: init.main_stream_id,
+            parents: [head],
+            workspace_manifest: {
+              schema_version: SCHEMA_VERSION,
+              workspace_id: 'ws_none',
+              workspace_kind: 'none' as const,
+              vcs: 'none' as const,
+              dirty_files: [],
+              untracked_files: [],
+              status_hash: sha256Hex('none'),
+              completeness: 'complete' as const,
+              blind_spots: [],
+            },
+            head_event_ids: [],
+            created_at: clock.wallIso(),
+          },
+          events: [],
+        },
+      ],
+    });
+
+    const ctx1 = engine.reserveTransaction(store, 'proj_ls', makeSpec('anc_1'), 5000);
+    store.markLeaseUnknown(ctx1.txn_id, clock.wallIso());
+
+    // Live process with unknown lease MUST block concurrent reserveTransaction
+    assert.throws(
+      () => engine.reserveTransaction(store, 'proj_ls', makeSpec('anc_2'), 5000),
+      CommitConflictError,
+    );
+
+    // Advance past reboot -> reserveTransaction reclaims and aborts ctx1 so ctx1 fails CAS
+    clock.epoch = 'boot_next';
+    const ctx2 = engine.reserveTransaction(store, 'proj_ls', makeSpec('anc_2'), 5000);
+    assert.ok(ctx2.txn_id !== ctx1.txn_id);
+    assert.equal(store.getTxn(ctx1.txn_id)?.state, 'aborted');
+    assert.throws(
+      () => engine.commitIntentTransaction(store, ctx1),
+      FencingViolationError,
+    );
+    store.close();
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Redaction scrubs JSON-quoted kv_secret with special chars and strips Git remote URL credentials', () => {
+  const redactor = new SlidingWindowRedactor();
+  const input = '{"api_key": "My$ecret!Pass=123", "password": "P@ssw0rd!9876"}';
+  const res = redactor.sanitizeText(input);
+  assert.ok(!res.sanitized.includes('My$ecret'));
+  assert.ok(!res.sanitized.includes('P@ssw0rd'));
+  assert.equal(res.redactedCount, 2);
+  // Preserves valid JSON syntax when quoted
+  const parsed = JSON.parse(res.sanitized) as Record<string, string>;
+  assert.equal(parsed.api_key, '[REDACTED:kv_secret]');
+
+  const escapedJson = '{"password": "abc\\"def$1234", "other": "safe"}';
+  const escRes = redactor.sanitizeText(escapedJson);
+  assert.ok(!escRes.sanitized.includes('def$1234'));
+  assert.equal((JSON.parse(escRes.sanitized) as Record<string, string>).password, '[REDACTED:kv_secret]');
+
+  assert.equal(
+    redactRemoteUrlCredentials('https://oauth2:glpat-secret123@gitlab.example.com/team/repo.git'),
+    'https://REDACTED@gitlab.example.com/team/repo.git',
+  );
+});
+
+test('runFsck detects offline Coordinator Journal divergence across synced devices and clears journal_head_id on rebuild', () => {
+  const homeA = makeTempHome('jdiv-a');
+  const homeB = makeTempHome('jdiv-b');
+  try {
+    const svcA = new ThreadPassService({ homeDir: homeA });
+    const svcB = new ThreadPassService({ homeDir: homeB });
+    svcA.initThread({ projectId: 'proj_jd', threadId: 'thr_jd', mainStreamId: 'strm_main' });
+
+    const layA = svcA.engine.getLayout('proj_jd', 'thr_jd');
+    const layB = svcB.engine.getLayout('proj_jd', 'thr_jd');
+    fs.mkdirSync(path.dirname(layB.rootDir), { recursive: true });
+    fs.cpSync(layA.rootDir, layB.rootDir, { recursive: true });
+    svcA.pinDeviceKey('proj_jd', svcB.engine.identity.device_id, svcB.engine.identity.public_key_spki_b64);
+    svcB.pinDeviceKey('proj_jd', svcA.engine.identity.device_id, svcA.engine.identity.public_key_spki_b64);
+
+    // Offline adopt journal divergence on two devices without mutual sync
+    svcA.adoptExternal({
+      projectId: 'proj_jd',
+      threadId: 'thr_jd',
+      streamId: 'strm_ext_a',
+      rawText: 'assistant: device A adoption',
+    });
+    svcB.adoptExternal({
+      projectId: 'proj_jd',
+      threadId: 'thr_jd',
+      streamId: 'strm_ext_b',
+      rawText: 'assistant: device B adoption',
+    });
+
+    // Sync Device B's whitelist files into Device A
+    const wlB = svcB.engine.collectSyncableWhitelist('proj_jd', 'thr_jd');
+    for (const rel of wlB.files) {
+      const src = path.join(layB.rootDir, ...rel.split('/'));
+      const dst = path.join(layA.rootDir, ...rel.split('/'));
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      if (!fs.existsSync(dst)) fs.copyFileSync(src, dst);
+    }
+
+    const fsck = svcA.runFsck('proj_jd', 'thr_jd', { rebuildSqlite: true });
+    assert.equal(fsck.ok, false);
+    assert.equal(fsck.divergent_journal_heads.length, 2);
+
+    const stAfter = svcA.engine.openExistingStore('proj_jd', 'thr_jd');
+    try {
+      assert.equal(stAfter.getThread('thr_jd')?.journal_head_id, null);
+    } finally {
+      stAfter.close();
+    }
+
+    // Divergent journal state must block new forks/adoptions until reconciled, then reconcile heals the DAG
+    assert.throws(
+      () =>
+        svcA.forkDispatch({
+          projectId: 'proj_jd',
+          threadId: 'thr_jd',
+          taskBrief: 'Should block while journal divergent',
+        }),
+      /unresolved divergent Coordinator Journal heads/,
+    );
+    svcA.commitReconcile({
+      projectId: 'proj_jd',
+      threadId: 'thr_jd',
+      sourceStreamIds: ['strm_ext_a', 'strm_ext_b'],
+      receiptRawText: JSON.stringify({
+        reconciliation_receipt: true,
+        adopted_items: ['strm_ext_a', 'strm_ext_b'],
+        conflicts: [],
+        synthesis_summary: 'Resolved offline journal divergence onto Main.',
+      }),
+    });
+    const fsckHealed = svcA.runFsck('proj_jd', 'thr_jd', { rebuildSqlite: true });
+    assert.equal(fsckHealed.ok, true);
+    assert.deepEqual(fsckHealed.divergent_journal_heads, []);
+  } finally {
+    fs.rmSync(homeA, { recursive: true, force: true });
+    fs.rmSync(homeB, { recursive: true, force: true });
+  }
+});
+
+test('readCommittedStreamLines follows causal anchor.parents order even under backward wall-clock skew', () => {
+  const home = makeTempHome('causal-read');
+  let isoNow = '2026-11-27T12:00:10.000Z';
+  const skewedClock: ClockPort = {
+    clockDomainId: () => 'clk_skew',
+    bootEpoch: () => 'boot_skew',
+    monotonicNs: () => 10_000_000_000n,
+    wallIso: () => isoNow,
+  };
+  try {
+    const svc = new ThreadPassService({ homeDir: home, clock: skewedClock });
+    const init = svc.initThread({ projectId: 'proj_skew', threadId: 'thr_skew', mainStreamId: 'strm_main' });
+    // Second commit has an EARLIER wall-clock timestamp than genesis!
+    isoNow = '2026-11-27T11:59:00.000Z';
+    svc.ingestReply({
+      projectId: 'proj_skew',
+      threadId: 'thr_skew',
+      streamId: init.main_stream_id,
+      rawText: 'assistant: second event with skewed earlier clock',
+    });
+    const events = svc
+      .peekStream('proj_skew', 'thr_skew', init.main_stream_id)
+      .filter((l) => l.kind === 'event');
+    assert.equal(events.length, 2);
+    assert.ok(events[1].kind === 'event' && events[1].payload.type === 'assistant_part');
+    assert.equal(events[1].payload.text, 'second event with skewed earlier clock');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });

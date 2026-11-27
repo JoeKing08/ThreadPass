@@ -130,18 +130,45 @@ export function extractStructuredJsonObject(
     }
   }
 
-  // 2. Scan inside tagged ```json or bare ``` code fence regions (matching from opening fence)
-  const fenceStartRegex = /```(?:json)?[ \t]*\r?\n?/gi;
+  // 2. Scan inside tagged ```json or bare ``` code fence blocks using a line state machine
+  // so closing ``` fences of ```ts blocks are never mistaken for opening JSON fences.
+  const lines = trimmed.split(/\r?\n/);
   const fencedMatches: Record<string, unknown>[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = fenceStartRegex.exec(trimmed)) !== null) {
-    const afterFence = trimmed.slice(match.index + match[0].length);
-    const objs = scanBalancedJsonObjects(afterFence);
-    for (const o of objs) {
-      if (hasExpectedKey(o)) {
-        fencedMatches.push(o);
+  let inFence = false;
+  let fenceLang = '';
+  let fenceBuf: string[] = [];
+
+  const collectFromFence = () => {
+    if (fenceLang === '' || fenceLang === 'json') {
+      const inner = fenceBuf.join('\n').trimStart();
+      if (inner.startsWith('{')) {
+        const objs = scanBalancedJsonObjects(inner);
+        if (objs.length > 0 && hasExpectedKey(objs[0])) {
+          fencedMatches.push(objs[0]);
+        }
       }
     }
+    fenceLang = '';
+    fenceBuf = [];
+  };
+
+  for (const line of lines) {
+    if (!inFence) {
+      const openMatch = line.match(/^[ \t]*```([a-zA-Z0-9_-]*)[ \t]*$/);
+      if (openMatch) {
+        inFence = true;
+        fenceLang = openMatch[1].toLowerCase();
+        fenceBuf = [];
+      }
+    } else if (/^[ \t]*```[ \t]*$/.test(line)) {
+      inFence = false;
+      collectFromFence();
+    } else {
+      fenceBuf.push(line);
+    }
+  }
+  if (inFence) {
+    collectFromFence();
   }
   if (fencedMatches.length > 0) {
     return { obj: fencedMatches[fencedMatches.length - 1], looksLikeJson: true };
@@ -335,7 +362,12 @@ export function parseExternalConversationInput(
   }
   flushTurn();
 
-  const recent = turns.slice(-8);
+  const recent = turns.slice(-24);
+  if (turns.length > 24) {
+    parseWarnings.push(
+      `Raw fallback truncated ${turns.length - 24} earlier turn(s) from inline events; full raw text preserved in snapshot blob when available.`,
+    );
+  }
   const summaryFallback = `[UNSUMMARIZED_EVIDENCE_HANDOFF] ${turns.length} raw turn(s) extracted from ${sourceLabel}.`;
 
   return {
@@ -377,6 +409,7 @@ export function buildEventsFromAdoptedPackage(params: {
   provenance: ProvenanceChain;
   startSeq?: number;
   nowIso?: string;
+  turnScopeSeed?: string;
 }): { events: EventRecord[]; invocation: InvocationRecord } {
   const nowIso = params.nowIso ?? new Date().toISOString();
   let seq = params.startSeq ?? 1;
@@ -384,9 +417,11 @@ export function buildEventsFromAdoptedPackage(params: {
   const inputRefs: string[] = [];
   const outputRefs: string[] = [];
 
+  const scopePrefix = params.turnScopeSeed ? `${params.turnScopeSeed}|` : '';
+
   for (let i = 0; i < params.pkg.recent_turns.length; i++) {
     const t = params.pkg.recent_turns[i];
-    const fp = sha256Hex(`${params.pkg.source_label}|${i}|${t.role}|${t.text}`);
+    const fp = sha256Hex(`${scopePrefix}${params.pkg.source_label}|${i}|${t.role}|${t.text}`);
     const eventId = deterministicEventId(params.streamId, fp);
     const ev: EventRecord = {
       schema_version: SCHEMA_VERSION,
@@ -452,7 +487,7 @@ export function buildEventsFromAdoptedPackage(params: {
 
   if (stateSections.length > 0) {
     const stateBody = `[STRUCTURED_HANDOFF_STATE]\n${stateSections.join('\n')}`;
-    const stateFp = sha256Hex(`${params.pkg.source_label}|structured_state|${stateBody}`);
+    const stateFp = sha256Hex(`${scopePrefix}${params.pkg.source_label}|structured_state|${stateBody}`);
     const stateEventId = deterministicEventId(params.streamId, stateFp);
     events.push({
       schema_version: SCHEMA_VERSION,
@@ -478,7 +513,7 @@ export function buildEventsFromAdoptedPackage(params: {
 
   if (params.pkg.tool_errors.length > 0) {
     const errBody = `[STRUCTURED_TOOL_ERRORS]\n- ${params.pkg.tool_errors.join('\n- ')}`;
-    const errFp = sha256Hex(`${params.pkg.source_label}|structured_errors|${errBody}`);
+    const errFp = sha256Hex(`${scopePrefix}${params.pkg.source_label}|structured_errors|${errBody}`);
     const errEventId = deterministicEventId(params.streamId, errFp);
     events.push({
       schema_version: SCHEMA_VERSION,

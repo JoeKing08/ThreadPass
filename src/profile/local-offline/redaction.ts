@@ -10,16 +10,18 @@ const BUILTIN_PATTERNS: SecretPattern[] = [
   { name: 'github_pat', regex: /github_pat_[A-Za-z0-9_]{20,}/g },
   { name: 'github_classic_token', regex: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g },
   { name: 'openai_like_key', regex: /\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}\b/g },
+  { name: 'stripe_key', regex: /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}\b/g },
+  { name: 'slack_token', regex: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g },
   { name: 'aws_access_key', regex: /\bAKIA[0-9A-Z]{16}\b/g },
   { name: 'google_api_key', regex: /\bAIza[0-9A-Za-z_-]{35}\b/g },
   {
     name: 'pem_private_key',
-    regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g,
+    regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----/g,
   },
-  { name: 'bearer_token', regex: /\bBearer\s+[A-Za-z0-9._-]{16,}\b/gi },
+  { name: 'bearer_token', regex: /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b/gi },
   {
     name: 'kv_secret',
-    regex: /\b(password|passwd|api_key|apikey|secret_key|access_token|auth_token)\s*[:=]\s*(['"]?)[A-Za-z0-9._~+/-]{8,}\2/gi,
+    regex: /\b(password|passwd|api_key|apikey|secret_key|access_token|auth_token)['"]?\s*[:=]\s*(?:"(?!\[REDACTED:)(?:\\.|[^"\\\r\n]){8,}"|'(?!\[REDACTED:)(?:\\.|[^'\\\r\n]){8,}'|(?!\[REDACTED:)[A-Za-z0-9._~+/=-]{8,})/gi,
   },
 ];
 
@@ -135,7 +137,14 @@ export class SlidingWindowRedactor implements RedactionHook {
         if (pat.name === 'kv_secret') {
           const eqIdx = match.search(/[:=]/);
           if (eqIdx > 0) {
-            return `${match.slice(0, eqIdx + 1)} [REDACTED:${pat.name}]`;
+            const afterEq = match.slice(eqIdx + 1);
+            const leadingWs = afterEq.match(/^\s*/)?.[0] ?? ' ';
+            const valPart = afterEq.slice(leadingWs.length);
+            const quote = valPart.startsWith('"') ? '"' : valPart.startsWith("'") ? "'" : '';
+            const prefixSpace = leadingWs.length > 0 ? leadingWs : ' ';
+            return quote
+              ? `${match.slice(0, eqIdx + 1)}${prefixSpace}${quote}[REDACTED:${pat.name}]${quote}`
+              : `${match.slice(0, eqIdx + 1)}${prefixSpace}[REDACTED:${pat.name}]`;
           }
         }
         return `[REDACTED:${pat.name}]`;
@@ -160,6 +169,20 @@ export function isOpaqueBinary(bytes: Uint8Array): boolean {
     }
   }
   return nonText / sampleLen > 0.15;
+}
+
+export function redactRemoteUrlCredentials(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.username || parsed.password) {
+      parsed.username = 'REDACTED';
+      parsed.password = '';
+      return parsed.toString();
+    }
+    return rawUrl;
+  } catch {
+    return rawUrl.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@\s]+@/g, '$1REDACTED@');
+  }
 }
 
 export class EgressBlockedError extends Error {

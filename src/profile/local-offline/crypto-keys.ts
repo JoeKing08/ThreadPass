@@ -209,14 +209,24 @@ export function pinTrustedDeviceKey(
       k.thread_id === entry.thread_id,
   );
   if (existing) {
+    const incomingNote = entry.note ?? existing.note;
+    const newTxns = entry.pinned_txn_ids ?? [];
+    const mergedTxns =
+      newTxns.length > 0
+        ? [...new Set([...existing.pinned_txn_ids, ...newTxns])]
+        : existing.pinned_txn_ids;
+    const unchanged =
+      existing.public_key_spki_b64 === entry.public_key_spki_b64 &&
+      existing.status === entry.status &&
+      existing.note === incomingNote &&
+      mergedTxns.length === existing.pinned_txn_ids.length;
+    if (unchanged) {
+      return existing;
+    }
     existing.public_key_spki_b64 = entry.public_key_spki_b64;
     existing.status = entry.status;
-    existing.note = entry.note ?? existing.note;
-    if (entry.pinned_txn_ids) {
-      existing.pinned_txn_ids = [
-        ...new Set([...existing.pinned_txn_ids, ...entry.pinned_txn_ids]),
-      ];
-    }
+    existing.note = incomingNote;
+    existing.pinned_txn_ids = mergedTxns;
     saveTrustedDeviceKeys(homeDir, reg);
     return existing;
   }

@@ -5,8 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { sha256Hex } from '../src/core/canonical.js';
-import { BudgetExceededError, splitIntoLineAwareChunks } from '../src/shell/budget.js';
-import { parseExternalConversationInput } from '../src/shell/ir.js';
+import { BudgetExceededError, packBudgetedEnvelope, splitIntoLineAwareChunks } from '../src/shell/budget.js';
+import { buildEventsFromAdoptedPackage, extractStructuredJsonObject, parseExternalConversationInput } from '../src/shell/ir.js';
 import { parseReconcileReceipt } from '../src/shell/prompts.js';
 import {
   DuplicateAdoptionError,
@@ -924,6 +924,249 @@ test('Real-world LLM regressions: structured state survival, placeholder host_se
     assert.ok(html.includes('id="streamIdsList"'));
     assert.ok(html.includes('runUiAction('));
     assert.equal(html.includes('.innerHTML ='), false);
+  } finally {
+    await web.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Audit regressions: Grant enforcement, small per_turn_input_limit, fence trim safety, JSON fence isolation, repeat ingest IDs, and Web/Service non-existent guards', async () => {
+  const home = makeTempHome('audit-reg');
+  const svc = new ThreadPassService({ homeDir: home });
+  const web = await startThreadPassWeb({ service: svc, idleTimeoutMs: 60_000 });
+  try {
+    // 1. Read-only getStatus on non-existent thread must NOT create directories on disk
+    assert.throws(
+      () => svc.getStatus('proj_nonexistent', 'thr_typo'),
+      /is not initialized/,
+    );
+    assert.equal(
+      fs.existsSync(path.join(home, 'projects', 'proj_nonexistent')),
+      false,
+    );
+
+    // 2. Web API missing projectId / threadId must return 400 instead of creating "undefined" dir
+    const badStatus = await fetch(`http://127.0.0.1:${web.port}/api/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-ThreadPass-Token': web.token },
+      body: JSON.stringify({}),
+    });
+    assert.equal(badStatus.status, 400);
+    assert.equal(fs.existsSync(path.join(home, 'projects', 'undefined')), false);
+
+    // 3. Grant delegation enforcement in forkDispatch
+    const init = svc.initThread({ projectId: 'proj_grt', threadId: 'thr_grt' });
+    const w1 = svc.forkDispatch({
+      projectId: 'proj_grt',
+      threadId: 'thr_grt',
+      workerStreamId: 'wrk_1',
+      taskBrief: 'Parent worker',
+    });
+    // Unauthorized nested fork from wrk_1 without a grant MUST fail
+    assert.throws(
+      () =>
+        svc.forkDispatch({
+          projectId: 'proj_grt',
+          threadId: 'thr_grt',
+          originStreamId: w1.worker_stream_id,
+          workerStreamId: 'wrk_unauth',
+          taskBrief: 'Unauthorized child',
+        }),
+      /Unauthorized nested fork/,
+    );
+    // Issue grant with maxTotalSpawns=1 -> 1 nested fork succeeds, 2nd fails
+    const grant = svc.issueDispatchGrant({
+      projectId: 'proj_grt',
+      threadId: 'thr_grt',
+      granteeStreamId: w1.worker_stream_id,
+      maxTotalSpawns: 1,
+    });
+    const nested = svc.forkDispatch({
+      projectId: 'proj_grt',
+      threadId: 'thr_grt',
+      originStreamId: w1.worker_stream_id,
+      workerStreamId: 'wrk_child_1',
+      taskBrief: 'Authorized child 1',
+    });
+    assert.equal(nested.worker_stream_id, 'wrk_child_1');
+    assert.throws(
+      () =>
+        svc.forkDispatch({
+          projectId: 'proj_grt',
+          threadId: 'thr_grt',
+          originStreamId: w1.worker_stream_id,
+          workerStreamId: 'wrk_child_2',
+          taskBrief: 'Exceeds quota',
+        }),
+      /Unauthorized nested fork/,
+    );
+    svc.revokeDispatchGrant({
+      projectId: 'proj_grt',
+      threadId: 'thr_grt',
+      grantId: grant.grant_id,
+    });
+    // Empty workspace_scope: [] must deny forkDispatch (fail-closed, not wildcard)
+    svc.issueDispatchGrant({
+      projectId: 'proj_grt',
+      threadId: 'thr_grt',
+      granteeStreamId: w1.worker_stream_id,
+      workspaceScope: [],
+      maxTotalSpawns: 1,
+    });
+    assert.throws(
+      () =>
+        svc.forkDispatch({
+          projectId: 'proj_grt',
+          threadId: 'thr_grt',
+          originStreamId: w1.worker_stream_id,
+          workerStreamId: 'wrk_empty_scope',
+          taskBrief: 'Must be blocked by empty workspace_scope',
+        }),
+      /Unauthorized nested fork/,
+    );
+    assert.throws(
+      () =>
+        svc.revokeDispatchGrant({
+          projectId: 'proj_grt',
+          threadId: 'thr_grt',
+          grantId: 'grt_nonexistent_id',
+        }),
+      /not found/,
+    );
+
+    // 4. Repeated identical ingestReply (including identical structured pending_tasks & tool_errors)
+    // MUST produce distinct event_id values across all emitted events
+    const structuredRepeat = JSON.stringify({
+      threadpass_handoff: true,
+      handoff_mode: 'model_authored',
+      summary_text: 'Repeated checkpoint milestone',
+      recent_turns: [{ role: 'assistant', text: 'identical milestone ok' }],
+      pending_tasks: ['Keep task X on list'],
+      tool_errors: ['Repeated warning EEXIST'],
+    });
+    const ing1 = svc.ingestReply({
+      projectId: 'proj_grt',
+      threadId: 'thr_grt',
+      streamId: init.main_stream_id,
+      rawText: structuredRepeat,
+    });
+    const ing2 = svc.ingestReply({
+      projectId: 'proj_grt',
+      threadId: 'thr_grt',
+      streamId: init.main_stream_id,
+      rawText: structuredRepeat,
+    });
+    assert.notEqual(ing1.anchor_id, ing2.anchor_id);
+    const mainEvents = svc
+      .peekStream('proj_grt', 'thr_grt', init.main_stream_id)
+      .filter((l) => l.kind === 'event');
+    const uniqueEventIds = new Set(mainEvents.map((e) => (e.kind === 'event' ? e.event_id : '')));
+    assert.equal(uniqueEventIds.size, mainEvents.length);
+
+    // 5. Fence extraction ignores ```ts and prose objects immediately after closing ``` fence
+    const tricky = [
+      '```json',
+      '{"threadpass_handoff": true, "summary_text": "real_json"}',
+      '```',
+      '```ts',
+      'const example = { "summary_text": "wrong_ts_fence" };',
+      '```',
+      '{"summary_text": "after_ts_close_prose"}',
+    ].join('\n');
+    const extracted = extractStructuredJsonObject(tricky, ['threadpass_handoff', 'summary_text']);
+    assert.equal(extracted.obj?.summary_text, 'real_json');
+
+    // 6. Small per_turn_input_limit (e.g. 900) strictly respected and middle-trim preserves multi-paragraph fences
+    const fencedBlocks = Array.from({ length: 8 }, (_, idx) =>
+      renderNonInstructionFence({
+        sourceLabel: `s_${idx}`,
+        trustTier: 'untrusted_peer',
+        anchorOrRef: `evt_${idx}`,
+        bodyText: `Paragraph 1 (${idx}): ${'A'.repeat(180)}\n\nParagraph 2 (${idx}): ${'Z'.repeat(180)}`,
+      }),
+    ).join('\n\n');
+    const packed = packBudgetedEnvelope(
+      'env_trim',
+      [
+        { key: 'core', priority: 1, title: 'Core', body: 'Core instructions', content_hash: sha256Hex('Core') },
+        { key: 'hist', priority: 3, title: 'History', body: fencedBlocks, content_hash: sha256Hex(fencedBlocks) },
+      ],
+      {
+        effective_context_budget: 2300,
+        per_turn_input_limit: 900,
+        budget_confidence: 'heuristic',
+        supports_attachments: false,
+      },
+    );
+    assert.ok(packed.folded_sections.includes('hist#trimmed'));
+    assert.ok(packed.parts.every((p) => p.text.length <= 900));
+    const openCount = (packed.full_markdown.match(/<<<UNTRUSTED_DATA_/g) ?? []).length;
+    const closeCount = (packed.full_markdown.match(/<<<END_UNTRUSTED_DATA_/g) ?? []).length;
+    assert.equal(openCount, closeCount);
+    assert.ok(openCount >= 2);
+
+    // 7. Exactly 4 blocks of ~650 chars must drop middle block(s) without falling through to mid-fence slicing
+    const fourBlocks = Array.from({ length: 4 }, (_, idx) =>
+      renderNonInstructionFence({
+        sourceLabel: `b_${idx}`,
+        trustTier: 'untrusted_peer',
+        anchorOrRef: `b_evt_${idx}`,
+        bodyText: `Block-${idx} ` + 'Q'.repeat(430),
+      }),
+    ).join('\n\n');
+    const fourPacked = packBudgetedEnvelope(
+      'env_four_blocks',
+      [
+        { key: 'core', priority: 1, title: 'Core', body: 'Core', content_hash: sha256Hex('Core') },
+        { key: 'hist4', priority: 3, title: 'Hist4', body: fourBlocks, content_hash: sha256Hex(fourBlocks) },
+      ],
+      {
+        effective_context_budget: 900,
+        per_turn_input_limit: 5000,
+        budget_confidence: 'heuristic',
+        supports_attachments: false,
+      },
+    );
+    assert.ok(fourPacked.folded_sections.includes('hist4#trimmed'));
+    const fourOpen = (fourPacked.full_markdown.match(/<<<UNTRUSTED_DATA_/g) ?? []).length;
+    const fourClose = (fourPacked.full_markdown.match(/<<<END_UNTRUSTED_DATA_/g) ?? []).length;
+    assert.equal(fourOpen, fourClose);
+    assert.ok(fourOpen >= 2 && fourOpen <= 3);
+
+    // 8. Exactly 2 oversized fenced blocks (>2400 chars) must trim inside each block with matched open/close tag IDs
+    const twoBlocks = Array.from({ length: 2 }, (_, idx) =>
+      renderNonInstructionFence({
+        sourceLabel: `two_${idx}`,
+        trustTier: 'untrusted_peer',
+        anchorOrRef: `two_evt_${idx}`,
+        bodyText: `Two-${idx} ` + 'M'.repeat(1300),
+      }),
+    ).join('\n\n');
+    const twoPacked = packBudgetedEnvelope(
+      'env_two_blocks',
+      [
+        { key: 'core', priority: 1, title: 'Core', body: 'Core', content_hash: sha256Hex('Core') },
+        { key: 'hist2', priority: 3, title: 'Hist2', body: twoBlocks, content_hash: sha256Hex(twoBlocks) },
+      ],
+      {
+        effective_context_budget: 1200,
+        per_turn_input_limit: 5000,
+        budget_confidence: 'heuristic',
+        supports_attachments: false,
+      },
+    );
+    assert.ok(twoPacked.folded_sections.includes('hist2#trimmed'));
+    const openTags = [...twoPacked.full_markdown.matchAll(/<<<(UNTRUSTED_DATA_[A-Z0-9]+)\b/g)].map(
+      (m) => m[1],
+    );
+    const closeTags = [...twoPacked.full_markdown.matchAll(/<<<END_(UNTRUSTED_DATA_[A-Z0-9]+)>>>/g)].map(
+      (m) => m[1],
+    );
+    assert.equal(openTags.length, 2);
+    assert.deepEqual(openTags, closeTags);
+
+    // Sanity check buildEventsFromAdoptedPackage export usage
+    void buildEventsFromAdoptedPackage;
   } finally {
     await web.close();
     fs.rmSync(home, { recursive: true, force: true });

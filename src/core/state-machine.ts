@@ -66,12 +66,34 @@ export function projectJournalState(
   >();
 
   const grants = new Map<string, EscrowGrantState>();
+  const grantIssuerEventIds = new Map<string, string>();
+  const seenEventIds = new Set<string>();
+  const uniqueEvents: JournalEventRecord[] = [];
   const revokedGrantIds = new Set<string>();
   const revocationsByGrant = new Map<string, Array<{ event_id: string; causal: Set<string> }>>();
+  const journalPredsById = new Map<string, readonly string[]>();
 
-  // Pass 1: Monotone tombstones & main candidates & grants
+  const computeCausalAncestors = (startId: string): Set<string> => {
+    const visited = new Set<string>();
+    const queue = [...(journalPredsById.get(startId) ?? [])];
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      if (visited.has(cur)) continue;
+      visited.add(cur);
+      for (const p of journalPredsById.get(cur) ?? []) {
+        if (!visited.has(p)) queue.push(p);
+      }
+    }
+    return visited;
+  };
+
+  // Pass 1: Deduplicate by journal_event_id; collect monotone tombstones, main candidates & grants
   for (const ev of events) {
     if (ev.thread_id !== threadId) continue;
+    if (seenEventIds.has(ev.journal_event_id)) continue;
+    seenEventIds.add(ev.journal_event_id);
+    uniqueEvents.push(ev);
+    journalPredsById.set(ev.journal_event_id, ev.causal_predecessors);
 
     if (ev.event_type === 'main_designated') {
       const data = ev.data as unknown as MainDesignationData;
@@ -92,7 +114,16 @@ export function projectJournalState(
       revocationsByGrant.set(data.grant_id, revList);
     } else if (ev.event_type === 'grant_issued') {
       const data = ev.data as unknown as GrantIssuedData;
-      if (!grants.has(data.grant_id)) {
+      const prevGrantEvent = grantIssuerEventIds.get(data.grant_id);
+      if (prevGrantEvent) {
+        conflicts.push({
+          kind: 'grant_scope_expanded',
+          target_id: data.grant_id,
+          event_ids: [prevGrantEvent, ev.journal_event_id],
+          detail: `Duplicate grant_issued with colliding grant_id ${data.grant_id}`,
+        });
+      } else {
+        grantIssuerEventIds.set(data.grant_id, ev.journal_event_id);
         grants.set(data.grant_id, {
           grant: data,
           remaining_spawns: data.max_total_spawns,
@@ -153,14 +184,25 @@ export function projectJournalState(
     changed = false;
     for (const [grantId, gState] of grants.entries()) {
       const directRev = revocationsByGrant.get(grantId);
+      const parentState =
+        gState.grant.parent_grant_id !== undefined
+          ? grants.get(gState.grant.parent_grant_id)
+          : undefined;
       const parentRevoked =
         gState.grant.parent_grant_id !== undefined &&
         revokedGrantIds.has(gState.grant.parent_grant_id);
       if ((directRev && directRev.length > 0) || parentRevoked) {
-        if (!gState.revoked) {
+        const mergedRevIds = [
+          ...new Set([
+            ...(directRev ? directRev.map((r) => r.event_id) : []),
+            ...(parentState?.revoked_by_event_ids ?? []),
+            ...gState.revoked_by_event_ids,
+          ]),
+        ];
+        if (!gState.revoked || mergedRevIds.length !== gState.revoked_by_event_ids.length) {
           gState.revoked = true;
           revokedGrantIds.add(grantId);
-          gState.revoked_by_event_ids = directRev ? directRev.map((r) => r.event_id) : [];
+          gState.revoked_by_event_ids = mergedRevIds;
           changed = true;
         }
       }
@@ -168,10 +210,28 @@ export function projectJournalState(
   }
 
   // Validate Escrow split / delegation conservation and offline dispatch vs revocation
-  for (const ev of events) {
-    if (ev.thread_id !== threadId) continue;
+  for (const ev of uniqueEvents) {
     if (ev.event_type === 'grant_issued') {
+      if (grantIssuerEventIds.get((ev.data as unknown as GrantIssuedData).grant_id) !== ev.journal_event_id) {
+        continue;
+      }
       const data = ev.data as unknown as GrantIssuedData;
+      if (!Number.isInteger(data.max_total_spawns) || data.max_total_spawns < 0) {
+        conflicts.push({
+          kind: 'grant_quota_exceeded',
+          target_id: data.grant_id,
+          event_ids: [ev.journal_event_id],
+          detail: `Grant ${data.grant_id} declares invalid max_total_spawns=${data.max_total_spawns}`,
+        });
+      }
+      if (!Number.isInteger(data.max_depth) || data.max_depth < 0) {
+        conflicts.push({
+          kind: 'grant_scope_expanded',
+          target_id: data.grant_id,
+          event_ids: [ev.journal_event_id],
+          detail: `Grant ${data.grant_id} declares invalid max_depth=${data.max_depth}`,
+        });
+      }
       if (data.parent_grant_id) {
         const parent = grants.get(data.parent_grant_id);
         if (!parent) {
@@ -184,10 +244,50 @@ export function projectJournalState(
           continue;
         }
         parent.children_grant_ids.push(data.grant_id);
+        if (parent.grant.grantee_stream_id !== data.issuer_stream_id) {
+          conflicts.push({
+            kind: 'grant_scope_expanded',
+            target_id: data.grant_id,
+            event_ids: [ev.journal_event_id],
+            detail: `Child grant ${data.grant_id} issuer ${data.issuer_stream_id} does not hold parent grant ${parent.grant.grant_id}`,
+          });
+        }
+        if (parent.revoked) {
+          const grantAncestors = computeCausalAncestors(ev.journal_event_id);
+          const explicitlyAfterRevIds: string[] = [];
+          const concurrentRevIds: string[] = [];
+          for (const revId of parent.revoked_by_event_ids) {
+            if (grantAncestors.has(revId)) {
+              explicitlyAfterRevIds.push(revId);
+            } else {
+              const revAncestors = computeCausalAncestors(revId);
+              if (!revAncestors.has(ev.journal_event_id)) {
+                concurrentRevIds.push(revId);
+              }
+            }
+          }
+          if (explicitlyAfterRevIds.length > 0) {
+            conflicts.push({
+              kind: 'revoked_grant_used',
+              target_id: data.grant_id,
+              event_ids: [ev.journal_event_id, ...explicitlyAfterRevIds],
+              detail: `Child grant ${data.grant_id} redelegated from already-revoked parent grant ${parent.grant.grant_id}`,
+            });
+          } else if (concurrentRevIds.length > 0 || parent.revoked_by_event_ids.length === 0) {
+            conflicts.push({
+              kind: 'offline_dispatch_vs_revocation',
+              target_id: data.grant_id,
+              event_ids: [ev.journal_event_id, ...concurrentRevIds],
+              detail: `Child grant ${data.grant_id} redelegated from parent grant ${parent.grant.grant_id} concurrently with revocation; fail-closed reconciliation required`,
+            });
+          }
+        }
         const parentActions = new Set(parent.grant.allowed_actions);
         const invalidActions = data.allowed_actions.filter((a) => !parentActions.has(a));
         const parentWs = new Set(parent.grant.workspace_scope);
-        const invalidWs = data.workspace_scope.filter((w) => !parentWs.has(w));
+        const invalidWs = parentWs.has('*')
+          ? []
+          : data.workspace_scope.filter((w) => !parentWs.has(w));
         if (
           !parent.grant.can_redelegate ||
           invalidActions.length > 0 ||
@@ -235,13 +335,34 @@ export function projectJournalState(
           });
         }
         if (g.revoked) {
-          // Check whether dispatch was causally before revocation or concurrent (fail-closed)
-          conflicts.push({
-            kind: 'offline_dispatch_vs_revocation',
-            target_id: data.dispatch_id,
-            event_ids: [ev.journal_event_id, ...g.revoked_by_event_ids],
-            detail: `Dispatch ${data.dispatch_id} used revoked grant ${g.grant.grant_id}; fail-closed reconciliation required`,
-          });
+          const dispAncestors = computeCausalAncestors(ev.journal_event_id);
+          const explicitlyAfterRevIds: string[] = [];
+          const concurrentRevIds: string[] = [];
+          for (const revId of g.revoked_by_event_ids) {
+            if (dispAncestors.has(revId)) {
+              explicitlyAfterRevIds.push(revId);
+            } else {
+              const revAncestors = computeCausalAncestors(revId);
+              if (!revAncestors.has(ev.journal_event_id)) {
+                concurrentRevIds.push(revId);
+              }
+            }
+          }
+          if (explicitlyAfterRevIds.length > 0) {
+            conflicts.push({
+              kind: 'revoked_grant_used',
+              target_id: data.dispatch_id,
+              event_ids: [ev.journal_event_id, ...explicitlyAfterRevIds],
+              detail: `Dispatch ${data.dispatch_id} used already-revoked grant ${g.grant.grant_id}`,
+            });
+          } else if (concurrentRevIds.length > 0 || g.revoked_by_event_ids.length === 0) {
+            conflicts.push({
+              kind: 'offline_dispatch_vs_revocation',
+              target_id: data.dispatch_id,
+              event_ids: [ev.journal_event_id, ...concurrentRevIds],
+              detail: `Dispatch ${data.dispatch_id} used grant ${g.grant.grant_id} concurrently with revocation; fail-closed reconciliation required`,
+            });
+          }
         }
       }
     }

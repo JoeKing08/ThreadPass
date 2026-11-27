@@ -10,6 +10,7 @@ import {
 } from '../core/canonical.js';
 import {
   analyzeCommonAncestors,
+  projectJournalState,
   verifyMailboxReceiptAck,
 } from '../core/state-machine.js';
 import {
@@ -19,6 +20,7 @@ import {
   type ControlRecord,
   type DispatchRecoveryCapsule,
   type EventRecord,
+  type GrantIssuedData,
   type InputDependencyManifest,
   type JournalEventRecord,
   type LineageAnchor,
@@ -241,7 +243,7 @@ export class ThreadPassService {
   }
 
   getStatus(projectId: string, threadId: string) {
-    const store = this.engine.openStore(projectId, threadId);
+    const store = this.engine.openExistingStore(projectId, threadId);
     try {
       const thread = store.getThread(threadId);
       const streams = store.listStreams(threadId);
@@ -283,7 +285,7 @@ export class ThreadPassService {
     pending_batch_id?: string;
     pending_message_ids?: string[];
   } {
-    const store = this.engine.openStore(projectId, threadId);
+    const store = this.engine.openExistingStore(projectId, threadId);
     let targetStreamId: string;
     let headAnchorId: string;
     let isMain: boolean;
@@ -370,6 +372,9 @@ export class ThreadPassService {
   } {
     assertSafeIdentifier('project_id', params.projectId);
     assertSafeIdentifier('thread_id', params.threadId);
+    if (!params.rawText.trim()) {
+      throw new Error('adoptExternal requires non-empty rawText');
+    }
     const warnings: string[] = [];
     const label = params.sourceLabel ?? 'external_ai';
     const pkg = parseExternalConversationInput(params.rawText, label);
@@ -414,13 +419,19 @@ export class ThreadPassService {
     });
 
     // 3-layer pre-ingestion lookup across SQLite
-    const store = this.engine.openStore(params.projectId, params.threadId);
+    const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let threadRow: ReturnType<typeof store.getThread>;
     let existingStream: ReturnType<typeof store.getStream>;
     try {
       threadRow = store.getThread(params.threadId);
       if (!threadRow) {
         throw new Error(`Thread ${params.threadId} is not initialized in project ${params.projectId}`);
+      }
+      const existingJournal = store.listJournalEvents(params.threadId);
+      if (threadRow.journal_head_id === null && existingJournal.length > 0) {
+        throw new Error(
+          `Thread ${params.threadId} has unresolved divergent Coordinator Journal heads; run reconcile commit before adopting new streams`,
+        );
       }
       existingStream = store.getStream(streamId);
       if (existingStream) {
@@ -554,7 +565,7 @@ export class ThreadPassService {
       actor_stream_id: threadRow!.main_stream_id,
       causal_predecessors: threadRow!.journal_head_id ? [threadRow!.journal_head_id] : [],
       commit_txn_id: 'pending',
-      coordinator_epoch: threadRow!.coordinator_epoch,
+      coordinator_epoch: threadRow!.coordinator_epoch + 1,
       created_at: nowIso,
       data: {
         adopted_stream_id: streamId,
@@ -626,7 +637,7 @@ export class ThreadPassService {
     source_anchors: Array<{ stream_id: string; anchor_id: string }>;
     attachment_path?: string;
   } {
-    const store = this.engine.openStore(params.projectId, params.threadId);
+    const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let threadRow: ReturnType<typeof store.getThread>;
     let sources: ReconcileSourceInput[];
     let commonAncestors: string[] = [];
@@ -752,6 +763,9 @@ export class ThreadPassService {
     conflicts_count: number;
     parse_warning?: string;
   } {
+    if (!params.receiptRawText.trim()) {
+      throw new Error('commitReconcile requires non-empty receiptRawText');
+    }
     const parsed = parseReconcileReceipt(params.receiptRawText);
     const exactReceiptSha = sha256Hex(normalizeConfirmationText(params.receiptRawText));
     const sanitizedSummary = this.engine.redactor.sanitizeText(parsed.synthesis_summary).sanitized;
@@ -766,22 +780,68 @@ export class ThreadPassService {
       positions: this.sanitizeTextList(c.positions).items,
       resolution: this.engine.redactor.sanitizeText(c.resolution).sanitized,
     }));
-    const store = this.engine.openStore(params.projectId, params.threadId);
+    const store = this.engine.openExistingStore(params.projectId, params.threadId);
 
     let threadRow: ReturnType<typeof store.getThread>;
     let mainRow: ReturnType<typeof store.getStream>;
     let inputSources: ReconciliationRecord['input_sources'] = [];
     let depItems: InputDependencyManifest['items'] = [];
+    let journalCausalPreds: string[] = [];
+    let mainAnchorParents: string[] = [];
 
     try {
       threadRow = store.getThread(params.threadId);
       if (!threadRow) throw new Error(`Thread ${params.threadId} not found`);
       mainRow = store.getStream(threadRow.main_stream_id);
       if (!mainRow) throw new Error(`Main stream ${threadRow.main_stream_id} not found`);
+      if (mainRow.health === 'quarantined') {
+        throw new Error(
+          `Main stream ${mainRow.stream_id} has health=quarantined; resolve fsck before reconciling`,
+        );
+      }
+
+      if (mainRow.health === 'divergent_heads') {
+        const mainAnchors = store
+          .listAnchors(params.threadId)
+          .filter((a) => a.stream_id === mainRow!.stream_id);
+        const mainPredIds = new Set<string>();
+        for (const ma of mainAnchors) {
+          for (const p of ma.parents) mainPredIds.add(p);
+        }
+        mainAnchorParents = mainAnchors
+          .filter((ma) => !mainPredIds.has(ma.anchor_id))
+          .map((ma) => ma.anchor_id)
+          .sort();
+      } else if (mainRow.head_anchor_id) {
+        mainAnchorParents = [mainRow.head_anchor_id];
+      }
+
+      if (threadRow.journal_head_id) {
+        journalCausalPreds = [threadRow.journal_head_id];
+      } else {
+        // When divergent journal heads cleared journal_head_id, join all current leaf heads so reconciliation heals the DAG
+        const jEvents = store.listJournalEvents(params.threadId);
+        const referencedPreds = new Set<string>();
+        for (const je of jEvents) {
+          for (const p of je.causal_predecessors) referencedPreds.add(p);
+        }
+        journalCausalPreds = jEvents
+          .filter((je) => !referencedPreds.has(je.journal_event_id))
+          .map((je) => je.journal_event_id)
+          .sort();
+      }
 
       for (const sid of params.sourceStreamIds) {
         const sRow = store.getStream(sid);
-        if (!sRow || !sRow.head_anchor_id) {
+        if (!sRow) {
+          throw new Error(`Source stream ${sid} not found`);
+        }
+        if (sRow.health === 'quarantined' || sRow.health === 'divergent_heads') {
+          throw new Error(
+            `Reconcile source ${sid} has health=${sRow.health}; resolve fsck/divergent heads before reconciling`,
+          );
+        }
+        if (!sRow.head_anchor_id) {
           throw new Error(`Reconcile source ${sid} missing published head`);
         }
         const a = store.getAnchor(sRow.head_anchor_id);
@@ -873,7 +933,7 @@ export class ThreadPassService {
       anchor_id: newAnchorId,
       thread_id: params.threadId,
       stream_id: threadRow.main_stream_id,
-      parents: mainRow.head_anchor_id ? [mainRow.head_anchor_id] : [],
+      parents: mainAnchorParents,
       workspace_manifest: ws,
       reconciliation_record_ref: reconciliationId,
       summary: sanitizedSummary.slice(0, 600),
@@ -900,9 +960,9 @@ export class ThreadPassService {
       main_stream_id: threadRow.main_stream_id,
       event_type: 'reconciliation_committed',
       actor_stream_id: threadRow.main_stream_id,
-      causal_predecessors: threadRow.journal_head_id ? [threadRow.journal_head_id] : [],
+      causal_predecessors: journalCausalPreds,
       commit_txn_id: 'pending',
-      coordinator_epoch: threadRow.coordinator_epoch,
+      coordinator_epoch: threadRow.coordinator_epoch + 1,
       created_at: nowIso,
       data: {
         reconciliation_id: reconciliationId,
@@ -957,7 +1017,7 @@ export class ThreadPassService {
     offered_batch_id?: string;
     attachment_path?: string;
   } {
-    const store = this.engine.openStore(params.projectId, params.threadId);
+    const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let targetStreamId: string;
     let isMain: boolean;
     let headAnchor: LineageAnchor;
@@ -1050,9 +1110,13 @@ export class ThreadPassService {
         };
         const newAnchorId = newId('anc', 8);
         const nextAnchor: LineageAnchor = {
-          ...headAnchor,
           anchor_id: newAnchorId,
+          thread_id: params.threadId,
+          stream_id: targetStreamId,
           parents: [headAnchor.anchor_id],
+          workspace_manifest: headAnchor.workspace_manifest,
+          summary: headAnchor.summary,
+          head_event_ids: [],
           created_at: nowIso,
         };
         const ctrl: ControlRecord = {
@@ -1152,12 +1216,20 @@ export class ThreadPassService {
     warnings: string[];
     redacted_count: number;
   } {
-    const store = this.engine.openStore(params.projectId, params.threadId);
+    if (!params.rawText.trim()) {
+      throw new Error('ingestReply requires non-empty rawText');
+    }
+    const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let headAnchorId: string | null = null;
     let lastSeq = 0;
     try {
       const sRow = store.getStream(params.streamId);
       if (!sRow) throw new Error(`Stream ${params.streamId} not found`);
+      if (sRow.health === 'quarantined' || sRow.health === 'divergent_heads') {
+        throw new Error(
+          `Stream ${params.streamId} has health=${sRow.health}; resolve before ingesting`,
+        );
+      }
       headAnchorId = sRow.head_anchor_id;
       lastSeq = sRow.last_seq;
     } finally {
@@ -1238,7 +1310,13 @@ export class ThreadPassService {
       provenance,
       startSeq: lastSeq + 1,
       nowIso,
+      turnScopeSeed: `${headAnchorId ?? 'root'}:${lastSeq}`,
     });
+
+    const sanitizedRawSnapshot = this.engine.redactor.sanitizeText(pkg.raw_text).sanitized;
+    const shouldArchiveRawBlob =
+      sanitizedRawSnapshot.length > 4096 ||
+      pkg.parse_warnings.some((w) => w.includes('truncated'));
 
     const newAnchorId = newId('anc', 8);
     const anchor: LineageAnchor = {
@@ -1264,6 +1342,17 @@ export class ThreadPassService {
           controls,
         },
       ],
+      ...(shouldArchiveRawBlob
+        ? {
+            blobs: {
+              ingest_snapshot: {
+                bytes: sanitizedRawSnapshot,
+                sync_policy: 'approved' as const,
+                media_type: 'text/plain',
+              },
+            },
+          }
+        : {}),
     });
 
     return {
@@ -1292,6 +1381,7 @@ export class ThreadPassService {
     expectedArtifacts?: string[];
     requireDisasterRedundant?: boolean;
     disasterVerified?: boolean;
+    actAsMain?: boolean;
   }): {
     dispatch_id: string;
     worker_stream_id: string;
@@ -1303,19 +1393,25 @@ export class ThreadPassService {
   } {
     assertSafeIdentifier('project_id', params.projectId);
     assertSafeIdentifier('thread_id', params.threadId);
+    if (!params.taskBrief.trim()) {
+      throw new Error('forkDispatch requires non-empty taskBrief');
+    }
     const workerStreamId = assertSafeIdentifier(
       'worker_stream_id',
       params.workerStreamId ?? newId('wrk', 6),
     );
-    const store = this.engine.openStore(params.projectId, params.threadId);
+    const ws = captureWorkspaceManifest(params.workspaceDir);
+    const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let threadRow: ReturnType<typeof store.getThread>;
     let sourceAnchor: LineageAnchor;
     let coordSnapshotText: string;
+    let originSid: string;
+    let matchedGrantId: string | undefined;
 
     try {
       threadRow = store.getThread(params.threadId);
       if (!threadRow) throw new Error(`Thread ${params.threadId} not found`);
-      const originSid = params.originStreamId ?? threadRow.main_stream_id;
+      originSid = params.originStreamId ?? threadRow.main_stream_id;
       const originStream = store.getStream(originSid);
       if (
         originStream &&
@@ -1334,10 +1430,43 @@ export class ThreadPassService {
       if (!anc) throw new Error(`Source anchor ${resolvedAnchorId} not found`);
       sourceAnchor = anc;
 
+      const journalEvents = store.listJournalEvents(params.threadId);
+      if (threadRow.journal_head_id === null && journalEvents.length > 0) {
+        throw new Error(
+          `Cannot dispatch from ${originSid}: thread ${params.threadId} has unresolved divergent Coordinator Journal heads`,
+        );
+      }
+      const jProj = projectJournalState(params.threadId, journalEvents);
+      if (jProj.has_blocking_conflict) {
+        throw new Error(
+          `Cannot dispatch from ${originSid}: thread ${params.threadId} has unresolved journal conflicts`,
+        );
+      }
+
+      if (originSid !== threadRow.main_stream_id && !params.actAsMain) {
+        const nowMs = Date.now();
+        const validGrant = [...jProj.grants.values()].find(
+          (g) =>
+            !g.revoked &&
+            g.grant.grantee_stream_id === originSid &&
+            g.grant.allowed_actions.includes('fork') &&
+            g.remaining_spawns >= 1 &&
+            (!g.grant.expires_at || Date.parse(g.grant.expires_at) > nowMs) &&
+            (g.grant.workspace_scope.includes('*') ||
+              g.grant.workspace_scope.includes(ws.workspace_id)),
+        );
+        if (!validGrant) {
+          throw new Error(
+            `Unauthorized nested fork from ${originSid}: no active dispatch_grant with remaining escrow quota`,
+          );
+        }
+        matchedGrantId = validGrant.grant.grant_id;
+      }
+
       const snapshotObj = {
         thread_id: params.threadId,
         main_stream_id: threadRow.main_stream_id,
-        coordinator_epoch: threadRow.coordinator_epoch,
+        coordinator_epoch: threadRow.coordinator_epoch + 1,
         streams: store.listStreams(params.threadId).map((s) => ({
           stream_id: s.stream_id,
           head_anchor_id: s.head_anchor_id,
@@ -1356,8 +1485,8 @@ export class ThreadPassService {
     const dispatchId = newId('disp', 8);
     const workerAnchorId = newId('anc', 8);
     const snapshotSha = sha256Hex(Buffer.from(coordSnapshotText, 'utf8'));
-    const ws = captureWorkspaceManifest(params.workspaceDir);
     const sanitizedBrief = this.engine.redactor.sanitizeText(params.taskBrief).sanitized;
+    const nextCoordEpoch = threadRow.coordinator_epoch + 1;
 
     const capsule: DispatchRecoveryCapsule = {
       capsule_id: newId('cap', 8),
@@ -1365,7 +1494,7 @@ export class ThreadPassService {
       origin_thread_id: params.threadId,
       source_anchor_id: sourceAnchor.anchor_id,
       dispatch_id: dispatchId,
-      coordinator_epoch: threadRow.coordinator_epoch,
+      coordinator_epoch: nextCoordEpoch,
       coordinator_snapshot_ref: snapshotSha,
       task_brief: sanitizedBrief,
       source_trust_tier: 'human_authority',
@@ -1429,10 +1558,10 @@ export class ThreadPassService {
       thread_id: params.threadId,
       main_stream_id: threadRow.main_stream_id,
       event_type: 'dispatch_committed',
-      actor_stream_id: threadRow.main_stream_id,
+      actor_stream_id: params.actAsMain ? threadRow.main_stream_id : originSid,
       causal_predecessors: threadRow.journal_head_id ? [threadRow.journal_head_id] : [],
       commit_txn_id: 'pending',
-      coordinator_epoch: threadRow.coordinator_epoch,
+      coordinator_epoch: nextCoordEpoch,
       created_at: nowIso,
       data: {
         dispatch_id: dispatchId,
@@ -1440,6 +1569,7 @@ export class ThreadPassService {
         source_anchor_id: sourceAnchor.anchor_id,
         target_stream_id: workerStreamId,
         target_workspace_id: ws.workspace_id,
+        ...(matchedGrantId ? { grant_id: matchedGrantId } : {}),
         task_brief: sanitizedBrief,
         capsule_id: capsule.capsule_id,
         coordinator_snapshot_ref: snapshotSha,
@@ -1564,12 +1694,23 @@ export class ThreadPassService {
     assertSafeIdentifier('thread_id', params.threadId);
     assertSafeIdentifier('from_stream_id', params.fromStreamId);
     assertSafeIdentifier('target_stream_id', params.targetStreamId);
-    const store = this.engine.openStore(params.projectId, params.threadId);
+    if (!params.text.trim()) {
+      throw new Error('sendMailboxMessage requires non-empty text');
+    }
+    const store = this.engine.openExistingStore(params.projectId, params.threadId);
     let headAnchor: LineageAnchor;
     let lastSeq: number;
     try {
       const sRow = store.getStream(params.fromStreamId);
-      if (!sRow || !sRow.head_anchor_id) {
+      if (!sRow) {
+        throw new Error(`Sender stream ${params.fromStreamId} missing`);
+      }
+      if (sRow.health === 'quarantined' || sRow.health === 'divergent_heads') {
+        throw new Error(
+          `Sender stream ${params.fromStreamId} has health=${sRow.health}; resolve before sending mailbox message`,
+        );
+      }
+      if (!sRow.head_anchor_id) {
         throw new Error(`Sender stream ${params.fromStreamId} missing`);
       }
       const anc = store.getAnchor(sRow.head_anchor_id);
@@ -1608,9 +1749,12 @@ export class ThreadPassService {
       },
     };
     const nextAnchor: LineageAnchor = {
-      ...headAnchor,
       anchor_id: newId('anc', 8),
+      thread_id: params.threadId,
+      stream_id: params.fromStreamId,
       parents: [headAnchor.anchor_id],
+      workspace_manifest: headAnchor.workspace_manifest,
+      summary: `Sent mailbox message ${messageId} to ${params.targetStreamId}`,
       head_event_ids: [ev.event_id],
       created_at: nowIso,
     };
@@ -1628,6 +1772,163 @@ export class ThreadPassService {
     });
 
     return { message_id: messageId, txn_id: res.txn_id };
+  }
+
+  issueDispatchGrant(params: {
+    projectId: string;
+    threadId: string;
+    issuerStreamId?: string;
+    granteeStreamId: string;
+    parentGrantId?: string;
+    allowedActions?: string[];
+    workspaceScope?: string[];
+    maxTotalSpawns: number;
+    maxDepth?: number;
+    canRedelegate?: boolean;
+    expiresAt?: string;
+  }): { grant_id: string; txn_id: string } {
+    assertSafeIdentifier('project_id', params.projectId);
+    assertSafeIdentifier('thread_id', params.threadId);
+    assertSafeIdentifier('grantee_stream_id', params.granteeStreamId);
+    if (!Number.isInteger(params.maxTotalSpawns) || params.maxTotalSpawns < 1) {
+      throw new Error(`Invalid maxTotalSpawns (${params.maxTotalSpawns}): must be an integer >= 1`);
+    }
+    if (params.maxDepth !== undefined && (!Number.isInteger(params.maxDepth) || params.maxDepth < 0)) {
+      throw new Error(`Invalid maxDepth (${params.maxDepth}): must be an integer >= 0`);
+    }
+    const store = this.engine.openExistingStore(params.projectId, params.threadId);
+    let threadRow: NonNullable<ReturnType<typeof store.getThread>>;
+    let issuerStreamId: string;
+    let existingJournal: JournalEventRecord[];
+    try {
+      const tr = store.getThread(params.threadId);
+      if (!tr) throw new Error(`Thread ${params.threadId} not found`);
+      threadRow = tr;
+      existingJournal = store.listJournalEvents(params.threadId);
+      if (threadRow.journal_head_id === null && existingJournal.length > 0) {
+        throw new Error(
+          `Thread ${params.threadId} has unresolved divergent Coordinator Journal heads; reconcile before issuing grants`,
+        );
+      }
+      issuerStreamId = params.issuerStreamId ?? tr.main_stream_id;
+      if (!store.getStream(params.granteeStreamId)) {
+        throw new Error(`Grantee stream ${params.granteeStreamId} not found`);
+      }
+      if (issuerStreamId !== tr.main_stream_id && !params.parentGrantId) {
+        throw new Error('Non-Main grant issuer must specify --parent-grant');
+      }
+      if (params.parentGrantId) {
+        const parentProj = projectJournalState(params.threadId, existingJournal).grants.get(
+          params.parentGrantId,
+        );
+        if (
+          parentProj?.grant.expires_at &&
+          Date.parse(parentProj.grant.expires_at) <= Date.now()
+        ) {
+          throw new Error(`Parent grant ${params.parentGrantId} has already expired`);
+        }
+      }
+    } finally {
+      store.close();
+    }
+
+    const grantId = newId('grt', 8);
+    const nowIso = this.engine.clock.wallIso();
+    const grantData: GrantIssuedData = {
+      grant_id: grantId,
+      issuer_stream_id: issuerStreamId,
+      grantee_stream_id: params.granteeStreamId,
+      ...(params.parentGrantId ? { parent_grant_id: params.parentGrantId } : {}),
+      allowed_actions: params.allowedActions ?? ['fork'],
+      workspace_scope: params.workspaceScope ?? ['*'],
+      max_total_spawns: params.maxTotalSpawns,
+      max_depth: params.maxDepth ?? 1,
+      can_redelegate: Boolean(params.canRedelegate),
+      ...(params.expiresAt ? { expires_at: params.expiresAt } : {}),
+    };
+
+    const je: JournalEventRecord = {
+      schema_version: SCHEMA_VERSION,
+      journal_event_id: newId('je', 8),
+      thread_id: params.threadId,
+      main_stream_id: threadRow.main_stream_id,
+      event_type: 'grant_issued',
+      actor_stream_id: issuerStreamId,
+      causal_predecessors: threadRow.journal_head_id ? [threadRow.journal_head_id] : [],
+      commit_txn_id: 'pending',
+      coordinator_epoch: threadRow.coordinator_epoch + 1,
+      created_at: nowIso,
+      data: grantData as unknown as Record<string, unknown>,
+    };
+    const projected = projectJournalState(params.threadId, [...existingJournal, je]);
+    if (projected.has_blocking_conflict) {
+      throw new Error(
+        `Grant rejected (fail-closed): ${projected.conflicts.map((c) => c.detail).join('; ')}`,
+      );
+    }
+
+    const res = this.engine.executeTransaction(params.projectId, {
+      thread_id: params.threadId,
+      expected_journal_head: threadRow.journal_head_id,
+      affected_streams: [],
+      journal_events: [je],
+    });
+    return { grant_id: grantId, txn_id: res.txn_id };
+  }
+
+  revokeDispatchGrant(params: {
+    projectId: string;
+    threadId: string;
+    grantId: string;
+    reason?: string;
+  }): { journal_event_id: string; txn_id: string } {
+    assertSafeIdentifier('project_id', params.projectId);
+    assertSafeIdentifier('thread_id', params.threadId);
+    const store = this.engine.openExistingStore(params.projectId, params.threadId);
+    let threadRow: NonNullable<ReturnType<typeof store.getThread>>;
+    try {
+      const tr = store.getThread(params.threadId);
+      if (!tr) throw new Error(`Thread ${params.threadId} not found`);
+      threadRow = tr;
+      const existingJournal = store.listJournalEvents(params.threadId);
+      if (threadRow.journal_head_id === null && existingJournal.length > 0) {
+        throw new Error(
+          `Thread ${params.threadId} has unresolved divergent Coordinator Journal heads; reconcile before revoking grants`,
+        );
+      }
+      const jProj = projectJournalState(params.threadId, existingJournal);
+      if (!jProj.grants.has(params.grantId)) {
+        throw new Error(`Grant ${params.grantId} not found in thread ${params.threadId}`);
+      }
+    } finally {
+      store.close();
+    }
+    const nowIso = this.engine.clock.wallIso();
+    const jeId = newId('je', 8);
+    const je: JournalEventRecord = {
+      schema_version: SCHEMA_VERSION,
+      journal_event_id: jeId,
+      thread_id: params.threadId,
+      main_stream_id: threadRow.main_stream_id,
+      event_type: 'grant_revoked',
+      actor_stream_id: threadRow.main_stream_id,
+      causal_predecessors: threadRow.journal_head_id ? [threadRow.journal_head_id] : [],
+      commit_txn_id: 'pending',
+      coordinator_epoch: threadRow.coordinator_epoch + 1,
+      created_at: nowIso,
+      data: {
+        grant_id: params.grantId,
+        revoked_by_stream_id: threadRow.main_stream_id,
+        reason: params.reason ?? 'revoked by coordinator',
+      },
+    };
+    const res = this.engine.executeTransaction(params.projectId, {
+      thread_id: params.threadId,
+      expected_journal_head: threadRow.journal_head_id,
+      affected_streams: [],
+      journal_events: [je],
+    });
+    return { journal_event_id: jeId, txn_id: res.txn_id };
   }
 
   peekStream(projectId: string, threadId: string, streamId: string): StreamShardLine[] {
