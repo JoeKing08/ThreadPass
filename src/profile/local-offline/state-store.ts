@@ -4,12 +4,30 @@ import { sha256Hex } from '../../core/canonical.js';
 import type { ClockPort } from '../../core/ports.js';
 import type {
   FsckTxnStatus,
+  HostTranscriptLocator,
   JournalEventRecord,
   LeaseInfo,
   LeaseState,
   LineageAnchor,
   StreamProjectionHealth,
 } from '../../core/types.js';
+
+export function computeTranscriptLocatorKey(loc: HostTranscriptLocator): string {
+  if (loc.host_kind === 'local_file' && loc.file_path) {
+    const normPath = loc.file_path.trim().replace(/\\/g, '/');
+    return sha256Hex(
+      `local|${(loc.machine_device_id ?? '').trim()}|${(loc.machine_hostname ?? '').trim()}|${normPath}`,
+    );
+  }
+  if (loc.host_kind === 'web_uploaded_blob' && loc.uploaded_blob_sha256) {
+    return sha256Hex(`blob|${loc.uploaded_blob_sha256}`);
+  }
+  if (loc.host_kind === 'cloud_remote') {
+    const ident = (loc.host_session_id ?? loc.remote_uri ?? loc.stream_id).trim();
+    return sha256Hex(`cloud|${(loc.cloud_provider ?? '').trim()}|${ident}`);
+  }
+  return sha256Hex(`placeholder|${loc.stream_id}|${loc.source_label}`);
+}
 
 export class SystemClock implements ClockPort {
   private readonly domainId: string;
@@ -220,6 +238,27 @@ export class StateStore {
         status TEXT NOT NULL,
         reason TEXT NOT NULL,
         detected_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS transcript_locators (
+        locator_key TEXT PRIMARY KEY,
+        locator_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        stream_id TEXT NOT NULL,
+        anchor_id TEXT,
+        source_label TEXT NOT NULL,
+        host_kind TEXT NOT NULL,
+        machine_hostname TEXT,
+        machine_device_id TEXT,
+        file_path TEXT,
+        cloud_provider TEXT,
+        host_session_id TEXT,
+        remote_uri TEXT,
+        uploaded_blob_sha256 TEXT,
+        uploaded_blob_rel TEXT,
+        uploaded_filename TEXT,
+        locator_json TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
       );
     `);
   }
@@ -445,5 +484,57 @@ export class StateStore {
       pid: row.pid,
       state: row.lease_state,
     };
+  }
+
+  upsertTranscriptLocator(threadId: string, loc: HostTranscriptLocator): void {
+    const key = computeTranscriptLocatorKey(loc);
+    this.db
+      .prepare(
+        `INSERT INTO transcript_locators(
+          locator_key, locator_id, thread_id, stream_id, anchor_id, source_label, host_kind,
+          machine_hostname, machine_device_id, file_path, cloud_provider, host_session_id,
+          remote_uri, uploaded_blob_sha256, uploaded_blob_rel, uploaded_filename,
+          locator_json, recorded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(locator_key) DO UPDATE SET
+          locator_id = excluded.locator_id,
+          anchor_id = COALESCE(excluded.anchor_id, transcript_locators.anchor_id),
+          source_label = excluded.source_label,
+          locator_json = excluded.locator_json,
+          recorded_at = MAX(transcript_locators.recorded_at, excluded.recorded_at)`,
+      )
+      .run(
+        key,
+        loc.locator_id,
+        threadId,
+        loc.stream_id,
+        loc.anchor_id ?? null,
+        loc.source_label,
+        loc.host_kind,
+        loc.machine_hostname ?? null,
+        loc.machine_device_id ?? null,
+        loc.file_path ?? null,
+        loc.cloud_provider ?? null,
+        loc.host_session_id ?? null,
+        loc.remote_uri ?? null,
+        loc.uploaded_blob_sha256 ?? null,
+        loc.uploaded_blob_rel ?? null,
+        loc.uploaded_filename ?? null,
+        JSON.stringify(loc),
+        loc.recorded_at,
+      );
+  }
+
+  listTranscriptLocators(threadId?: string): HostTranscriptLocator[] {
+    const rows = (threadId
+      ? this.db
+          .prepare(
+            'SELECT locator_json FROM transcript_locators WHERE thread_id = ? ORDER BY recorded_at DESC, locator_key ASC',
+          )
+          .all(threadId)
+      : this.db
+          .prepare('SELECT locator_json FROM transcript_locators ORDER BY recorded_at DESC, locator_key ASC')
+          .all()) as Array<{ locator_json: string }>;
+    return rows.map((r) => JSON.parse(r.locator_json) as HostTranscriptLocator);
   }
 }

@@ -881,3 +881,60 @@ test('readCommittedStreamLines follows causal anchor.parents order even under ba
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('Transcript locators cap inline prompt list at 12, export transcript-index.json, and survive fsck --rebuild', () => {
+  const home = makeTempHome('tloc-rebuild');
+  try {
+    const svc = new ThreadPassService({ homeDir: home });
+    const init = svc.initThread({ projectId: 'proj_tloc', threadId: 'thr_tloc', mainStreamId: 'strm_main' });
+
+    for (let i = 1; i <= 15; i++) {
+      const fpath = path.join(home, `session_${i}.jsonl`);
+      fs.writeFileSync(fpath, `line_${i}\n`, 'utf8');
+      svc.adoptExternal({
+        projectId: 'proj_tloc',
+        threadId: 'thr_tloc',
+        sourceLabel: `ai_${i}`,
+        streamId: `strm_t_${i}`,
+        rawText: `assistant: finding number ${i}`,
+        transcriptFilePath: fpath,
+      });
+    }
+
+    // Re-ingesting the SAME path on an existing stream should deduplicate cleanly
+    svc.ingestReply({
+      projectId: 'proj_tloc',
+      threadId: 'thr_tloc',
+      streamId: 'strm_t_1',
+      rawText: 'assistant: second update same transcript file',
+      transcriptFilePath: path.join(home, 'session_1.jsonl'),
+    });
+
+    const layout = svc.engine.getLayout('proj_tloc', 'thr_tloc');
+    const indexJson = JSON.parse(fs.readFileSync(layout.transcriptIndexJsonPath, 'utf8')) as {
+      total_locators: number;
+      locators: Array<{ stream_id: string }>;
+    };
+    assert.equal(indexJson.total_locators, 15);
+
+    const ho = svc.packHandoff({
+      projectId: 'proj_tloc',
+      threadId: 'thr_tloc',
+      streamId: init.main_stream_id,
+    });
+    assert.ok(ho.full_markdown.includes('(+3 older transcript locator(s) archived in'));
+
+    // Delete SQLite & rebuild from immutable shards -> all 15 locators MUST survive
+    for (const suf of ['', '-wal', '-shm']) {
+      const f = `${layout.dbPath}${suf}`;
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    }
+    const rebuilt = svc.runFsck('proj_tloc', 'thr_tloc', { rebuildSqlite: true });
+    assert.equal(rebuilt.ok, true);
+
+    const stAfter = svc.getStatus('proj_tloc', 'thr_tloc');
+    assert.equal(stAfter.transcript_locators.length, 15);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

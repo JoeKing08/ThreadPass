@@ -20,6 +20,10 @@ export interface ParsedAdoptPackage {
   continuity_level: ContinuityLevel;
   source_label: string;
   host_session_id?: string;
+  transcript_file_path?: string;
+  machine_hostname?: string;
+  cloud_provider?: string;
+  remote_uri?: string;
   claimed_user_quotes: string[];
   decisions_made: string[];
   files_and_artifacts: string[];
@@ -191,7 +195,7 @@ export function extractStructuredJsonObject(
   return { obj: null, looksLikeJson: false };
 }
 
-export function normalizeHostSessionId(value: unknown): string | undefined {
+export function normalizeOptionalMetaString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const s = value.trim();
   if (!s) return undefined;
@@ -211,6 +215,10 @@ export function normalizeHostSessionId(value: unknown): string | undefined {
     return undefined;
   }
   return s;
+}
+
+export function normalizeHostSessionId(value: unknown): string | undefined {
+  return normalizeOptionalMetaString(value);
 }
 
 function normalizeStringArray(val: unknown): string[] {
@@ -289,6 +297,10 @@ export function parseExternalConversationInput(
         mode === 'evidence_based' ? 'Evidence Recovery' : 'Prompt Reconstruction',
       source_label: String(obj.source_label ?? sourceLabel),
       host_session_id: normalizeHostSessionId(obj.host_session_id),
+      transcript_file_path: normalizeOptionalMetaString(obj.transcript_file_path),
+      machine_hostname: normalizeOptionalMetaString(obj.machine_hostname),
+      cloud_provider: normalizeOptionalMetaString(obj.cloud_provider),
+      remote_uri: normalizeOptionalMetaString(obj.remote_uri),
       claimed_user_quotes: normalizeStringArray(obj.claimed_user_quotes),
       decisions_made: normalizeStringArray(obj.decisions_made),
       files_and_artifacts: normalizeStringArray(obj.files_and_artifacts),

@@ -116,6 +116,14 @@ ThreadPass 架构宪章分为三个规范性设计层级：
   - **`coordination/journal/committed/` 是当前 `thread_id` 的协调事实日志权威（Coordinator Journal）**，与 Main 的对话/模型交互历史分离，采用不可变追加记录，专门保存派发、授权授予/撤销、成果回执与采纳、分支放弃、恢复、收编及归并裁决等改变协作空间控制状态的事实。它不是第二份 Main，也不保存完整会话对话；`state.sqlite` 中的协调账本表是其可重建的并发控制投影。Journal 可在 Main 会话流丢失时重建协调视图，但不能恢复 Journal 从未记录的 Main 对话或决策。
   - **独立灾备副本**须包含已提交 Coordinator Journal 事件及其依赖的获准 Blob、派发胶囊和校验清单，并放置在与主存储不同的故障域。只有在副本内容及引用完整性得到验证后，相关状态才可标记为 `disaster_redundant`；否则只能诚实标记为 `local_committed` / `local_only`。是否要求关键操作在投喂前取得独立副本确认，由明确的持久性策略决定，系统不得把单机落盘描述成独立灾备。
 - **各原厂 Agent 客户端内部的本地或远端会话存储**仅构成特定会话流在当前执行阶段的**宿主工作副本（Host Working Replica）**，绝不因持有最新交互字节而自动获得全局谱系权威。
+- **核心概念三分法（逻辑主会话 / 宿主原生会话 / 当前主 Agent）：**
+  1. **逻辑主会话（Canonical Main Stream / `thp` Main）：** ThreadPass 内核里由 `main_designated` 锚定、指向某条规范 `stream_id` 的唯一权威逻辑主线。**铁律：任何时候、任何外部 IDE/CLI/Agent 框架或网页客户端里的原生会话记录/日志文件，都不是主会话。**
+  2. **宿主原生会话（Host Session / Ephemeral Carrier）：** 外部工具或网页端里的单个对话窗口及其原生历史文件（无论本地 `.jsonl`/`.json` 还是云端会话），仅为某一工作阶段临时承载逻辑流的工作副本，可随时替换、分流或收编。
+  3. **当前主 Agent（Active Main Agent）：** 此时此刻正在替逻辑主会话值班执行、统筹决策或对接派发的那**一个具体 AI 模型实例**（即便当前只有一个 Agent 在独立工作，它也只是“当前值班的主 Agent”，而不是逻辑主会话本体）。当更换模型、耗尽上下文重开窗口或从云端切换到本地时，替换的是“主 Agent”躯壳，背后延续的仍是同一条“逻辑主会话（thp Main）”。
+- **宿主会话文件定位符、可选上传副本与可达性契约（Host Transcript Locators & Reachability）：**
+  - 当工作流跨越多个同机 AI 工具（共用本机文件系统、需要 `grep` 原始历史明细）、跨设备离线同步、Web 上传导出记录及仅存于云端沙箱的 Agent（如无本机盘会话文件的云端 Agent）时，收编、检查点备份、合并提交与派发均可附带 `HostTranscriptLocator` 控制记录并持久化进不可变分片、`state.sqlite` 及派生只读索引 `transcript-index.json`（与 `lineage.json` 同级，支持 `thp fsck --rebuild` 完整重建）。
+  - 定位符须**严格绑定机器归属**（`machine_hostname` + `machine_device_id` + `file_path`），并在支持时允许 Web 会话**可选上传原始会话文件文本**（先全量流式脱敏再内容寻址存入 `blobs/objects/`）；对纯云端或缺失本地文件的来源，保留 `cloud_remote`（记录 `cloud_provider` / `host_session_id` / 脱敏 `remote_uri`）或 `placeholder_unavailable` 显式占位标记，严禁静默伪造本地路径。
+  - 生成 Reconcile / Handoff / Fork 信封时，系统按当前宿主机器环境动态标注每条定位符的**实际可达性**（`LOCAL_GREPPABLE` / `LOCAL_FILE_MISSING` / `OTHER_MACHINE` / `UPLOADED_TRANSCRIPT_BLOB` / `CLOUD_ONLY / NO_LOCAL_FILE` / `NO_TRANSCRIPT_FILE / PLACEHOLDER`），并明确提醒接手 AI 其对全量原始会话日志的可见性是否完整（例如本地接手 AI 可 `grep` 全部同机本地日志，但无法触及 `CLOUD_ONLY` 云端副会话；反之兼容云端宿主若可访问对应提供商 `host_session_id` 则可自行反查），同时按主机预算对信封内联条目数设硬上限（默认 12 条，溢出指向完整 `transcript-index.json`），防止定位符清单随会话增长撑爆上下文窗口。
 - 宿主工作副本产生的新增交互，只有在来源验证、凭证脱敏、事务级分片暂存刷盘、SQLite 提交意图登记、Blob/历史分片发布及最终头指针激活全部完成后，方可成为规范谱系中的可见新状态；协调操作还须在同一提交协议中落入 Coordinator Journal。
 
 ### 0.4 跨子系统交互契约

@@ -144,6 +144,14 @@ function renderHtmlPage(
       <div style="flex:1;"><label>Source Label（如 ai_gpt / ai_claude / ai_1）</label><input id="adoptSource" type="text" value="external_ai_1" /></div>
       <div style="align-self:flex-end;"><button class="sec" onclick="runUiAction('adoptOut', () => copyAdoptPrompt(this))">复制提取 Prompt 模板</button></div>
     </div>
+    <div class="row" style="margin-top:8px;">
+      <div style="flex:2; min-width:220px;"><label>原宿主本地会话文件路径（可选，同机 grep 定位）</label><input id="adoptTranscriptPath" type="text" placeholder="例如 C:\\Users\\...\\transcript_full.jsonl" /></div>
+      <div style="flex:1; min-width:140px;"><label>云端宿主标识（可选，无本地日志时）</label><input id="adoptCloudHost" type="text" placeholder="如 devin_cloud / web_gpt" /></div>
+      <div style="flex:1; min-width:140px;"><label>Host Session ID（可选）</label><input id="adoptHostSess" type="text" placeholder="可选会话 ID" /></div>
+    </div>
+    <div class="row" style="margin-top:8px; justify-content:space-between;">
+      <label class="file-label">可选：上传 Web 端原始会话文件备份（脱敏存入本地 blob）<input id="adoptUploadFile" type="file" accept=".md,.txt,.json,.jsonl,text/plain,text/markdown" /></label>
+    </div>
     <div class="row" style="justify-content:space-between; margin-top:10px;">
       <label style="margin:0;">粘贴源 AI 回复或原始对话全文（自动跨块脱敏 + 防重复收编反查，支持拖放 .md/.txt）</label>
       <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('adoptText', this)" /></label>
@@ -175,6 +183,13 @@ function renderHtmlPage(
     </div>
     <textarea id="recReceipt" placeholder="粘贴或拖放 JSON ReconciliationReceipt 或总结文本"></textarea>
     <div class="row" style="margin-top:8px;">
+      <div style="flex:2; min-width:200px;"><label>合并 AI 原生会话文件路径（可选）</label><input id="recTranscriptPath" type="text" placeholder="可选本地日志路径" /></div>
+      <div style="flex:1; min-width:140px;"><label>云端宿主（可选）</label><input id="recCloudHost" type="text" placeholder="如 claude_web" /></div>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <label class="file-label">可选：上传合并 AI 原始会话副本（自动脱敏）<input id="recUploadFile" type="file" accept=".md,.txt,.json,.jsonl,text/plain,text/markdown" /></label>
+    </div>
+    <div class="row" style="margin-top:8px;">
       <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
         <input id="recConfirm" type="checkbox" /> 人工审阅确认合并裁决并绑定内容哈希
       </label>
@@ -195,6 +210,13 @@ function renderHtmlPage(
       <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('ckptText', this)" /></label>
     </div>
     <textarea id="ckptText" placeholder="粘贴或拖放检查点 JSON 或新阶段对话原文..."></textarea>
+    <div class="row" style="margin-top:8px;">
+      <div style="flex:2; min-width:200px;"><label>当前 AI 原生会话文件路径（可选）</label><input id="ckptTranscriptPath" type="text" placeholder="可选本地日志路径" /></div>
+      <div style="flex:1; min-width:140px;"><label>云端宿主（可选）</label><input id="ckptCloudHost" type="text" placeholder="如 devin_cloud" /></div>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <label class="file-label">可选：上传该阶段原始会话副本（自动脱敏）<input id="ckptUploadFile" type="file" accept=".md,.txt,.json,.jsonl,text/plain,text/markdown" /></label>
+    </div>
     <div class="row" style="margin-top:8px;">
       <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
         <input id="ckptConfirm" type="checkbox" /> 我已审阅原文并签发哈希绑定授权凭证
@@ -222,6 +244,10 @@ function renderHtmlPage(
     <div class="row" style="margin-top:8px;">
       <div style="flex:1;"><label>派生子流任务描述 (Fork Task Brief)</label><input id="forkTask" type="text" placeholder="Implement sub-module X" /></div>
       <div style="align-self:flex-end;"><button onclick="runUiAction('hoOut', doFork)">原子派发 Fork</button></div>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <div style="flex:2; min-width:200px;"><label>子流原生会话路径（可选）</label><input id="forkTranscriptPath" type="text" placeholder="可选本地日志路径" /></div>
+      <div style="flex:1; min-width:140px;"><label>子流云端宿主（可选）</label><input id="forkCloudHost" type="text" placeholder="如 devin_cloud" /></div>
     </div>
     <div id="forkPromptBox"></div>
 
@@ -389,12 +415,26 @@ async function copyAdoptPrompt(btn) {
   document.getElementById('adoptOut').textContent = res.prompt;
 }
 
+async function readOptionalUpload(inputId) {
+  const el = document.getElementById(inputId);
+  const file = el && el.files && el.files[0];
+  if (!file) return {};
+  return { uploadedTranscriptText: await file.text(), uploadedTranscriptFilename: file.name };
+}
+
 async function doAdopt() {
   const { projectId, threadId } = getIds();
   const rawText = document.getElementById('adoptText').value;
   const sourceLabel = document.getElementById('adoptSource').value.trim();
   const confirm = document.getElementById('adoptConfirm').checked;
-  const res = await api('/api/adopt', { projectId, threadId, sourceLabel, rawText, confirmAuthorize: confirm });
+  const transcriptFilePath = document.getElementById('adoptTranscriptPath').value.trim() || undefined;
+  const cloudProvider = document.getElementById('adoptCloudHost').value.trim() || undefined;
+  const hostSessionId = document.getElementById('adoptHostSess').value.trim() || undefined;
+  const upload = await readOptionalUpload('adoptUploadFile');
+  const res = await api('/api/adopt', {
+    projectId, threadId, sourceLabel, rawText, confirmAuthorize: confirm,
+    transcriptFilePath, cloudProvider, hostSessionId, ...upload
+  });
   document.getElementById('adoptOut').textContent = JSON.stringify(res, null, 2);
   showAlert('已收编流 ' + res.stream_id + ' (trust=' + res.trust_tier + ')', 'ok');
   await refreshStatus();
@@ -460,8 +500,12 @@ async function commitReconcile() {
   const selected = Array.from(document.querySelectorAll('.rec-src:checked')).map(c => c.value);
   const receiptRawText = document.getElementById('recReceipt').value;
   const confirmAuthorize = document.getElementById('recConfirm').checked;
+  const transcriptFilePath = document.getElementById('recTranscriptPath').value.trim() || undefined;
+  const cloudProvider = document.getElementById('recCloudHost').value.trim() || undefined;
+  const upload = await readOptionalUpload('recUploadFile');
   const res = await api('/api/reconcile/commit', {
-    projectId, threadId, sourceStreamIds: selected, receiptRawText, confirmAuthorize
+    projectId, threadId, sourceStreamIds: selected, receiptRawText, confirmAuthorize,
+    transcriptFilePath, cloudProvider, ...upload
   });
   document.getElementById('recOut').textContent = JSON.stringify(res, null, 2);
   showAlert('已合并提交到 Main (anchor=' + res.anchor_id + ')', 'ok');
@@ -486,8 +530,12 @@ async function doIngest() {
   const rawText = document.getElementById('ckptText').value;
   const workspaceDir = document.getElementById('ckptWorkspace').value.trim() || undefined;
   const confirmAuthorize = document.getElementById('ckptConfirm').checked;
+  const transcriptFilePath = document.getElementById('ckptTranscriptPath').value.trim() || undefined;
+  const cloudProvider = document.getElementById('ckptCloudHost').value.trim() || undefined;
+  const upload = await readOptionalUpload('ckptUploadFile');
   const res = await api('/api/ingest', {
-    projectId, threadId, streamId, rawText, workspaceDir, confirmAuthorize
+    projectId, threadId, streamId, rawText, workspaceDir, confirmAuthorize,
+    transcriptFilePath, cloudProvider, ...upload
   });
   document.getElementById('hoOut').textContent = JSON.stringify(res, null, 2);
   showAlert('已提交检查点存档到流 ' + streamId, 'ok');
@@ -515,8 +563,11 @@ async function doFork() {
   const workerStreamId = document.getElementById('forkWorker').value.trim() || undefined;
   const workspaceDir = document.getElementById('forkWs').value.trim() || undefined;
   const taskBrief = document.getElementById('forkTask').value;
+  const transcriptFilePath = document.getElementById('forkTranscriptPath').value.trim() || undefined;
+  const cloudProvider = document.getElementById('forkCloudHost').value.trim() || undefined;
   const res = await api('/api/fork', {
-    projectId, threadId, originStreamId, workerStreamId, workspaceDir, taskBrief
+    projectId, threadId, originStreamId, workerStreamId, workspaceDir, taskBrief,
+    transcriptFilePath, cloudProvider
   });
   const box = document.getElementById('forkPromptBox');
   box.textContent = '';
@@ -660,6 +711,32 @@ export async function startThreadPassWeb(
                 typeof body.workspaceDir === 'string' && body.workspaceDir.trim()
                   ? body.workspaceDir.trim()
                   : undefined,
+              transcriptFilePath:
+                typeof body.transcriptFilePath === 'string' && body.transcriptFilePath.trim()
+                  ? body.transcriptFilePath.trim()
+                  : undefined,
+              machineHostname:
+                typeof body.machineHostname === 'string' && body.machineHostname.trim()
+                  ? body.machineHostname.trim()
+                  : undefined,
+              cloudProvider:
+                typeof body.cloudProvider === 'string' && body.cloudProvider.trim()
+                  ? body.cloudProvider.trim()
+                  : undefined,
+              remoteUri:
+                typeof body.remoteUri === 'string' && body.remoteUri.trim()
+                  ? body.remoteUri.trim()
+                  : undefined,
+              hostSessionId:
+                typeof body.hostSessionId === 'string' && body.hostSessionId.trim()
+                  ? body.hostSessionId.trim()
+                  : undefined,
+              uploadedTranscriptText:
+                typeof body.uploadedTranscriptText === 'string' ? body.uploadedTranscriptText : undefined,
+              uploadedTranscriptFilename:
+                typeof body.uploadedTranscriptFilename === 'string' && body.uploadedTranscriptFilename.trim()
+                  ? body.uploadedTranscriptFilename.trim()
+                  : undefined,
             }),
           );
           return;
@@ -720,6 +797,32 @@ export async function startThreadPassWeb(
                 typeof body.workspaceDir === 'string' && body.workspaceDir.trim()
                   ? body.workspaceDir.trim()
                   : undefined,
+              transcriptFilePath:
+                typeof body.transcriptFilePath === 'string' && body.transcriptFilePath.trim()
+                  ? body.transcriptFilePath.trim()
+                  : undefined,
+              machineHostname:
+                typeof body.machineHostname === 'string' && body.machineHostname.trim()
+                  ? body.machineHostname.trim()
+                  : undefined,
+              cloudProvider:
+                typeof body.cloudProvider === 'string' && body.cloudProvider.trim()
+                  ? body.cloudProvider.trim()
+                  : undefined,
+              remoteUri:
+                typeof body.remoteUri === 'string' && body.remoteUri.trim()
+                  ? body.remoteUri.trim()
+                  : undefined,
+              hostSessionId:
+                typeof body.hostSessionId === 'string' && body.hostSessionId.trim()
+                  ? body.hostSessionId.trim()
+                  : undefined,
+              uploadedTranscriptText:
+                typeof body.uploadedTranscriptText === 'string' ? body.uploadedTranscriptText : undefined,
+              uploadedTranscriptFilename:
+                typeof body.uploadedTranscriptFilename === 'string' && body.uploadedTranscriptFilename.trim()
+                  ? body.uploadedTranscriptFilename.trim()
+                  : undefined,
             }),
           );
           return;
@@ -760,6 +863,32 @@ export async function startThreadPassWeb(
               rawText,
               confirmationProof: proof,
               allowForeignCanonical: Boolean(body.allowForeignCanonical),
+              transcriptFilePath:
+                typeof body.transcriptFilePath === 'string' && body.transcriptFilePath.trim()
+                  ? body.transcriptFilePath.trim()
+                  : undefined,
+              machineHostname:
+                typeof body.machineHostname === 'string' && body.machineHostname.trim()
+                  ? body.machineHostname.trim()
+                  : undefined,
+              cloudProvider:
+                typeof body.cloudProvider === 'string' && body.cloudProvider.trim()
+                  ? body.cloudProvider.trim()
+                  : undefined,
+              remoteUri:
+                typeof body.remoteUri === 'string' && body.remoteUri.trim()
+                  ? body.remoteUri.trim()
+                  : undefined,
+              hostSessionId:
+                typeof body.hostSessionId === 'string' && body.hostSessionId.trim()
+                  ? body.hostSessionId.trim()
+                  : undefined,
+              uploadedTranscriptText:
+                typeof body.uploadedTranscriptText === 'string' ? body.uploadedTranscriptText : undefined,
+              uploadedTranscriptFilename:
+                typeof body.uploadedTranscriptFilename === 'string' && body.uploadedTranscriptFilename.trim()
+                  ? body.uploadedTranscriptFilename.trim()
+                  : undefined,
             }),
           );
           return;
@@ -812,6 +941,28 @@ export async function startThreadPassWeb(
                 : [],
               receiptRawText,
               confirmationProof: proof,
+              transcriptFilePath:
+                typeof body.transcriptFilePath === 'string' && body.transcriptFilePath.trim()
+                  ? body.transcriptFilePath.trim()
+                  : undefined,
+              machineHostname:
+                typeof body.machineHostname === 'string' && body.machineHostname.trim()
+                  ? body.machineHostname.trim()
+                  : undefined,
+              cloudProvider:
+                typeof body.cloudProvider === 'string' && body.cloudProvider.trim()
+                  ? body.cloudProvider.trim()
+                  : undefined,
+              remoteUri:
+                typeof body.remoteUri === 'string' && body.remoteUri.trim()
+                  ? body.remoteUri.trim()
+                  : undefined,
+              uploadedTranscriptText:
+                typeof body.uploadedTranscriptText === 'string' ? body.uploadedTranscriptText : undefined,
+              uploadedTranscriptFilename:
+                typeof body.uploadedTranscriptFilename === 'string' && body.uploadedTranscriptFilename.trim()
+                  ? body.uploadedTranscriptFilename.trim()
+                  : undefined,
             }),
           );
           return;
@@ -866,6 +1017,18 @@ export async function startThreadPassWeb(
                   : 'Execute scoped subtask',
               requireDisasterRedundant: Boolean(body.requireDisasterRedundant),
               disasterVerified: Boolean(body.disasterVerified),
+              transcriptFilePath:
+                typeof body.transcriptFilePath === 'string' && body.transcriptFilePath.trim()
+                  ? body.transcriptFilePath.trim()
+                  : undefined,
+              cloudProvider:
+                typeof body.cloudProvider === 'string' && body.cloudProvider.trim()
+                  ? body.cloudProvider.trim()
+                  : undefined,
+              hostSessionId:
+                typeof body.hostSessionId === 'string' && body.hostSessionId.trim()
+                  ? body.hostSessionId.trim()
+                  : undefined,
             }),
           );
           return;

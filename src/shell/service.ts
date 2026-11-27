@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {
   assertSafeIdentifier,
@@ -21,6 +22,7 @@ import {
   type DispatchRecoveryCapsule,
   type EventRecord,
   type GrantIssuedData,
+  type HostTranscriptLocator,
   type InputDependencyManifest,
   type JournalEventRecord,
   type LineageAnchor,
@@ -33,17 +35,26 @@ import {
   pinTrustedDeviceKey,
   updateTrustedDeviceKeyStatus,
 } from '../profile/local-offline/crypto-keys.js';
-import { assertOutboundEgressSafe } from '../profile/local-offline/redaction.js';
+import {
+  assertOutboundEgressSafe,
+  redactRemoteUrlCredentials,
+} from '../profile/local-offline/redaction.js';
 import { StateStore } from '../profile/local-offline/state-store.js';
-import { LocalOfflineEngine, type FsckReport } from '../profile/local-offline/txn-engine.js';
+import {
+  LocalOfflineEngine,
+  type FsckReport,
+  type StagedBlobInput,
+} from '../profile/local-offline/txn-engine.js';
 import { type HostBudgetSpec, type PackedEnvelopeResult } from './budget.js';
 import {
   buildEventsFromAdoptedPackage,
+  normalizeOptionalMetaString,
   parseExternalConversationInput,
   type ParsedAdoptPackage,
 } from './ir.js';
 import {
   buildCurrentRoleBriefing,
+  formatTranscriptLocatorsSection,
   generateBatchId,
   packHandoffEnvelope,
   packReconcileEnvelope,
@@ -51,6 +62,7 @@ import {
   renderAdoptExtractPrompt,
   renderCheckpointPrompt,
   type ReconcileSourceInput,
+  type TranscriptLocatorFormatContext,
 } from './prompts.js';
 import {
   computeTrustTier,
@@ -83,6 +95,16 @@ export class ReleaseGateBlockedError extends Error {
     super(message);
     this.name = 'ReleaseGateBlockedError';
   }
+}
+
+export interface TranscriptInputOptions {
+  transcriptFilePath?: string;
+  machineHostname?: string;
+  cloudProvider?: string;
+  remoteUri?: string;
+  uploadedTranscriptText?: string;
+  uploadedTranscriptFilename?: string;
+  transcriptNote?: string;
 }
 
 export class ThreadPassService {
@@ -147,13 +169,150 @@ export class ThreadPassService {
     };
   }
 
+  private getTranscriptFormatContext(
+    projectId: string,
+    threadId: string,
+  ): TranscriptLocatorFormatContext {
+    const layout = this.engine.getLayout(projectId, threadId);
+    return {
+      currentHostname: os.hostname(),
+      currentDeviceId: this.engine.identity.device_id,
+      threadRootDir: layout.rootDir,
+      transcriptIndexPath: layout.transcriptIndexJsonPath,
+      checkFileExists: (p: string) => fs.existsSync(p),
+      resolveThreadPath: (rel: string) => path.join(layout.rootDir, ...rel.split('/')),
+    };
+  }
+
+  private prepareTranscriptArtifacts(params: {
+    streamId: string;
+    anchorId: string;
+    sourceLabel: string;
+    hostSessionId?: string;
+    nowIso: string;
+    options?: TranscriptInputOptions;
+    requirePlaceholderIfEmpty?: boolean;
+  }): {
+    controls: ControlRecord[];
+    blobs: Record<string, StagedBlobInput>;
+    locators: HostTranscriptLocator[];
+    redactedCount: number;
+  } {
+    const controls: ControlRecord[] = [];
+    const blobs: Record<string, StagedBlobInput> = {};
+    const locators: HostTranscriptLocator[] = [];
+    let redactedCount = 0;
+
+    const opts = params.options ?? {};
+    const filePath = normalizeOptionalMetaString(opts.transcriptFilePath);
+    const hostname = normalizeOptionalMetaString(opts.machineHostname) ?? os.hostname();
+    const cloudProvider = normalizeOptionalMetaString(opts.cloudProvider);
+    const remoteUri = normalizeOptionalMetaString(opts.remoteUri);
+    const hostSessionId = normalizeOptionalMetaString(params.hostSessionId);
+    const note = normalizeOptionalMetaString(opts.transcriptNote);
+
+    const pushLocator = (loc: HostTranscriptLocator) => {
+      locators.push(loc);
+      controls.push({
+        schema_version: SCHEMA_VERSION,
+        kind: 'control',
+        control_id: newId('ctrl', 8),
+        stream_id: params.streamId,
+        commit_txn_id: 'pending',
+        created_at: params.nowIso,
+        payload: { type: 'transcript_locator', locator: loc },
+      });
+    };
+
+    if (filePath) {
+      const fpRes = this.engine.redactor.sanitizeText(filePath);
+      redactedCount += fpRes.redactedCount;
+      pushLocator({
+        locator_id: newId('tloc', 8),
+        stream_id: params.streamId,
+        anchor_id: params.anchorId,
+        source_label: params.sourceLabel,
+        host_kind: 'local_file',
+        machine_hostname: hostname,
+        machine_device_id: this.engine.identity.device_id,
+        file_path: fpRes.sanitized,
+        ...(cloudProvider ? { cloud_provider: cloudProvider } : {}),
+        ...(hostSessionId ? { host_session_id: hostSessionId } : {}),
+        ...(note ? { note } : {}),
+        recorded_at: params.nowIso,
+      });
+    }
+
+    if (opts.uploadedTranscriptText && opts.uploadedTranscriptText.trim().length > 0) {
+      const upRes = this.engine.redactor.sanitizeText(opts.uploadedTranscriptText);
+      redactedCount += upRes.redactedCount;
+      const sanitizedBytes = Buffer.from(upRes.sanitized, 'utf8');
+      const blobSha = sha256Hex(sanitizedBytes);
+      const blobRel = path.posix.join('blobs', 'objects', blobSha.slice(0, 2), blobSha);
+      blobs.uploaded_transcript = {
+        bytes: upRes.sanitized,
+        sync_policy: 'approved',
+        media_type: 'text/plain',
+      };
+      const filename = normalizeOptionalMetaString(opts.uploadedTranscriptFilename);
+      pushLocator({
+        locator_id: newId('tloc', 8),
+        stream_id: params.streamId,
+        anchor_id: params.anchorId,
+        source_label: params.sourceLabel,
+        host_kind: 'web_uploaded_blob',
+        machine_hostname: hostname,
+        machine_device_id: this.engine.identity.device_id,
+        uploaded_blob_sha256: blobSha,
+        uploaded_blob_rel: blobRel,
+        ...(filename ? { uploaded_filename: filename } : {}),
+        ...(cloudProvider ? { cloud_provider: cloudProvider } : {}),
+        ...(hostSessionId ? { host_session_id: hostSessionId } : {}),
+        ...(note ? { note } : {}),
+        recorded_at: params.nowIso,
+      });
+    } else if (!filePath && (cloudProvider || remoteUri)) {
+      const safeUri = remoteUri
+        ? this.engine.redactor.sanitizeText(redactRemoteUrlCredentials(remoteUri)).sanitized
+        : undefined;
+      pushLocator({
+        locator_id: newId('tloc', 8),
+        stream_id: params.streamId,
+        anchor_id: params.anchorId,
+        source_label: params.sourceLabel,
+        host_kind: 'cloud_remote',
+        ...(cloudProvider ? { cloud_provider: cloudProvider } : {}),
+        ...(hostSessionId ? { host_session_id: hostSessionId } : {}),
+        ...(safeUri ? { remote_uri: safeUri } : {}),
+        ...(note ? { note } : {}),
+        recorded_at: params.nowIso,
+      });
+    }
+
+    if (params.requirePlaceholderIfEmpty && locators.length === 0) {
+      pushLocator({
+        locator_id: newId('tloc', 8),
+        stream_id: params.streamId,
+        anchor_id: params.anchorId,
+        source_label: params.sourceLabel,
+        host_kind: 'placeholder_unavailable',
+        ...(hostSessionId ? { host_session_id: hostSessionId } : {}),
+        ...(note ? { note } : {}),
+        recorded_at: params.nowIso,
+      });
+    }
+
+    return { controls, blobs, locators, redactedCount };
+  }
+
   initThread(params: {
     projectId: string;
     threadId?: string;
     mainStreamId?: string;
     workspaceDir?: string;
     summary?: string;
-  }): {
+    hostSessionId?: string;
+  } & TranscriptInputOptions): {
     project_id: string;
     thread_id: string;
     main_stream_id: string;
@@ -217,6 +376,16 @@ export class ThreadPassService {
       data: { main_stream_id: mainStreamId },
     };
 
+    const transcriptArtifacts = this.prepareTranscriptArtifacts({
+      streamId: mainStreamId,
+      anchorId,
+      sourceLabel: mainStreamId,
+      hostSessionId: params.hostSessionId,
+      nowIso,
+      options: params,
+      requirePlaceholderIfEmpty: false,
+    });
+
     const res = this.engine.executeTransaction(params.projectId, {
       thread_id: threadId,
       is_new_thread: true,
@@ -228,9 +397,14 @@ export class ThreadPassService {
           expected_parent_head: null,
           anchor,
           events: [initEvent],
+          ...(transcriptArtifacts.controls.length > 0 ? { controls: transcriptArtifacts.controls } : {}),
         },
       ],
       journal_events: [mainDesigEvent],
+      ...(Object.keys(transcriptArtifacts.blobs).length > 0 ? { blobs: transcriptArtifacts.blobs } : {}),
+      ...(params.hostSessionId
+        ? { host_bindings: [{ host_session_id: params.hostSessionId, stream_id: mainStreamId }] }
+        : {}),
     });
 
     return {
@@ -253,6 +427,8 @@ export class ThreadPassService {
       const pendingMailbox = store.db
         .prepare("SELECT * FROM mailbox_proj WHERE status != 'committed_receipt'")
         .all();
+      const transcriptLocators = store.listTranscriptLocators(threadId);
+      const layout = this.engine.getLayout(projectId, threadId);
       return {
         device_id: this.engine.identity.device_id,
         project_id: projectId,
@@ -262,6 +438,8 @@ export class ThreadPassService {
         journal_count: journal.length,
         quarantined,
         pending_mailbox: pendingMailbox,
+        transcript_locators: transcriptLocators,
+        transcript_index_path: layout.transcriptIndexJsonPath,
       };
     } finally {
       store.close();
@@ -360,7 +538,7 @@ export class ThreadPassService {
     confirmationProof?: ConfirmationProof;
     allowForeignCanonical?: boolean;
     workspaceDir?: string;
-  }): {
+  } & TranscriptInputOptions): {
     stream_id: string;
     anchor_id: string;
     txn_id: string;
@@ -369,6 +547,7 @@ export class ThreadPassService {
     continuity_level: string;
     warnings: string[];
     redacted_count: number;
+    transcript_locators: HostTranscriptLocator[];
   } {
     assertSafeIdentifier('project_id', params.projectId);
     assertSafeIdentifier('thread_id', params.threadId);
@@ -581,6 +760,24 @@ export class ThreadPassService {
       ? (params.hostSessionId ?? pkg.host_session_id)
       : undefined;
 
+    const transcriptArtifacts = this.prepareTranscriptArtifacts({
+      streamId,
+      anchorId,
+      sourceLabel: label,
+      hostSessionId: params.hostSessionId ?? pkg.host_session_id,
+      nowIso,
+      options: {
+        transcriptFilePath: params.transcriptFilePath ?? pkg.transcript_file_path,
+        machineHostname: params.machineHostname ?? pkg.machine_hostname,
+        cloudProvider: params.cloudProvider ?? pkg.cloud_provider,
+        remoteUri: params.remoteUri ?? pkg.remote_uri,
+        uploadedTranscriptText: params.uploadedTranscriptText,
+        uploadedTranscriptFilename: params.uploadedTranscriptFilename,
+        transcriptNote: params.transcriptNote,
+      },
+      requirePlaceholderIfEmpty: true,
+    });
+
     const res = this.engine.executeTransaction(params.projectId, {
       thread_id: params.threadId,
       expected_journal_head: threadRow!.journal_head_id,
@@ -591,7 +788,7 @@ export class ThreadPassService {
           anchor,
           events,
           invocations: [invocation],
-          controls: [adoptedCtrl],
+          controls: [adoptedCtrl, ...transcriptArtifacts.controls],
         },
       ],
       journal_events: [journalEv],
@@ -601,6 +798,7 @@ export class ThreadPassService {
           sync_policy: 'approved',
           media_type: 'text/plain',
         },
+        ...transcriptArtifacts.blobs,
       },
       host_bindings: hostIdToBind
         ? [{ host_session_id: hostIdToBind, stream_id: streamId }]
@@ -615,7 +813,10 @@ export class ThreadPassService {
       mode: pkg.mode,
       continuity_level: pkg.continuity_level,
       warnings,
-      redacted_count: Math.max(sanitizedRawRes.redactedCount, sanitizedPkgRes.redactedCount),
+      redacted_count:
+        Math.max(sanitizedRawRes.redactedCount, sanitizedPkgRes.redactedCount) +
+        transcriptArtifacts.redactedCount,
+      transcript_locators: transcriptArtifacts.locators,
     };
   }
 
@@ -641,6 +842,7 @@ export class ThreadPassService {
     let threadRow: ReturnType<typeof store.getThread>;
     let sources: ReconcileSourceInput[];
     let commonAncestors: string[] = [];
+    let transcriptLocators: HostTranscriptLocator[] = [];
 
     try {
       threadRow = store.getThread(params.threadId);
@@ -702,6 +904,7 @@ export class ThreadPassService {
         (id) => store.getAnchor(id)?.parents ?? null,
       );
       commonAncestors = [...preAnalysis.common];
+      transcriptLocators = store.listTranscriptLocators(params.threadId);
     } finally {
       store.close();
     }
@@ -715,6 +918,8 @@ export class ThreadPassService {
         params.mainGoal ??
         'Synthesize the selected independent AI sessions into a single unified plan and engineering checklist as ThreadPass Main.',
       targetWorkspace: targetWs,
+      transcriptLocators,
+      transcriptContext: this.getTranscriptFormatContext(params.projectId, params.threadId),
       budget: params.budget,
     });
 
@@ -755,7 +960,8 @@ export class ThreadPassService {
     receiptRawText: string;
     confirmationProof?: ConfirmationProof;
     workspaceDir?: string;
-  }): {
+    hostSessionId?: string;
+  } & TranscriptInputOptions): {
     reconciliation_id: string;
     main_stream_id: string;
     anchor_id: string;
@@ -972,6 +1178,16 @@ export class ThreadPassService {
       },
     };
 
+    const transcriptArtifacts = this.prepareTranscriptArtifacts({
+      streamId: threadRow.main_stream_id,
+      anchorId: newAnchorId,
+      sourceLabel: threadRow.main_stream_id,
+      hostSessionId: params.hostSessionId,
+      nowIso,
+      options: params,
+      requirePlaceholderIfEmpty: false,
+    });
+
     const res = this.engine.executeTransaction(params.projectId, {
       thread_id: params.threadId,
       expected_journal_head: threadRow.journal_head_id,
@@ -981,12 +1197,13 @@ export class ThreadPassService {
           expected_parent_head: mainRow.head_anchor_id,
           anchor,
           events: [injectEvent],
-          controls: [recControl],
+          controls: [recControl, ...transcriptArtifacts.controls],
         },
       ],
       journal_events: [journalEv],
       input_dependency_manifests: [depManifest],
       provenance_refs: sanitizedProvenanceRefs,
+      ...(Object.keys(transcriptArtifacts.blobs).length > 0 ? { blobs: transcriptArtifacts.blobs } : {}),
     });
 
     return {
@@ -1021,6 +1238,7 @@ export class ThreadPassService {
     let targetStreamId: string;
     let isMain: boolean;
     let headAnchor: LineageAnchor;
+    let transcriptLocators: HostTranscriptLocator[] = [];
     let pendingMsgs: Array<{
       message_id: string;
       from_stream_id: string;
@@ -1057,6 +1275,7 @@ export class ThreadPassService {
            WHERE target_stream_id = ? AND status IN ('pending', 'offered')`,
         )
         .all(targetStreamId) as typeof pendingMsgs;
+      transcriptLocators = store.listTranscriptLocators(params.threadId);
     } finally {
       store.close();
     }
@@ -1170,6 +1389,8 @@ export class ThreadPassService {
       continuityLevel: 'Prompt Reconstruction',
       workspace: ws,
       mailboxBatch: offeredBatch,
+      transcriptLocators,
+      transcriptContext: this.getTranscriptFormatContext(params.projectId, params.threadId),
       goalOverride: params.goalOverride,
       budget: params.budget,
     });
@@ -1209,12 +1430,14 @@ export class ThreadPassService {
     ackBatchId?: string;
     ackMessageIds?: string[];
     workspaceDir?: string;
-  }): {
+    hostSessionId?: string;
+  } & TranscriptInputOptions): {
     anchor_id: string;
     txn_id: string;
     accepted_mailbox_ids: string[];
     warnings: string[];
     redacted_count: number;
+    transcript_locators: HostTranscriptLocator[];
   } {
     if (!params.rawText.trim()) {
       throw new Error('ingestReply requires non-empty rawText');
@@ -1330,6 +1553,37 @@ export class ThreadPassService {
       created_at: nowIso,
     };
 
+    const transcriptArtifacts = this.prepareTranscriptArtifacts({
+      streamId: params.streamId,
+      anchorId: newAnchorId,
+      sourceLabel: params.streamId,
+      hostSessionId: params.hostSessionId ?? pkg.host_session_id,
+      nowIso,
+      options: {
+        transcriptFilePath: params.transcriptFilePath ?? pkg.transcript_file_path,
+        machineHostname: params.machineHostname ?? pkg.machine_hostname,
+        cloudProvider: params.cloudProvider ?? pkg.cloud_provider,
+        remoteUri: params.remoteUri ?? pkg.remote_uri,
+        uploadedTranscriptText: params.uploadedTranscriptText,
+        uploadedTranscriptFilename: params.uploadedTranscriptFilename,
+        transcriptNote: params.transcriptNote,
+      },
+      requirePlaceholderIfEmpty: false,
+    });
+
+    const combinedBlobs: Record<string, StagedBlobInput> = {
+      ...transcriptArtifacts.blobs,
+      ...(shouldArchiveRawBlob
+        ? {
+            ingest_snapshot: {
+              bytes: sanitizedRawSnapshot,
+              sync_policy: 'approved' as const,
+              media_type: 'text/plain',
+            },
+          }
+        : {}),
+    };
+
     const res = this.engine.executeTransaction(params.projectId, {
       thread_id: params.threadId,
       affected_streams: [
@@ -1339,20 +1593,10 @@ export class ThreadPassService {
           anchor,
           events,
           invocations: [invocation],
-          controls,
+          controls: [...controls, ...transcriptArtifacts.controls],
         },
       ],
-      ...(shouldArchiveRawBlob
-        ? {
-            blobs: {
-              ingest_snapshot: {
-                bytes: sanitizedRawSnapshot,
-                sync_policy: 'approved' as const,
-                media_type: 'text/plain',
-              },
-            },
-          }
-        : {}),
+      ...(Object.keys(combinedBlobs).length > 0 ? { blobs: combinedBlobs } : {}),
     });
 
     return {
@@ -1360,7 +1604,8 @@ export class ThreadPassService {
       txn_id: res.txn_id,
       accepted_mailbox_ids: acceptedMailboxIds,
       warnings: pkg.parse_warnings,
-      redacted_count: sanitizedPkgRes.redactedCount,
+      redacted_count: sanitizedPkgRes.redactedCount + transcriptArtifacts.redactedCount,
+      transcript_locators: transcriptArtifacts.locators,
     };
   }
 
@@ -1382,7 +1627,8 @@ export class ThreadPassService {
     requireDisasterRedundant?: boolean;
     disasterVerified?: boolean;
     actAsMain?: boolean;
-  }): {
+    hostSessionId?: string;
+  } & TranscriptInputOptions): {
     dispatch_id: string;
     worker_stream_id: string;
     worker_anchor_id: string;
@@ -1407,6 +1653,7 @@ export class ThreadPassService {
     let coordSnapshotText: string;
     let originSid: string;
     let matchedGrantId: string | undefined;
+    let existingLocators: HostTranscriptLocator[] = [];
 
     try {
       threadRow = store.getThread(params.threadId);
@@ -1477,6 +1724,7 @@ export class ThreadPassService {
       coordSnapshotText = this.engine.redactor.sanitizeText(
         canonicalJson(snapshotObj),
       ).sanitized;
+      existingLocators = store.listTranscriptLocators(params.threadId);
     } finally {
       store.close();
     }
@@ -1577,6 +1825,16 @@ export class ThreadPassService {
       },
     };
 
+    const transcriptArtifacts = this.prepareTranscriptArtifacts({
+      streamId: workerStreamId,
+      anchorId: workerAnchorId,
+      sourceLabel: workerStreamId,
+      hostSessionId: params.hostSessionId,
+      nowIso,
+      options: params,
+      requirePlaceholderIfEmpty: false,
+    });
+
     const res = this.engine.executeTransaction(params.projectId, {
       thread_id: params.threadId,
       expected_journal_head: threadRow.journal_head_id,
@@ -1586,7 +1844,7 @@ export class ThreadPassService {
           expected_parent_head: null,
           anchor: workerAnchor,
           events: [childInjectEvent],
-          controls: [capsuleCtrl],
+          controls: [capsuleCtrl, ...transcriptArtifacts.controls],
         },
       ],
       journal_events: [journalEv],
@@ -1596,6 +1854,7 @@ export class ThreadPassService {
           sync_policy: 'approved',
           media_type: 'application/json',
         },
+        ...transcriptArtifacts.blobs,
       },
     });
 
@@ -1668,7 +1927,18 @@ export class ThreadPassService {
         `When your subtask finishes, provide your findings/changes AND include ONE \`\`\`json checkpoint block citing:`,
         `- \`threadpass_handoff: true\`, \`source_label: "${workerStreamId}"\`, \`base_anchor_id: "${workerAnchorId}"\`, \`dispatch_id: "${dispatchId}"\`, \`summary_text\`, \`decisions_made\`, \`files_and_artifacts\`, \`pending_tasks\`, \`blockers\`, \`tool_errors\`.`,
       ].join('\n');
-      workerPrompt = `${roleHeader}\n\n## Scoped Parent Context\n\n${scopedCtx}\n\n## Permission Boundary\n- ${capsule.permission_boundary.join('\n- ')}\n\n## Expected Artifacts\n- ${capsule.expected_artifacts.join('\n- ')}\n\n## Return Format Reminder\n${returnReminder}`;
+      const allWorkerLocators = [...transcriptArtifacts.locators, ...existingLocators];
+      const locatorText =
+        allWorkerLocators.length > 0
+          ? formatTranscriptLocatorsSection({
+              locators: allWorkerLocators,
+              context: this.getTranscriptFormatContext(params.projectId, params.threadId),
+            })
+          : '';
+      const locatorBlock = locatorText
+        ? `\n\n## Session Transcript Locators (Machine-Scoped Paths & Reachability)\n${locatorText}`
+        : '';
+      workerPrompt = `${roleHeader}\n\n## Scoped Parent Context\n\n${scopedCtx}${locatorBlock}\n\n## Permission Boundary\n- ${capsule.permission_boundary.join('\n- ')}\n\n## Expected Artifacts\n- ${capsule.expected_artifacts.join('\n- ')}\n\n## Return Format Reminder\n${returnReminder}`;
       assertOutboundEgressSafe(this.engine.redactor, workerPrompt);
     }
 

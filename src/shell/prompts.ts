@@ -2,6 +2,7 @@ import { newHighEntropyToken, newId, sha256Hex } from '../core/canonical.js';
 import type {
   ContinuityLevel,
   EventRecord,
+  HostTranscriptLocator,
   LineageAnchor,
   ReconciliationConflict,
   ReconciliationRecord,
@@ -47,7 +48,7 @@ export function renderAdoptExtractPrompt(sourceLabel = 'source_ai'): string {
     ``,
     `Extraction rules:`,
     `- Preserve the conversation's working language (e.g., keep Chinese technical prose in Chinese while keeping code, file paths, and identifiers exact).`,
-    `- Do NOT fabricate any ThreadPass IDs (\`thr_*\`, \`strm_*\`, \`anc_*\`) if none were provided; leave \`"host_session_id": null\` unless a genuine host session ID was explicitly shown (never copy placeholder words).`,
+    `- Do NOT fabricate any ThreadPass IDs (\`thr_*\`, \`strm_*\`, \`anc_*\`) if none were provided; leave \`"host_session_id": null\`, \`"transcript_file_path": null\`, and \`"cloud_provider": null\` unless genuine values are explicitly known to you (never copy placeholder words).`,
     `- Output valid RFC-8259 JSON inside ONE \`\`\`json code block only (no commentary before/after; escape newlines/quotes properly; avoid raw triple-backtick \`\`\` inside JSON strings).`,
     ``,
     '```json',
@@ -56,6 +57,8 @@ export function renderAdoptExtractPrompt(sourceLabel = 'source_ai'): string {
     `  "handoff_mode": "model_authored",`,
     `  "source_label": "${sourceLabel}",`,
     `  "host_session_id": null,`,
+    `  "transcript_file_path": null,`,
+    `  "cloud_provider": null,`,
     `  "summary_text": "Concise summary of problem statement, architecture/conclusions reached, and current progress",`,
     `  "decisions_made": ["Locked decision + short rationale (so the next AI does not re-litigate settled choices)"],`,
     `  "files_and_artifacts": ["Exact file path, symbol, commit SHA, or verified test/command result observed in this chat"],`,
@@ -105,6 +108,8 @@ export function renderCheckpointPrompt(params: {
     `  "handoff_mode": "model_authored",`,
     `  "source_label": "${params.streamId}",`,
     `  "base_anchor_id": "${params.anchorId}",`,
+    `  "transcript_file_path": null,`,
+    `  "cloud_provider": null,`,
     `  "referenced_ids": ${JSON.stringify(params.recentEventIds.slice(-4))},`,
     `  "summary_text": "Exact progress summary since base_anchor_id and current verification status",`,
     `  "decisions_made": ["New decisions locked in this phase + rationale"],`,
@@ -153,12 +158,138 @@ function formatEventLineForEnvelope(e: EventRecord): string {
   return `[${e.event_id}][mailbox:${p.from_stream_id}->${p.target_stream_id}] ${p.text ?? ''}`;
 }
 
+export const MAX_INLINE_TRANSCRIPT_LOCATORS = 12;
+
+export interface TranscriptLocatorFormatContext {
+  currentHostname: string;
+  currentDeviceId: string;
+  threadRootDir: string;
+  transcriptIndexPath: string;
+  maxInline?: number;
+  checkFileExists?: (filePath: string) => boolean;
+  resolveThreadPath?: (relPath: string) => string;
+}
+
+export function formatTranscriptLocatorsSection(params: {
+  locators: readonly HostTranscriptLocator[];
+  context: TranscriptLocatorFormatContext;
+}): string {
+  const { locators, context } = params;
+  if (locators.length === 0) return '';
+
+  const maxInline = context.maxInline ?? MAX_INLINE_TRANSCRIPT_LOCATORS;
+  const existsFn = context.checkFileExists ?? (() => true);
+  const resolveRel =
+    context.resolveThreadPath ??
+    ((rel: string) => `${context.threadRootDir.replace(/[\\/]$/, '')}/${rel}`);
+
+  let localGreppable = 0;
+  let localMissing = 0;
+  let otherMachine = 0;
+  let uploadedBlobs = 0;
+  let cloudOnly = 0;
+  let placeholders = 0;
+
+  const formattedEntries = locators.map((loc) => {
+    let tag = '';
+    let detail = '';
+
+    if (loc.host_kind === 'local_file' && loc.file_path) {
+      const sameDevice =
+        (!loc.machine_device_id || loc.machine_device_id === context.currentDeviceId) &&
+        (!loc.machine_hostname ||
+          loc.machine_hostname.toLowerCase() === context.currentHostname.toLowerCase());
+      const hostTag = `${loc.machine_hostname ?? context.currentHostname} (${loc.machine_device_id ?? 'local'})`;
+      if (sameDevice) {
+        if (existsFn(loc.file_path)) {
+          localGreppable += 1;
+          tag = `LOCAL_GREPPABLE on ${hostTag}`;
+        } else {
+          localMissing += 1;
+          tag = `LOCAL_FILE_MISSING on ${hostTag}`;
+        }
+      } else {
+        otherMachine += 1;
+        tag = `OTHER_MACHINE: ${hostTag}`;
+      }
+      detail = `"${loc.file_path}"`;
+    } else if (loc.host_kind === 'web_uploaded_blob' && loc.uploaded_blob_rel) {
+      const absBlobPath = resolveRel(loc.uploaded_blob_rel);
+      if (existsFn(absBlobPath)) {
+        uploadedBlobs += 1;
+        tag = `UPLOADED_TRANSCRIPT_BLOB on ${context.currentHostname}`;
+      } else {
+        localMissing += 1;
+        tag = `UPLOADED_BLOB_MISSING on ${context.currentHostname}`;
+      }
+      const fname = loc.uploaded_filename ? ` (sanitized copy of ${loc.uploaded_filename})` : ' (sanitized copy)';
+      detail = `"${absBlobPath}"${fname}`;
+    } else if (loc.host_kind === 'cloud_remote') {
+      cloudOnly += 1;
+      const parts = [
+        loc.cloud_provider ? `provider=${loc.cloud_provider}` : 'provider=unknown_cloud',
+        loc.host_session_id ? `session_id=${loc.host_session_id}` : '',
+        loc.remote_uri ? `uri=${loc.remote_uri}` : '',
+      ].filter(Boolean);
+      tag = `CLOUD_ONLY / NO_LOCAL_FILE | ${parts.join(' | ')}`;
+      detail = loc.note ?? 'No local disk transcript file; reachable only via matching cloud host/provider';
+    } else {
+      placeholders += 1;
+      const parts = [
+        `stream=${loc.stream_id}`,
+        loc.host_session_id ? `session_id=${loc.host_session_id}` : '',
+      ].filter(Boolean);
+      tag = `NO_TRANSCRIPT_FILE / PLACEHOLDER | ${parts.join(' | ')}`;
+      detail = loc.note ?? 'Raw host transcript not attached or unobservable';
+    }
+
+    const line = `- [${tag}] stream=\`${loc.stream_id}\` source=\`${loc.source_label}\` -> ${detail}`;
+    return { line, hostKind: loc.host_kind, priorityBoost: loc.host_kind === 'cloud_remote' || loc.host_kind === 'web_uploaded_blob' };
+  });
+
+  // Bound inline output cleanly while preserving at least one representative of distinct kinds when truncated
+  let shown = formattedEntries;
+  let omitted = 0;
+  if (formattedEntries.length > maxInline) {
+    const picked = new Set<number>();
+    // Ensure most recent entries take priority while retaining cloud/uploaded visibility clues
+    for (let i = 0; i < formattedEntries.length && picked.size < Math.min(4, maxInline); i++) {
+      if (formattedEntries[i].priorityBoost) picked.add(i);
+    }
+    for (let i = 0; i < formattedEntries.length && picked.size < maxInline; i++) {
+      picked.add(i);
+    }
+    shown = [...picked].sort((a, b) => a - b).map((idx) => formattedEntries[idx]);
+    omitted = formattedEntries.length - shown.length;
+  }
+
+  const totalLocalReadable = localGreppable + uploadedBlobs;
+  const totalNonLocalOrUnavailable = cloudOnly + otherMachine + placeholders + localMissing;
+  const visibilityNote =
+    totalNonLocalOrUnavailable > 0
+      ? `REACHABILITY NOTICE (current_machine=${context.currentHostname}/${context.currentDeviceId}): ${totalLocalReadable} source(s) directly greppable on this machine, while ${totalNonLocalOrUnavailable} source(s) are cloud-only/other-machine/missing/placeholder. A local AI on this machine has PARTIAL raw transcript visibility and CANNOT grep CLOUD_ONLY sessions (and vice versa unless your host accesses that provider/session_id). Rely on canonical ThreadPass summaries/events above for unreachable streams.`
+      : `REACHABILITY NOTICE (current_machine=${context.currentHostname}/${context.currentDeviceId}): All ${totalLocalReadable} recorded transcript source(s) are directly readable/greppable on this machine if deeper line-level grep is needed.`;
+
+  const lines = [
+    visibilityNote,
+    ...shown.map((e) => e.line),
+  ];
+  if (omitted > 0) {
+    lines.push(
+      `(+${omitted} older transcript locator(s) archived in "${context.transcriptIndexPath}" — grep that index file if needed)`,
+    );
+  }
+  return lines.join('\n');
+}
+
 export function packReconcileEnvelope(params: {
   threadId: string;
   mainStreamId: string;
   sources: readonly ReconcileSourceInput[];
   mainGoal: string;
   targetWorkspace: WorkspaceManifest;
+  transcriptLocators?: readonly HostTranscriptLocator[];
+  transcriptContext?: TranscriptLocatorFormatContext;
   budget?: HostBudgetSpec;
 }): PackedEnvelopeResult {
   const envelopeId = newId('env', 8);
@@ -209,6 +340,23 @@ export function packReconcileEnvelope(params: {
     body: wsBody,
     content_hash: sha256Hex(wsBody),
   });
+
+  if (params.transcriptLocators && params.transcriptLocators.length > 0 && params.transcriptContext) {
+    const locBody = formatTranscriptLocatorsSection({
+      locators: params.transcriptLocators,
+      context: params.transcriptContext,
+    });
+    if (locBody) {
+      sections.push({
+        key: 'transcript_locators',
+        priority: 2,
+        title: 'Session Transcript Locators (Machine-Scoped Paths & Reachability)',
+        body: locBody,
+        content_hash: sha256Hex(locBody),
+        pointer_ref: params.transcriptContext.transcriptIndexPath,
+      });
+    }
+  }
 
   const maxEventsPerSource = 8;
   for (let i = 0; i < params.sources.length; i++) {
@@ -388,6 +536,8 @@ export function packHandoffEnvelope(params: {
     batch_id: string;
     messages: Array<{ message_id: string; from_stream_id: string; text: string }>;
   };
+  transcriptLocators?: readonly HostTranscriptLocator[];
+  transcriptContext?: TranscriptLocatorFormatContext;
   goalOverride?: string;
   budget?: HostBudgetSpec;
 }): PackedEnvelopeResult {
@@ -428,7 +578,7 @@ export function packHandoffEnvelope(params: {
     `2. **Locked Decisions & Adopted Findings:** Summarize key settled architectural decisions / reconciliation outcomes.`,
     `3. **Files, Artifacts & Workspace State:** Note branch/dirty status and key paths/artifacts mentioned.`,
     `4. **Pending Actions, Conflicts & Blockers:** List active \`next_actions\`, unresolved conflicts, and errors.`,
-    `5. **Missing Context / Gaps:** Flag anything that appears folded, omitted, or needs verification in the current workspace.`,
+    `5. **Raw Transcript Reachability & Gaps:** Note which session transcripts listed below you can grep locally vs which are cloud-only/other-machine/missing, plus any folded or omitted context.`,
   ].join('\n');
   sections.push({
     key: 'context_reception_check',
@@ -453,6 +603,23 @@ export function packHandoffEnvelope(params: {
     body: floorSummary,
     content_hash: sha256Hex(floorSummary),
   });
+
+  if (params.transcriptLocators && params.transcriptLocators.length > 0 && params.transcriptContext) {
+    const locBody = formatTranscriptLocatorsSection({
+      locators: params.transcriptLocators,
+      context: params.transcriptContext,
+    });
+    if (locBody) {
+      sections.push({
+        key: 'transcript_locators',
+        priority: 2,
+        title: 'Session Transcript Locators (Machine-Scoped Paths & Reachability)',
+        body: locBody,
+        content_hash: sha256Hex(locBody),
+        pointer_ref: params.transcriptContext.transcriptIndexPath,
+      });
+    }
+  }
 
   const latestRec = findLatestReconciliationRecord(params.lines);
   if (latestRec) {

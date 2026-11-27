@@ -1172,3 +1172,148 @@ test('Audit regressions: Grant enforcement, small per_turn_input_limit, fence tr
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('HostTranscriptLocator: local machine path, other-machine, cloud-only (partial visibility), sanitized web upload blob, placeholder, and reachability in reconcile/handoff/fork', async () => {
+  const home = makeTempHome('transcript-loc');
+  const svc = new ThreadPassService({ homeDir: home });
+  const web = await startThreadPassWeb({ service: svc, idleTimeoutMs: 60_000 });
+  const localTranscriptPath = path.join(home, 'local_agent_1.jsonl');
+  fs.writeFileSync(localTranscriptPath, '{"role":"assistant","text":"full local trace"}\n', 'utf8');
+
+  try {
+    const init = svc.initThread({ projectId: 'proj_loc', threadId: 'thr_loc', mainStreamId: 'strm_main' });
+
+    // 1. Local existing same-machine file
+    const aLocal = svc.adoptExternal({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+      sourceLabel: 'antigravity_local',
+      streamId: 'strm_local',
+      rawText: 'assistant: Local agent findings',
+      transcriptFilePath: localTranscriptPath,
+    });
+    assert.equal(aLocal.transcript_locators[0]?.host_kind, 'local_file');
+
+    // 2. Same-machine missing file
+    svc.adoptExternal({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+      sourceLabel: 'deleted_local',
+      streamId: 'strm_missing',
+      rawText: 'assistant: Missing file findings',
+      transcriptFilePath: path.join(home, 'nonexistent_trace.jsonl'),
+    });
+
+    // 3. Other machine local file
+    svc.adoptExternal({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+      sourceLabel: 'workstation_b',
+      streamId: 'strm_other_pc',
+      rawText: 'assistant: Other machine findings',
+      transcriptFilePath: '/home/joe/workstation_b/transcript_full.jsonl',
+      machineHostname: 'desktop-other-node-99',
+    });
+
+    // 4. Cloud-only session (no local transcript file)
+    svc.adoptExternal({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+      sourceLabel: 'devin_cloud',
+      streamId: 'strm_cloud',
+      rawText: 'assistant: Devin Cloud architectural fix',
+      cloudProvider: 'devin_cloud',
+      hostSessionId: 'devin_sess_77',
+    });
+
+    // 5. Optional uploaded Web transcript blob containing embedded secret -> scrubbed before storage
+    const upRes = await fetch(`http://127.0.0.1:${web.port}/api/adopt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-ThreadPass-Token': web.token },
+      body: JSON.stringify({
+        projectId: 'proj_loc',
+        threadId: 'thr_loc',
+        sourceLabel: 'web_gpt_upload',
+        rawText: 'assistant: Web chat export adopted',
+        uploadedTranscriptFilename: 'gpt-chat.txt',
+        uploadedTranscriptText: 'User: check key sk-proj-secret1234567890abcdef\nAssistant: Done.',
+      }),
+    });
+    assert.equal(upRes.status, 200);
+    const upJson = (await upRes.json()) as {
+      stream_id: string;
+      redacted_count: number;
+      transcript_locators: Array<{ host_kind: string; uploaded_blob_rel?: string }>;
+    };
+    assert.equal(upJson.redacted_count >= 1, true);
+    assert.equal(upJson.transcript_locators[0]?.host_kind, 'web_uploaded_blob');
+    const relBlob = upJson.transcript_locators[0]?.uploaded_blob_rel;
+    assert.ok(relBlob);
+    const absBlob = path.join(svc.engine.getLayout('proj_loc', 'thr_loc').rootDir, ...relBlob.split('/'));
+    const blobContent = fs.readFileSync(absBlob, 'utf8');
+    assert.equal(blobContent.includes('sk-proj-secret1234567890abcdef'), false);
+    assert.ok(blobContent.includes('[REDACTED:openai_like_key]'));
+
+    // 6. Plain adopt with neither file nor cloud nor upload -> explicit placeholder locator
+    const aPlaceholder = svc.adoptExternal({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+      sourceLabel: 'bare_paste',
+      streamId: 'strm_bare',
+      rawText: 'assistant: Pure paste without file',
+    });
+    assert.equal(aPlaceholder.transcript_locators[0]?.host_kind, 'placeholder_unavailable');
+
+    // Reconcile pack includes all reachability tags & partial visibility notice
+    const recPack = svc.packReconcile({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+    });
+    assert.ok(recPack.full_markdown.includes('Session Transcript Locators'));
+    assert.ok(recPack.full_markdown.includes('[LOCAL_GREPPABLE on'));
+    assert.ok(recPack.full_markdown.includes('[LOCAL_FILE_MISSING on'));
+    assert.ok(recPack.full_markdown.includes('[OTHER_MACHINE: desktop-other-node-99'));
+    assert.ok(recPack.full_markdown.includes('[UPLOADED_TRANSCRIPT_BLOB on'));
+    assert.ok(recPack.full_markdown.includes('[CLOUD_ONLY / NO_LOCAL_FILE | provider=devin_cloud | session_id=devin_sess_77]'));
+    assert.ok(recPack.full_markdown.includes('[NO_TRANSCRIPT_FILE / PLACEHOLDER | stream=strm_bare]'));
+    assert.ok(recPack.full_markdown.includes('PARTIAL raw transcript visibility'));
+
+    // Commit reconcile & verify packHandoff + forkDispatch preserve reachability notices cleanly
+    svc.commitReconcile({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+      sourceStreamIds: ['strm_local', 'strm_cloud', upJson.stream_id],
+      receiptRawText: JSON.stringify({
+        reconciliation_receipt: true,
+        adopted_items: ['strm_local', 'strm_cloud'],
+        conflicts: [],
+        synthesis_summary: 'Merged local + cloud + web transcript streams.',
+        next_actions: ['Verify handoff reachability'],
+      }),
+    });
+
+    const ho = svc.packHandoff({ projectId: 'proj_loc', threadId: 'thr_loc', streamId: init.main_stream_id });
+    assert.ok(ho.full_markdown.includes('Raw Transcript Reachability & Gaps'));
+    assert.ok(ho.full_markdown.includes('CLOUD_ONLY / NO_LOCAL_FILE | provider=devin_cloud'));
+    assert.ok(ho.full_markdown.includes(localTranscriptPath));
+
+    const forked = svc.forkDispatch({
+      projectId: 'proj_loc',
+      threadId: 'thr_loc',
+      workerStreamId: 'wrk_grep',
+      taskBrief: 'Grep accessible local logs and inspect cloud summary',
+    });
+    assert.ok(forked.worker_prompt?.includes('## Session Transcript Locators'));
+    assert.ok(forked.worker_prompt?.includes('LOCAL_GREPPABLE on'));
+
+    // Web HTML exposes transcript path / cloud host / upload inputs
+    const html = await (await fetch(web.url)).text();
+    assert.ok(html.includes('id="adoptTranscriptPath"'));
+    assert.ok(html.includes('id="adoptCloudHost"'));
+    assert.ok(html.includes('id="adoptUploadFile"'));
+    assert.ok(html.includes('id="forkTranscriptPath"'));
+  } finally {
+    await web.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

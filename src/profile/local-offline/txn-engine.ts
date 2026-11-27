@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {
   assertSafeIdentifier,
@@ -25,6 +26,7 @@ import {
   type ControlRecord,
   type EventRecord,
   type FsckTxnStatus,
+  type HostTranscriptLocator,
   type InputDependencyManifest,
   type JournalEventRecord,
   type LineageAnchor,
@@ -193,6 +195,9 @@ export class ThreadDirLayout {
   }
   get lineageJsonPath(): string {
     return path.join(this.rootDir, 'lineage.json');
+  }
+  get transcriptIndexJsonPath(): string {
+    return path.join(this.rootDir, 'transcript-index.json');
   }
   get historyStagingDir(): string {
     return path.join(this.rootDir, 'history', 'staging');
@@ -834,6 +839,15 @@ export class LocalOfflineEngine {
                 manifest: this.sanitizeWorkspaceManifest(ctrl.payload.manifest),
               },
             });
+          } else if (ctrl.payload.type === 'transcript_locator') {
+            lines.push({
+              ...ctrl,
+              commit_txn_id: txnId,
+              payload: {
+                type: 'transcript_locator',
+                locator: this.sanitizeTranscriptLocator(ctrl.payload.locator),
+              },
+            });
           } else {
             lines.push({ ...ctrl, commit_txn_id: txnId });
           }
@@ -1013,6 +1027,20 @@ export class LocalOfflineEngine {
       dirty_files: ws.dirty_files.map(scrub),
       untracked_files: ws.untracked_files.map(scrub),
       blind_spots: ws.blind_spots.map(scrub),
+    };
+  }
+
+  private sanitizeTranscriptLocator(loc: HostTranscriptLocator): HostTranscriptLocator {
+    const scrub = (s: string) => this.redactor.sanitizeText(s).sanitized;
+    return {
+      ...loc,
+      source_label: scrub(loc.source_label),
+      file_path: loc.file_path ? scrub(loc.file_path) : undefined,
+      cloud_provider: loc.cloud_provider ? scrub(loc.cloud_provider) : undefined,
+      host_session_id: loc.host_session_id ? scrub(loc.host_session_id) : undefined,
+      remote_uri: loc.remote_uri ? scrub(redactRemoteUrlCredentials(loc.remote_uri)) : undefined,
+      uploaded_filename: loc.uploaded_filename ? scrub(loc.uploaded_filename) : undefined,
+      note: loc.note ? scrub(loc.note) : undefined,
     };
   }
 
@@ -1470,6 +1498,8 @@ export class LocalOfflineEngine {
             shardAnchor = rec.payload.anchor;
           } else if (rec.payload.type === 'notify_receipt') {
             this.applyNotifyReceiptProj(store, rec.payload.receipt);
+          } else if (rec.payload.type === 'transcript_locator') {
+            store.upsertTranscriptLocator(manifest.thread_id, rec.payload.locator);
           } else if (rec.payload.type === 'host_binding') {
             store.db
               .prepare(
@@ -1875,9 +1905,10 @@ export class LocalOfflineEngine {
   }
 
   exportLineageJson(store: StateStore, layout: ThreadDirLayout): void {
+    const generatedAt = this.clock.wallIso();
     const data = {
       schema_version: SCHEMA_VERSION,
-      generated_at: this.clock.wallIso(),
+      generated_at: generatedAt,
       threads: store.listThreads(),
       streams: store.listStreams(),
       anchors: store.listAnchors(),
@@ -1885,6 +1916,21 @@ export class LocalOfflineEngine {
     const tmp = path.join(layout.rootDir, `.lineage.${newId('tmp', 6)}.tmp`);
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
     fs.renameSync(tmp, layout.lineageJsonPath);
+
+    const locators = store.listTranscriptLocators();
+    const indexData = {
+      schema_version: SCHEMA_VERSION,
+      generated_at: generatedAt,
+      current_machine: {
+        hostname: os.hostname(),
+        device_id: this.identity.device_id,
+      },
+      total_locators: locators.length,
+      locators,
+    };
+    const idxTmp = path.join(layout.rootDir, `.transcript-index.${newId('tmp', 6)}.tmp`);
+    fs.writeFileSync(idxTmp, JSON.stringify(indexData, null, 2), 'utf8');
+    fs.renameSync(idxTmp, layout.transcriptIndexJsonPath);
   }
 
   /**

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { sha256Hex } from '../core/canonical.js';
-import { ThreadPassService } from './service.js';
+import { ThreadPassService, type TranscriptInputOptions } from './service.js';
 import { issueConfirmationProof, normalizeConfirmationText } from './trust.js';
 import { startThreadPassWeb } from './web.js';
 
@@ -112,6 +113,27 @@ async function maybeIssueCliConfirmationProof(
   );
 }
 
+function readTranscriptOptions(
+  flags: Record<string, string | boolean>,
+): TranscriptInputOptions & { hostSessionId?: string } {
+  const uploadPath = strFlag(flags, 'upload-transcript');
+  let uploadedTranscriptText: string | undefined;
+  let uploadedTranscriptFilename: string | undefined;
+  if (uploadPath) {
+    uploadedTranscriptText = fs.readFileSync(uploadPath, 'utf8');
+    uploadedTranscriptFilename = path.basename(uploadPath);
+  }
+  return {
+    transcriptFilePath: strFlag(flags, 'transcript-file'),
+    machineHostname: strFlag(flags, 'machine'),
+    cloudProvider: strFlag(flags, 'cloud-host'),
+    remoteUri: strFlag(flags, 'remote-uri'),
+    hostSessionId: strFlag(flags, 'host-session-id'),
+    uploadedTranscriptText,
+    uploadedTranscriptFilename,
+  };
+}
+
 function printHelp(): void {
   console.log(`ThreadPass CLI (thp) — Pure Node.js local-offline kernel & prompt shell
 
@@ -120,12 +142,12 @@ Usage:
   thp status --project <id> --thread <id>
   thp prompt adopt-extract [--source <label>]
   thp prompt checkpoint --project <id> --thread <id> [--stream <id>]
-  thp adopt --project <id> --thread <id> --source <label> (--file <path> | --text <str>) [--authorize] [--workspace <dir>]
+  thp adopt --project <id> --thread <id> --source <label> (--file <path> | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--machine <host>] [--cloud-host <provider>] [--remote-uri <url>] [--host-session-id <id>] [--upload-transcript <path>]
   thp reconcile pack --project <id> --thread <id> [--sources s1,s2,...] [--goal <text>] [--workspace <dir>] [--attachment]
-  thp reconcile commit --project <id> --thread <id> --sources s1,s2,... (--file <path> | --text <str>) [--authorize] [--workspace <dir>]
+  thp reconcile commit --project <id> --thread <id> --sources s1,s2,... (--file <path> | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
   thp handoff pack --project <id> --thread <id> [--stream <id>] [--goal <text>] [--workspace <dir>] [--attachment]
-  thp ingest --project <id> --thread <id> --stream <id> (--file <path> | --text <str>) [--authorize] [--ack-batch <batch_id> --ack-msgs m1,m2] [--workspace <dir>]
-  thp fork --project <id> --thread <id> --task <brief> [--origin <stream>] [--worker <stream>] [--workspace <dir>] [--act-as-main]
+  thp ingest --project <id> --thread <id> --stream <id> (--file <path> | --text <str>) [--authorize] [--ack-batch <batch_id> --ack-msgs m1,m2] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
+  thp fork --project <id> --thread <id> --task <brief> [--origin <stream>] [--worker <stream>] [--workspace <dir>] [--act-as-main] [--transcript-file <path>] [--cloud-host <provider>]
   thp grant issue --project <id> --thread <id> --grantee <stream> --max-spawns <n> [--issuer <stream>] [--parent-grant <id>] [--max-depth <n>] [--can-redelegate]
   thp grant revoke --project <id> --thread <id> --grant <id> [--reason <text>]
   thp mailbox send --project <id> --thread <id> --from <stream> --to <stream> --text <msg>
@@ -184,6 +206,7 @@ async function main(): Promise<void> {
   if (cmd === 'adopt') {
     const rawText = readInputText(flags);
     const proof = await maybeIssueCliConfirmationProof(flags, rawText);
+    const tOpts = readTranscriptOptions(flags);
     const out = svc.adoptExternal({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
@@ -192,6 +215,7 @@ async function main(): Promise<void> {
       confirmationProof: proof,
       allowForeignCanonical: flags['foreign-canonical'] === true,
       workspaceDir: strFlag(flags, 'workspace'),
+      ...tOpts,
     });
     console.log(JSON.stringify(out, null, 2));
     return;
@@ -214,6 +238,7 @@ async function main(): Promise<void> {
   if (cmd === 'reconcile' && sub === 'commit') {
     const rawText = readInputText(flags);
     const proof = await maybeIssueCliConfirmationProof(flags, rawText);
+    const tOpts = readTranscriptOptions(flags);
     const out = svc.commitReconcile({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
@@ -221,6 +246,7 @@ async function main(): Promise<void> {
       receiptRawText: rawText,
       confirmationProof: proof,
       workspaceDir: strFlag(flags, 'workspace'),
+      ...tOpts,
     });
     console.log(JSON.stringify(out, null, 2));
     return;
@@ -244,6 +270,7 @@ async function main(): Promise<void> {
     const proof = await maybeIssueCliConfirmationProof(flags, rawText);
     const ackBatch = strFlag(flags, 'ack-batch');
     const ackMsgs = strFlag(flags, 'ack-msgs');
+    const tOpts = readTranscriptOptions(flags);
     const out = svc.ingestReply({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
@@ -253,12 +280,14 @@ async function main(): Promise<void> {
       ackBatchId: ackBatch,
       ackMessageIds: ackMsgs ? ackMsgs.split(',').filter(Boolean) : undefined,
       workspaceDir: strFlag(flags, 'workspace'),
+      ...tOpts,
     });
     console.log(JSON.stringify(out, null, 2));
     return;
   }
 
   if (cmd === 'fork') {
+    const tOpts = readTranscriptOptions(flags);
     const out = svc.forkDispatch({
       projectId: reqFlag(flags, 'project'),
       threadId: reqFlag(flags, 'thread'),
@@ -269,6 +298,7 @@ async function main(): Promise<void> {
       requireDisasterRedundant: flags['require-disaster-redundant'] === true,
       disasterVerified: flags['disaster-verified'] === true,
       actAsMain: flags['act-as-main'] === true,
+      ...tOpts,
     });
     console.log(JSON.stringify(out, null, 2));
     return;

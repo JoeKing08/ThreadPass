@@ -2,7 +2,11 @@
 
 跨宿主 AI 会话连续性内核与参考应用薄壳（`Pure Core ← Local-Offline Profile ← Application Shell`），支持纯 Node.js（`>= 22.18.0`）零第三方运行时依赖跨平台运行（Windows / macOS / Linux）。
 
-- 架构宪章与系统不变量：[docs/threadpass-architecture-baseline.md](docs/threadpass-architecture-baseline.md)
+- **核心概念区分（避免混淆）：**
+  - **逻辑主会话（`thp` Main）**：ThreadPass 内核中由 `main_designated` 锚定的唯一权威逻辑主线。**任何时候，任何外部 Agent 框架里的原生会话文件都不是主会话。**
+  - **宿主原生会话**：IDE/CLI/Web 里的具体窗口或本地/云端对话记录，只是临时承载逻辑流的工作载体。
+  - **当前主 Agent**：此时此刻正在替逻辑主会话值班干活的那一个 AI 实例（哪怕全场只有 1 个 AI，它也只是“当前主 Agent”，换窗口/换模型不换主会话）。
+- **宿主会话日志定位、Web 可选上传与可达性标记：** 支持在 `adopt` / `ingest` / `reconcile commit` / `fork` 时记录带机器归属（`hostname + device_id + file_path`）的原生会话文件路径（`--transcript-file`）、从 Web 上传并自动脱敏归档会话副本（`--upload-transcript`）或标注纯云端来源（`--cloud-host` / `--host-session-id`）。打包信封时会自动标注本机可 `grep`、异机、已上传或仅云端占位等可达性状态，溢出时写入 `transcript-index.json`。
 
 ## 三层目录结构
 

@@ -314,6 +314,31 @@ export interface BatonHandoffRecord {
   issued_at: string;
 }
 
+export type HostTranscriptKind =
+  | 'local_file'
+  | 'web_uploaded_blob'
+  | 'cloud_remote'
+  | 'placeholder_unavailable';
+
+export interface HostTranscriptLocator {
+  locator_id: string;
+  stream_id: string;
+  anchor_id?: string;
+  source_label: string;
+  host_kind: HostTranscriptKind;
+  machine_hostname?: string;
+  machine_device_id?: string;
+  file_path?: string;
+  cloud_provider?: string;
+  host_session_id?: string;
+  remote_uri?: string;
+  uploaded_blob_sha256?: string;
+  uploaded_blob_rel?: string;
+  uploaded_filename?: string;
+  note?: string;
+  recorded_at: string;
+}
+
 export type ControlPayload =
   | { type: 'anchor'; anchor: LineageAnchor }
   | { type: 'blob_manifest'; entries: BlobManifestEntry[] }
@@ -328,6 +353,7 @@ export type ControlPayload =
   | { type: 'recovery_record'; record: RecoveryRecord }
   | { type: 'baton_handoff'; baton: BatonHandoffRecord }
   | { type: 'host_binding'; host_session_id: string; stream_id: string }
+  | { type: 'transcript_locator'; locator: HostTranscriptLocator }
   | { type: 'unknown'; original_type: string; raw_json: string; blob_ref?: string };
 
 export interface ControlRecord {
