@@ -10,6 +10,7 @@ import { startThreadPassWeb } from './web.js';
 interface ParsedArgs {
   positional: string[];
   flags: Record<string, string | boolean>;
+  files: string[];
 }
 
 const BOOLEAN_FLAGS = new Set([
@@ -28,17 +29,22 @@ const BOOLEAN_FLAGS = new Set([
 function parseCliArgs(argv: string[]): ParsedArgs {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
+  const files: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
       const eq = arg.indexOf('=');
       if (eq > 2) {
-        flags[arg.slice(2, eq)] = arg.slice(eq + 1);
+        const key = arg.slice(2, eq);
+        const val = arg.slice(eq + 1);
+        flags[key] = val;
+        if (key === 'file') files.push(val);
       } else {
         const key = arg.slice(2);
         const next = argv[i + 1];
         if (!BOOLEAN_FLAGS.has(key) && next !== undefined && !next.startsWith('--')) {
           flags[key] = next;
+          if (key === 'file') files.push(next);
           i += 1;
         } else {
           flags[key] = true;
@@ -48,7 +54,7 @@ function parseCliArgs(argv: string[]): ParsedArgs {
       positional.push(arg);
     }
   }
-  return { positional, flags };
+  return { positional, flags, files };
 }
 
 function strFlag(flags: Record<string, string | boolean>, name: string): string | undefined {
@@ -62,15 +68,16 @@ function reqFlag(flags: Record<string, string | boolean>, name: string): string 
   return v;
 }
 
-function readInputText(flags: Record<string, string | boolean>): string {
-  const filePath = strFlag(flags, 'file');
-  if (filePath) return fs.readFileSync(filePath, 'utf8');
-  const text = strFlag(flags, 'text');
+function readInputText(parsed: ParsedArgs): string {
+  if (parsed.files.length > 0) {
+    return parsed.files.map((f) => fs.readFileSync(f, 'utf8')).join('\n\n');
+  }
+  const text = strFlag(parsed.flags, 'text');
   if (text !== undefined) return text;
   if (!process.stdin.isTTY) {
     return fs.readFileSync(0, 'utf8');
   }
-  throw new Error('Provide input via --file <path>, --text <string>, or stdin');
+  throw new Error('Provide input via --file <path> (repeatable for multipart outputs), --text <string>, or stdin');
 }
 
 async function maybeIssueCliConfirmationProof(
@@ -142,11 +149,11 @@ Usage:
   thp status --project <id> --thread <id>
   thp prompt adopt-extract [--source <label>]
   thp prompt checkpoint --project <id> --thread <id> [--stream <id>]
-  thp adopt --project <id> --thread <id> --source <label> (--file <path> | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--machine <host>] [--cloud-host <provider>] [--remote-uri <url>] [--host-session-id <id>] [--upload-transcript <path>]
+  thp adopt --project <id> --thread <id> --source <label> (--file <path>... | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--machine <host>] [--cloud-host <provider>] [--remote-uri <url>] [--host-session-id <id>] [--upload-transcript <path>]
   thp reconcile pack --project <id> --thread <id> [--sources s1,s2,...] [--goal <text>] [--workspace <dir>] [--attachment]
-  thp reconcile commit --project <id> --thread <id> --sources s1,s2,... (--file <path> | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
+  thp reconcile commit --project <id> --thread <id> --sources s1,s2,... (--file <path>... | --text <str>) [--authorize] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
   thp handoff pack --project <id> --thread <id> [--stream <id>] [--goal <text>] [--workspace <dir>] [--attachment]
-  thp ingest --project <id> --thread <id> --stream <id> (--file <path> | --text <str>) [--authorize] [--ack-batch <batch_id> --ack-msgs m1,m2] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
+  thp ingest --project <id> --thread <id> --stream <id> (--file <path>... | --text <str>) [--authorize] [--ack-batch <batch_id> --ack-msgs m1,m2] [--workspace <dir>] [--transcript-file <path>] [--upload-transcript <path>]
   thp fork --project <id> --thread <id> --task <brief> [--origin <stream>] [--worker <stream>] [--workspace <dir>] [--act-as-main] [--transcript-file <path>] [--cloud-host <provider>]
   thp grant issue --project <id> --thread <id> --grantee <stream> --max-spawns <n> [--issuer <stream>] [--parent-grant <id>] [--max-depth <n>] [--can-redelegate]
   thp grant revoke --project <id> --thread <id> --grant <id> [--reason <text>]
@@ -160,7 +167,8 @@ Usage:
 }
 
 async function main(): Promise<void> {
-  const { positional, flags } = parseCliArgs(process.argv.slice(2));
+  const parsed = parseCliArgs(process.argv.slice(2));
+  const { positional, flags } = parsed;
   if (positional.length === 0 || flags.help || positional[0] === 'help') {
     printHelp();
     return;
@@ -204,7 +212,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'adopt') {
-    const rawText = readInputText(flags);
+    const rawText = readInputText(parsed);
     const proof = await maybeIssueCliConfirmationProof(flags, rawText);
     const tOpts = readTranscriptOptions(flags);
     const out = svc.adoptExternal({
@@ -236,7 +244,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'reconcile' && sub === 'commit') {
-    const rawText = readInputText(flags);
+    const rawText = readInputText(parsed);
     const proof = await maybeIssueCliConfirmationProof(flags, rawText);
     const tOpts = readTranscriptOptions(flags);
     const out = svc.commitReconcile({
@@ -266,7 +274,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'ingest') {
-    const rawText = readInputText(flags);
+    const rawText = readInputText(parsed);
     const proof = await maybeIssueCliConfirmationProof(flags, rawText);
     const ackBatch = strFlag(flags, 'ack-batch');
     const ackMsgs = strFlag(flags, 'ack-msgs');

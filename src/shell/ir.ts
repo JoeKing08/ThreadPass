@@ -1,4 +1,4 @@
-import { deterministicEventId, newId, sha256Hex } from '../core/canonical.js';
+import { canonicalJson, deterministicEventId, newId, sha256Hex } from '../core/canonical.js';
 import {
   SCHEMA_VERSION,
   type ContinuityLevel,
@@ -13,6 +13,18 @@ export interface ParsedTurnMessage {
   role: 'user' | 'assistant' | 'tool';
   text: string;
   source_ref?: string;
+}
+
+export interface AssembledMultipartInfo {
+  group_id: string;
+  total_parts: number;
+}
+
+export class IncompleteMultipartOutputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IncompleteMultipartOutputError';
+  }
 }
 
 export interface ParsedAdoptPackage {
@@ -35,8 +47,15 @@ export interface ParsedAdoptPackage {
   tool_errors: string[];
   referenced_ids: string[];
   mailbox_ack?: { batch_id: string; message_ids: string[] };
+  assembled_parts?: AssembledMultipartInfo;
   parse_warnings: string[];
   raw_text: string;
+}
+
+export interface ExtractedJsonObjectsResult {
+  objects: Record<string, unknown>[];
+  looksLikeJson: boolean;
+  parseWarning?: string;
 }
 
 export interface ExtractedJsonResult {
@@ -102,32 +121,44 @@ function scanBalancedJsonObjects(text: string): Record<string, unknown>[] {
 }
 
 /**
- * Extracts a structured JSON object without relying on non-greedy code-fence regexes,
- * so embedded triple backticks inside JSON strings, bare fences, or surrounding prose
+ * Extracts one or more structured JSON objects without relying on non-greedy code-fence regexes,
+ * so embedded triple backticks inside JSON strings, bare fences, multipart chunks, or prose
  * never truncate extraction.
  */
-export function extractStructuredJsonObject(
+export function extractStructuredJsonObjects(
   rawText: string,
   expectedKeys: readonly string[],
-): ExtractedJsonResult {
+): ExtractedJsonObjectsResult {
   const trimmed = rawText.trim();
   if (!trimmed) {
-    return { obj: null, looksLikeJson: false };
+    return { objects: [], looksLikeJson: false };
   }
 
   const hasExpectedKey = (obj: Record<string, unknown>): boolean =>
+    expectedKeys.length === 0 ||
     expectedKeys.some((k) => Object.prototype.hasOwnProperty.call(obj, k));
 
   const looksLikeJson = expectedKeys.some((k) =>
     new RegExp(`"${k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s*:`).test(trimmed),
   );
 
-  // 1. Fast path if whole input is already valid JSON
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+  // 1. Fast path if whole input is already valid JSON object or array of objects
+  if (
+    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))
+  ) {
     try {
       const parsed: unknown = JSON.parse(trimmed);
-      if (isPlainObject(parsed) && (hasExpectedKey(parsed) || expectedKeys.length === 0)) {
-        return { obj: parsed, looksLikeJson: true };
+      if (isPlainObject(parsed) && hasExpectedKey(parsed)) {
+        return { objects: [parsed], looksLikeJson: true };
+      }
+      if (Array.isArray(parsed)) {
+        const matched = parsed.filter(
+          (item): item is Record<string, unknown> => isPlainObject(item) && hasExpectedKey(item),
+        );
+        if (matched.length > 0) {
+          return { objects: matched, looksLikeJson: true };
+        }
       }
     } catch {
       // Fall through to fence and balanced scan
@@ -145,11 +176,9 @@ export function extractStructuredJsonObject(
   const collectFromFence = () => {
     if (fenceLang === '' || fenceLang === 'json') {
       const inner = fenceBuf.join('\n').trimStart();
-      if (inner.startsWith('{')) {
-        const objs = scanBalancedJsonObjects(inner);
-        if (objs.length > 0 && hasExpectedKey(objs[0])) {
-          fencedMatches.push(objs[0]);
-        }
+      if (inner.startsWith('{') || inner.startsWith('[')) {
+        const objs = scanBalancedJsonObjects(inner).filter(hasExpectedKey);
+        fencedMatches.push(...objs);
       }
     }
     fenceLang = '';
@@ -175,24 +204,182 @@ export function extractStructuredJsonObject(
     collectFromFence();
   }
   if (fencedMatches.length > 0) {
-    return { obj: fencedMatches[fencedMatches.length - 1], looksLikeJson: true };
+    return { objects: fencedMatches, looksLikeJson: true };
   }
 
   // 3. Scan top-level balanced JSON objects anywhere in rawText
   const topLevel = scanBalancedJsonObjects(trimmed).filter(hasExpectedKey);
   if (topLevel.length > 0) {
-    return { obj: topLevel[topLevel.length - 1], looksLikeJson: true };
+    return { objects: topLevel, looksLikeJson: true };
   }
 
   if (looksLikeJson) {
     return {
-      obj: null,
+      objects: [],
       looksLikeJson: true,
       parseWarning:
         'Detected ThreadPass JSON key(s) in input, but valid RFC-8259 JSON extraction failed (check unescaped quotes/newlines or truncated brace); fell back safely.',
     };
   }
-  return { obj: null, looksLikeJson: false };
+  return { objects: [], looksLikeJson: false };
+}
+
+export function extractStructuredJsonObject(
+  rawText: string,
+  expectedKeys: readonly string[],
+): ExtractedJsonResult {
+  const res = extractStructuredJsonObjects(rawText, expectedKeys);
+  return {
+    obj: res.objects.length > 0 ? res.objects[res.objects.length - 1] : null,
+    looksLikeJson: res.looksLikeJson,
+    parseWarning: res.parseWarning,
+  };
+}
+
+function hasMultipartFields(obj: Record<string, unknown>): boolean {
+  return (
+    (obj.part_index !== undefined && obj.part_index !== null) ||
+    (obj.total_parts !== undefined && obj.total_parts !== null) ||
+    (typeof obj.part_group_id === 'string' && obj.part_group_id.trim().length > 0) ||
+    typeof obj.is_final === 'boolean'
+  );
+}
+
+/**
+ * Validates and orders single- or multi-part model JSON outputs.
+ * When multipart envelope metadata is present, enforces group consistency,
+ * duplicate conflict detection, missing-part fail-closed erroring, and final-part termination.
+ */
+export function assembleMultipartObjects(objects: readonly Record<string, unknown>[]): {
+  parts: Record<string, unknown>[];
+  multipart?: AssembledMultipartInfo;
+} {
+  if (objects.length === 0) {
+    return { parts: [] };
+  }
+  const mpObjs = objects.filter(hasMultipartFields);
+  if (mpObjs.length === 0) {
+    return { parts: [objects[objects.length - 1]] };
+  }
+
+  const groupIds = new Set<string>();
+  const declaredTotals = new Set<number>();
+  const byIndex = new Map<number, Record<string, unknown>>();
+  const finalIndices = new Set<number>();
+  const nonFinalIndices = new Set<number>();
+
+  for (const obj of mpObjs) {
+    if (typeof obj.part_group_id === 'string' && obj.part_group_id.trim()) {
+      groupIds.add(obj.part_group_id.trim());
+    }
+    const idx = obj.part_index;
+    if (typeof idx !== 'number' || !Number.isInteger(idx) || idx < 1) {
+      throw new IncompleteMultipartOutputError(
+        `Multipart output entry is missing a valid positive integer part_index (got ${JSON.stringify(idx)})`,
+      );
+    }
+    if (obj.total_parts !== undefined && obj.total_parts !== null) {
+      const tot = obj.total_parts;
+      if (typeof tot !== 'number' || !Number.isInteger(tot) || tot < 1) {
+        throw new IncompleteMultipartOutputError(
+          `Multipart output part ${idx} has invalid total_parts (${JSON.stringify(tot)})`,
+        );
+      }
+      declaredTotals.add(tot);
+    }
+    const existing = byIndex.get(idx);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(obj)) {
+        throw new IncompleteMultipartOutputError(
+          `Conflicting duplicate payload for part_index=${idx}`,
+        );
+      }
+    } else {
+      byIndex.set(idx, obj);
+    }
+    if (obj.is_final === true) {
+      finalIndices.add(idx);
+    } else if (obj.is_final === false) {
+      nonFinalIndices.add(idx);
+    }
+  }
+
+  if (groupIds.size > 1) {
+    throw new IncompleteMultipartOutputError(
+      `Conflicting part_group_id values in pasted multipart output: ${[...groupIds].join(', ')}`,
+    );
+  }
+  if (declaredTotals.size > 1) {
+    throw new IncompleteMultipartOutputError(
+      `Conflicting total_parts declarations in multipart output: ${[...declaredTotals].join(', ')}`,
+    );
+  }
+
+  const groupId = [...groupIds][0] ?? 'default';
+  let expectedTotal: number;
+
+  if (declaredTotals.size === 1) {
+    expectedTotal = [...declaredTotals][0];
+    for (const idx of byIndex.keys()) {
+      if (idx > expectedTotal) {
+        throw new IncompleteMultipartOutputError(
+          `Multipart output (group=${groupId}) has part_index=${idx} exceeding total_parts=${expectedTotal}`,
+        );
+      }
+    }
+    for (const idx of finalIndices) {
+      if (idx !== expectedTotal) {
+        throw new IncompleteMultipartOutputError(
+          `Multipart output (group=${groupId}) marked part ${idx} as is_final=true before total_parts=${expectedTotal}`,
+        );
+      }
+    }
+    if (nonFinalIndices.has(expectedTotal)) {
+      throw new IncompleteMultipartOutputError(
+        `Multipart output (group=${groupId}) marked final part ${expectedTotal} with is_final=false`,
+      );
+    }
+  } else {
+    if (finalIndices.size === 0) {
+      throw new IncompleteMultipartOutputError(
+        `Incomplete multipart output (group=${groupId}): received part(s) ${[...byIndex.keys()].sort((a, b) => a - b).join(', ')} but no part has is_final=true`,
+      );
+    }
+    if (finalIndices.size > 1) {
+      throw new IncompleteMultipartOutputError(
+        `Conflicting is_final=true on multiple parts (${[...finalIndices].sort((a, b) => a - b).join(', ')}) in group=${groupId}`,
+      );
+    }
+    expectedTotal = [...finalIndices][0];
+    for (const idx of byIndex.keys()) {
+      if (idx > expectedTotal) {
+        throw new IncompleteMultipartOutputError(
+          `Multipart output (group=${groupId}) has part_index=${idx} after final part ${expectedTotal}`,
+        );
+      }
+    }
+  }
+
+  const missing: number[] = [];
+  const ordered: Record<string, unknown>[] = [];
+  for (let i = 1; i <= expectedTotal; i++) {
+    const entry = byIndex.get(i);
+    if (!entry) {
+      missing.push(i);
+    } else {
+      ordered.push(entry);
+    }
+  }
+  if (missing.length > 0) {
+    throw new IncompleteMultipartOutputError(
+      `Incomplete multipart output (group=${groupId}): missing part(s) ${missing.join(', ')} of ${expectedTotal}`,
+    );
+  }
+
+  return {
+    parts: ordered,
+    multipart: { group_id: groupId, total_parts: expectedTotal },
+  };
 }
 
 export function normalizeOptionalMetaString(value: unknown): string | undefined {
@@ -266,7 +453,7 @@ export function parseExternalConversationInput(
   sourceLabel = 'external_ai',
 ): ParsedAdoptPackage {
   const trimmed = rawText.trim();
-  const extracted = extractStructuredJsonObject(trimmed, [
+  const extracted = extractStructuredJsonObjects(trimmed, [
     'threadpass_handoff',
     'handoff_mode',
     'summary_text',
@@ -277,52 +464,142 @@ export function parseExternalConversationInput(
     parseWarnings.push(extracted.parseWarning);
   }
 
-  if (extracted.obj) {
-    const obj = extracted.obj;
-    const mode: HandoffMode =
-      obj.handoff_mode === 'evidence_based' ? 'evidence_based' : 'model_authored';
-    const turns: ParsedTurnMessage[] = Array.isArray(obj.recent_turns)
-      ? (obj.recent_turns as Array<Record<string, unknown>>).map((t, idx) => ({
-          role:
-            t.role === 'user' || t.role === 'assistant' || t.role === 'tool'
+  if (extracted.objects.length > 0) {
+    const assembled = assembleMultipartObjects(extracted.objects);
+    const parts = assembled.parts;
+
+    const dedupPush = (target: string[], seen: Set<string>, items: readonly string[]) => {
+      for (const s of items) {
+        if (!seen.has(s)) {
+          seen.add(s);
+          target.push(s);
+        }
+      }
+    };
+
+    let mode: HandoffMode = 'model_authored';
+    let resolvedLabel: string | undefined;
+    let hostSessionId: string | undefined;
+    let transcriptFilePath: string | undefined;
+    let machineHostname: string | undefined;
+    let cloudProvider: string | undefined;
+    let remoteUri: string | undefined;
+
+    const summaries: string[] = [];
+    const seenSummaries = new Set<string>();
+    const turns: ParsedTurnMessage[] = [];
+    const seenTurnKeys = new Set<string>();
+    const claimedUserQuotes: string[] = [];
+    const seenQuotes = new Set<string>();
+    const decisionsMade: string[] = [];
+    const seenDecisions = new Set<string>();
+    const filesAndArtifacts: string[] = [];
+    const seenFiles = new Set<string>();
+    const openQuestions: string[] = [];
+    const seenQuestions = new Set<string>();
+    const pendingTasks: string[] = [];
+    const seenTasks = new Set<string>();
+    const blockers: string[] = [];
+    const seenBlockers = new Set<string>();
+    const toolErrors: string[] = [];
+    const seenErrors = new Set<string>();
+    const referencedIds: string[] = [];
+    const seenRefs = new Set<string>();
+
+    let ackBatchId: string | undefined;
+    const ackMessageIds: string[] = [];
+    const seenAckMsgIds = new Set<string>();
+
+    for (const obj of parts) {
+      if (obj.handoff_mode === 'evidence_based') {
+        mode = 'evidence_based';
+      }
+      if (!resolvedLabel && typeof obj.source_label === 'string' && obj.source_label.trim()) {
+        resolvedLabel = obj.source_label.trim();
+      }
+      hostSessionId ??= normalizeHostSessionId(obj.host_session_id);
+      transcriptFilePath ??= normalizeOptionalMetaString(obj.transcript_file_path);
+      machineHostname ??= normalizeOptionalMetaString(obj.machine_hostname);
+      cloudProvider ??= normalizeOptionalMetaString(obj.cloud_provider);
+      remoteUri ??= normalizeOptionalMetaString(obj.remote_uri);
+
+      const rawSummary = String(obj.summary_text ?? obj.summary ?? '').trim();
+      if (rawSummary && !seenSummaries.has(rawSummary)) {
+        seenSummaries.add(rawSummary);
+        summaries.push(rawSummary);
+      }
+
+      if (Array.isArray(obj.recent_turns)) {
+        for (let idx = 0; idx < obj.recent_turns.length; idx++) {
+          const t = obj.recent_turns[idx] as Record<string, unknown>;
+          const role: ParsedTurnMessage['role'] =
+            t?.role === 'user' || t?.role === 'assistant' || t?.role === 'tool'
               ? t.role
-              : 'assistant',
-          text: String(t.text ?? t.content ?? ''),
-          source_ref: String(t.source_ref ?? `turn_${idx + 1}`),
-        }))
-      : [];
-    return {
-      mode,
-      continuity_level:
-        mode === 'evidence_based' ? 'Evidence Recovery' : 'Prompt Reconstruction',
-      source_label: String(obj.source_label ?? sourceLabel),
-      host_session_id: normalizeHostSessionId(obj.host_session_id),
-      transcript_file_path: normalizeOptionalMetaString(obj.transcript_file_path),
-      machine_hostname: normalizeOptionalMetaString(obj.machine_hostname),
-      cloud_provider: normalizeOptionalMetaString(obj.cloud_provider),
-      remote_uri: normalizeOptionalMetaString(obj.remote_uri),
-      claimed_user_quotes: normalizeStringArray(obj.claimed_user_quotes),
-      decisions_made: normalizeStringArray(obj.decisions_made),
-      files_and_artifacts: normalizeStringArray(obj.files_and_artifacts),
-      open_questions: normalizeStringArray(obj.open_questions),
-      summary_text: String(obj.summary_text ?? obj.summary ?? ''),
-      recent_turns: turns,
-      pending_tasks: normalizeStringArray(obj.pending_tasks),
-      blockers: normalizeStringArray(obj.blockers),
-      tool_errors: normalizeStringArray(obj.tool_errors),
-      referenced_ids: normalizeStringArray(obj.referenced_ids),
-      mailbox_ack:
+              : 'assistant';
+          const text = String(t?.text ?? t?.content ?? '');
+          const sourceRef = String(t?.source_ref ?? `turn_${turns.length + 1}`);
+          const dedupKey = `${role}|${sourceRef}|${text}`;
+          if (!seenTurnKeys.has(dedupKey)) {
+            seenTurnKeys.add(dedupKey);
+            turns.push({ role, text, source_ref: sourceRef });
+          }
+        }
+      }
+
+      dedupPush(claimedUserQuotes, seenQuotes, normalizeStringArray(obj.claimed_user_quotes));
+      dedupPush(decisionsMade, seenDecisions, normalizeStringArray(obj.decisions_made));
+      dedupPush(filesAndArtifacts, seenFiles, normalizeStringArray(obj.files_and_artifacts));
+      dedupPush(openQuestions, seenQuestions, normalizeStringArray(obj.open_questions));
+      dedupPush(pendingTasks, seenTasks, normalizeStringArray(obj.pending_tasks));
+      dedupPush(blockers, seenBlockers, normalizeStringArray(obj.blockers));
+      dedupPush(toolErrors, seenErrors, normalizeStringArray(obj.tool_errors));
+      dedupPush(referencedIds, seenRefs, normalizeStringArray(obj.referenced_ids));
+
+      if (
         obj.mailbox_ack &&
         typeof obj.mailbox_ack === 'object' &&
         typeof (obj.mailbox_ack as Record<string, unknown>).batch_id === 'string' &&
         Array.isArray((obj.mailbox_ack as Record<string, unknown>).message_ids)
-          ? {
-              batch_id: String((obj.mailbox_ack as Record<string, unknown>).batch_id),
-              message_ids: (
-                (obj.mailbox_ack as Record<string, unknown>).message_ids as unknown[]
-              ).map(String),
-            }
-          : undefined,
+      ) {
+        const mb = obj.mailbox_ack as Record<string, unknown>;
+        const bid = String(mb.batch_id);
+        if (ackBatchId && ackBatchId !== bid) {
+          throw new IncompleteMultipartOutputError(
+            `Conflicting mailbox_ack.batch_id across multipart output (${ackBatchId} vs ${bid})`,
+          );
+        }
+        ackBatchId = bid;
+        for (const mid of (mb.message_ids as unknown[]).map(String)) {
+          if (!seenAckMsgIds.has(mid)) {
+            seenAckMsgIds.add(mid);
+            ackMessageIds.push(mid);
+          }
+        }
+      }
+    }
+
+    return {
+      mode,
+      continuity_level:
+        mode === 'evidence_based' ? 'Evidence Recovery' : 'Prompt Reconstruction',
+      source_label: resolvedLabel ?? sourceLabel,
+      host_session_id: hostSessionId,
+      transcript_file_path: transcriptFilePath,
+      machine_hostname: machineHostname,
+      cloud_provider: cloudProvider,
+      remote_uri: remoteUri,
+      claimed_user_quotes: claimedUserQuotes,
+      decisions_made: decisionsMade,
+      files_and_artifacts: filesAndArtifacts,
+      open_questions: openQuestions,
+      summary_text: summaries.join('\n\n'),
+      recent_turns: turns,
+      pending_tasks: pendingTasks,
+      blockers: blockers,
+      tool_errors: toolErrors,
+      referenced_ids: referencedIds,
+      mailbox_ack: ackBatchId ? { batch_id: ackBatchId, message_ids: ackMessageIds } : undefined,
+      ...(assembled.multipart ? { assembled_parts: assembled.multipart } : {}),
       parse_warnings: parseWarnings,
       raw_text: trimmed,
     };

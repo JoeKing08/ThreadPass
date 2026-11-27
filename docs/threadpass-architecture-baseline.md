@@ -405,6 +405,7 @@ ThreadPass 架构宪章分为三个规范性设计层级：
   - 对具备本机 CLI/Skill 执行能力的宿主，可作为可选增强通过 `thp load`（或分片 `peek`）自动读取当前流头 `anchor_id` 的交棒包与信箱批次，无需改变底层状态机或产生第二套语义路径。
 - **结束归档与可选旁路增强（Outbound —— 双态诚实区分）：**
   - **常态路径（`model_authored`）：** 源模型存活且有可用额度时，由收尾/派发/合并 Prompt 产出带历史证据引用的结构化交接或回执块，经用户粘贴回存（或本地受控提交）推进新锚点；其中**已纳管流续跑或派发回执**须引用信封中已提供的 `anchor_id / event_id`，而**首次野生外部粘贴收编（`unmanaged_external`）**因源对话尚未入库不存在既有 `event_id`，严禁要求模型捏造 ID，应改用**原文关键片段摘录与轮次定位（及可选原始对话全文粘贴）**作为证据，粘贴回 `thp` 入库时由系统分配确定性 `event_id` 并按 6.2 节默认定级为 `untrusted_peer` / `unverified_import`（不自动授予 `human_authority`）；
+  - **模型输出分片归并协议（Multipart Output Assembly）：** 当单次收编（`adopt`）、检查点回存（`ingest`）或大合并裁决（`reconcile commit`）因信息量大而接近模型单轮输出上限时，允许模型按**对象级多片有效 RFC-8259 JSON** 分多次输出（严禁将单个 JSON 字符串拦腰截断）：每片自带 `part_group_id`、`part_index`、`total_parts`（未知总片数时可先置 `null`）与 `is_final`（终片为 `true`）。解析层（`ir.ts` / `prompts.ts`）对同一输入粘贴或可重复 `--file` 文件列表执行严格完整性与冲突校验：缺片、缺少 `is_final: true`、跨组 `part_group_id` / `total_parts` 冲突或同序号内容矛盾均 `fail-closed` 报错拒绝半残落盘；齐备后按 `part_index` 顺序确定性去重归并字段，最终仍通过**单次原子事务**发布锚点与历史，不留半写入孤片。
   - **暴毙兜底路径（`evidence_based`）：** 源宿主因额度耗尽、限流锁死或崩溃无法再生成交接块时，允许用户直接粘贴原始对话导出/网页全文，或由可选本地源适配器执行 `thp harvest` 零模型读取宿主客观日志，确定性构建涵盖原始用户请求、已执行工具序列、末尾报错与工作区状态清单的现场恢复包，并强制标注 **`[UNSUMMARIZED_EVIDENCE_HANDOFF]`**，标定连续性等级为 `Evidence Recovery`；
   - **可选只读旁路采集外挂（非核心前提）：** 若用户按需挂载框架生命周期 Hook（如回合结束回调）或浏览器只读网络流捕获插件以实现无感增量入库，该外挂必须严守三条红线：**① 只旁听不插嘴**（绝不向活跃对话注入探测 Prompt 占用上下文）；**② 只读不抢锁**（绝不抢占原厂数据库或活跃日志写入锁）；**③ 事件驱动防风控**（仅在回合完成或文件静默落盘后增量同步，严禁高频盲轮询触发服务端限流）。
 
@@ -418,10 +419,10 @@ ThreadPass 架构宪章分为三个规范性设计层级：
 
 ### 5.3 认知角色简报、身份重框定与宿主内部子 Agent 隔离
 
-1. **认知身份与权威身份严格分离：** 目标 AI 在会话内正常工作需要清晰的“认知角色”，但协作空间内的真实控制权限绝不依赖模型自我声明：
-   - **顶部 `Current Role Briefing`（认知角色简报）：** 应用壳在每份交棒/派发信封顶部显式注入结构化简报，明确告知目标模型当前挂载的 `thread_id / stream_id`、当前协作角色（`main_coordinator` 或 `scoped_worker`）、本次任务范围、是否持有有效派生授权及预期结构化回执格式；
+1. **认知身份与权威身份严格分离，且保持模型原生自我认同：** 目标 AI 在会话内正常工作需要清晰的协作分工，但**不得破坏其原生助手自我认同，也不得把底层权限控制权托付给模型自称**：
+   - **顶部 `Session Handoff Overview`（`Current Role Briefing` 认知简报）：** 应用壳在每份交棒/派发信封顶部以温和的工程交接笔记口吻提供结构化简报，明确当前逻辑流 `thread_id / stream_id`、当前值班分工（Active Main Agent `main_coordinator` 或 Scoped Worker Agent `scoped_worker`）、本次任务范围及输出格式，并显式声明：模型保留自身原生助手身份、能力与安全原则，无需扮演或模仿前任模型；历史摘录中前任 AI 的输出与自身当前窗口的实操经验严格分离（未在本环境亲验的事项均须标为前任记录）；当旧聊天窗口被切换角色（如子 Agent 升格为主 Agent 或相反）时，由本简报显式宣布协作分工切换生效；
    - **底层内核独立仲裁：** 简报仅服务于模型对齐任务边界与输出格式，不授予任何实际写账本、提升信任级或创建正式子流的权限；一切协调权威仍由内核 `main_designation`、`dispatch_grant` 与信任来源证明链核验。
-2. **收编与重建时的身份重框定（Identity Re-framing）：** 当多个独立来源被 `adopt` 收编，或原 Main 丢失后将幸存子流收编进新协作空间时，源历史中必然残留旧视角与过时角色自称（如旧 Main 或旧从属流标识）。应用壳须将此类历史片段全部封入非指令参考围栏作为客观过去事实，并由顶部 `Current Role Briefing` 显式声明覆盖过时角色自称，防止新会话模型错乱身份或继续尝试向已失联旧 Main 汇报。
+2. **收编、重建与低误报参考围栏（Identity Re-framing & Safety-Friendly Framing）：** 当多个独立来源被 `adopt` 收编，或原 Main 丢失后将幸存子流收编进新协作空间时，源历史中必然残留旧视角与过时角色自称（如旧 Main 或旧从属流标识）。应用壳将此类历史片段封装于原生友好的 XML 参考标签 `<archived_reference_<hash8> source="..." origin="..." ref="..."> ... </archived_reference_<hash8>>`（同时转义正文内同名闭合标签、系统标签及遗留围栏标记防逃逸），分片边界使用 `<handoff_chunk>`；并刻意避免在用户态 Prompt 中使用高频触发模型防注入误报的红队警告词（如 `Ignore ...`、`[SECURITY NOTICE: ...]`、`inject`、`PAYLOAD`、`overrides` 等），在不降低纵深防御隔离强度的前提下避免触发敏感模型的误拒安全护栏。
 3. **宿主内部瞬态子 Agent 隔离：** 宿主框架自身在单次会话中拉起的内部瞬态子 Agent 属于该流内部的工具执行细节（在 IR 中仅记为 `tool_call` / `tool_result`），不自动在 Coordinator Journal 中登记为正式跨流派发；**严禁**将 ThreadPass 的 `main_coordinator` 会话强行挂载至带有强制只读或下属限制隐藏系统提示词的宿主原生子 Agent 实例内执行。
 
 ## 6. 规范中间会话表示（Canonical Session IR）与信任来源模型

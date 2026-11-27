@@ -50,6 +50,7 @@ import {
   buildEventsFromAdoptedPackage,
   normalizeOptionalMetaString,
   parseExternalConversationInput,
+  type AssembledMultipartInfo,
   type ParsedAdoptPackage,
 } from './ir.js';
 import {
@@ -66,6 +67,7 @@ import {
 } from './prompts.js';
 import {
   computeTrustTier,
+  formatOriginLabel,
   normalizeConfirmationText,
   renderNonInstructionFence,
   TRUST_ADAPTER_VERSION,
@@ -548,6 +550,7 @@ export class ThreadPassService {
     warnings: string[];
     redacted_count: number;
     transcript_locators: HostTranscriptLocator[];
+    assembled_parts?: AssembledMultipartInfo;
   } {
     assertSafeIdentifier('project_id', params.projectId);
     assertSafeIdentifier('thread_id', params.threadId);
@@ -817,6 +820,7 @@ export class ThreadPassService {
         Math.max(sanitizedRawRes.redactedCount, sanitizedPkgRes.redactedCount) +
         transcriptArtifacts.redactedCount,
       transcript_locators: transcriptArtifacts.locators,
+      ...(pkg.assembled_parts ? { assembled_parts: pkg.assembled_parts } : {}),
     };
   }
 
@@ -968,6 +972,7 @@ export class ThreadPassService {
     txn_id: string;
     conflicts_count: number;
     parse_warning?: string;
+    assembled_parts?: AssembledMultipartInfo;
   } {
     if (!params.receiptRawText.trim()) {
       throw new Error('commitReconcile requires non-empty receiptRawText');
@@ -1213,6 +1218,7 @@ export class ThreadPassService {
       txn_id: res.txn_id,
       conflicts_count: sanitizedConflicts.length,
       ...(parsed.parse_warning ? { parse_warning: parsed.parse_warning } : {}),
+      ...(parsed.assembled_parts ? { assembled_parts: parsed.assembled_parts } : {}),
     };
   }
 
@@ -1438,6 +1444,7 @@ export class ThreadPassService {
     warnings: string[];
     redacted_count: number;
     transcript_locators: HostTranscriptLocator[];
+    assembled_parts?: AssembledMultipartInfo;
   } {
     if (!params.rawText.trim()) {
       throw new Error('ingestReply requires non-empty rawText');
@@ -1606,6 +1613,7 @@ export class ThreadPassService {
       warnings: pkg.parse_warnings,
       redacted_count: sanitizedPkgRes.redactedCount + transcriptArtifacts.redactedCount,
       transcript_locators: transcriptArtifacts.locators,
+      ...(pkg.assembled_parts ? { assembled_parts: pkg.assembled_parts } : {}),
     };
   }
 
@@ -1887,7 +1895,15 @@ export class ThreadPassService {
                   : ev.payload.type === 'tool_result'
                     ? ev.payload.text ?? ''
                     : ev.payload.text ?? '';
-          return `[${ev.event_id}][${ev.payload.type}][tier=${ev.trust_tier}] ${rawBody.slice(0, 800)}`;
+          const displayKind =
+            ev.payload.type === 'coordinator_inject'
+              ? 'handoff_note'
+              : ev.payload.type === 'assistant_part'
+                ? 'prior_agent'
+                : ev.payload.type === 'human_message'
+                  ? 'archived_user_msg'
+                  : ev.payload.type;
+          return `[${ev.event_id}][${displayKind}][origin=${formatOriginLabel(ev.trust_tier)}] ${rawBody.slice(0, 800)}`;
         });
       if (omittedOriginCount > 0) {
         originEventLines.unshift(`[... ${omittedOriginCount} earlier parent event(s) omitted ...]`);
@@ -1926,6 +1942,7 @@ export class ThreadPassService {
       const returnReminder = [
         `When your subtask finishes, provide your findings/changes AND include ONE \`\`\`json checkpoint block citing:`,
         `- \`threadpass_handoff: true\`, \`source_label: "${workerStreamId}"\`, \`base_anchor_id: "${workerAnchorId}"\`, \`dispatch_id: "${dispatchId}"\`, \`summary_text\`, \`decisions_made\`, \`files_and_artifacts\`, \`pending_tasks\`, \`blockers\`, \`tool_errors\`.`,
+        `- If the report exceeds your single-turn output limit, split it into standalone valid \`\`\`json objects using \`part_group_id\`, \`part_index\`, \`total_parts\` (or \`null\`), and \`is_final\`.`,
       ].join('\n');
       const allWorkerLocators = [...transcriptArtifacts.locators, ...existingLocators];
       const locatorText =
@@ -1938,7 +1955,7 @@ export class ThreadPassService {
       const locatorBlock = locatorText
         ? `\n\n## Session Transcript Locators (Machine-Scoped Paths & Reachability)\n${locatorText}`
         : '';
-      workerPrompt = `${roleHeader}\n\n## Scoped Parent Context\n\n${scopedCtx}${locatorBlock}\n\n## Permission Boundary\n- ${capsule.permission_boundary.join('\n- ')}\n\n## Expected Artifacts\n- ${capsule.expected_artifacts.join('\n- ')}\n\n## Return Format Reminder\n${returnReminder}`;
+      workerPrompt = `${roleHeader}\n\n## Scoped Parent Context\n\n${scopedCtx}${locatorBlock}\n\n## Scope & Working Boundaries\n- ${capsule.permission_boundary.join('\n- ')}\n\n## Expected Artifacts\n- ${capsule.expected_artifacts.join('\n- ')}\n\n## Return Format Reminder\n${returnReminder}`;
       assertOutboundEgressSafe(this.engine.redactor, workerPrompt);
     }
 

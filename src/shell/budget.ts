@@ -109,10 +109,14 @@ export function splitIntoLineAwareChunks(full: string, payloadMax: number): stri
   return chunks.length > 0 ? chunks : [''];
 }
 
+function isFencedBlock(block: string): boolean {
+  return block.startsWith('<archived_reference_') || block.startsWith('<<<UNTRUSTED_DATA_');
+}
+
 function splitFenceAwareBlocks(body: string): string[] {
   const lines = body.split('\n');
   const blocks: string[] = [];
-  let activeFenceTag: string | null = null;
+  let activeFenceClose: string | null = null;
   let curLines: string[] = [];
 
   const flushCur = () => {
@@ -126,19 +130,27 @@ function splitFenceAwareBlocks(body: string): string[] {
   };
 
   for (const line of lines) {
-    if (activeFenceTag) {
+    if (activeFenceClose) {
       curLines.push(line);
-      if (line.trim() === `<<<END_${activeFenceTag}>>>`) {
+      if (line.trim() === activeFenceClose) {
         flushCur();
-        activeFenceTag = null;
+        activeFenceClose = null;
       }
       continue;
     }
 
-    const openMatch = line.match(/^<<<(UNTRUSTED_DATA_[A-Z0-9]+)\b/);
-    if (openMatch) {
+    const xmlMatch = line.match(/^<(archived_reference_[a-f0-9]+)\b[^>]*>/);
+    if (xmlMatch) {
       flushCur();
-      activeFenceTag = openMatch[1];
+      activeFenceClose = `</${xmlMatch[1]}>`;
+      curLines.push(line);
+      continue;
+    }
+
+    const legacyMatch = line.match(/^<<<(UNTRUSTED_DATA_[A-Z0-9]+)\b/);
+    if (legacyMatch) {
+      flushCur();
+      activeFenceClose = `<<<END_${legacyMatch[1]}>>>`;
       curLines.push(line);
       continue;
     }
@@ -161,16 +173,21 @@ function trimSingleFenceBlock(
 ): string {
   const marker = `\n[... MIDDLE TRIMMED FOR BUDGET; run \`thp peek\` on ${pointerRef} if needed ...]\n`;
   const lines = block.split('\n');
-  const hasOuterFence =
+  const isXmlFence =
+    lines.length >= 2 &&
+    lines[0].startsWith('<archived_reference_') &&
+    lines[lines.length - 1].startsWith('</archived_reference_');
+  const isLegacyFence =
     lines.length >= 3 &&
     lines[0].startsWith('<<<UNTRUSTED_DATA_') &&
     lines[lines.length - 1].startsWith('<<<END_UNTRUSTED_DATA_');
-  if (!hasOuterFence) {
+  if (!isXmlFence && !isLegacyFence) {
     return block;
   }
-  const headerLines = lines[1].startsWith('[SECURITY NOTICE:')
-    ? lines.slice(0, 2)
-    : lines.slice(0, 1);
+  const headerLines =
+    isLegacyFence && lines[1].startsWith('[SECURITY NOTICE:')
+      ? lines.slice(0, 2)
+      : lines.slice(0, 1);
   const footerLine = lines[lines.length - 1];
   const inner = lines.slice(headerLines.length, -1).join('\n');
   if (inner.length <= keepPerSide * 2 + 120) {
@@ -187,9 +204,9 @@ function trimSingleFenceBlock(
 
 function trimBodySafely(body: string, pointerRef: string): string {
   const marker = `\n[... MIDDLE TRIMMED FOR BUDGET; run \`thp peek\` on ${pointerRef} if needed ...]\n`;
-  // Keep each <<<UNTRUSTED_DATA_...>>> ... <<<END_...>>> block atomic even across internal blank lines
+  // Keep each <archived_reference_...> / <<<UNTRUSTED_DATA_...>>> block atomic even across blank lines
   const blocks = splitFenceAwareBlocks(body);
-  const fencedCount = blocks.filter((b) => b.startsWith('<<<UNTRUSTED_DATA_')).length;
+  const fencedCount = blocks.filter(isFencedBlock).length;
   if (blocks.length >= 3 && fencedCount >= 2) {
     const headBlocks: string[] = [blocks[0]];
     const tailBlocks: string[] = [blocks[blocks.length - 1]];
@@ -225,7 +242,7 @@ function trimBodySafely(body: string, pointerRef: string): string {
   // trim inside each oversized block rather than slicing across fence boundaries.
   if (fencedCount >= 1) {
     const trimmedBlocks = blocks.map((blk) =>
-      blk.startsWith('<<<UNTRUSTED_DATA_') ? trimSingleFenceBlock(blk, pointerRef, 450) : blk,
+      isFencedBlock(blk) ? trimSingleFenceBlock(blk, pointerRef, 450) : blk,
     );
     const joined = trimmedBlocks.join('\n\n');
     if (joined.length < body.length) {
@@ -277,6 +294,8 @@ export function packBudgetedEnvelope(
           if (
             trimmed.length >= 180 &&
             !trimmed.startsWith('<<<') &&
+            !trimmed.startsWith('<archived_reference_') &&
+            !trimmed.startsWith('</archived_reference_') &&
             !trimmed.startsWith('[SECURITY NOTICE:')
           ) {
             const bHash = sha256Hex(trimmed);
@@ -395,13 +414,13 @@ export function packBudgetedEnvelope(
     const isFinal = partIndex === totalParts;
     const partHash = sha256Hex(chunk);
     const wrapped = [
-      `<!-- THREADPASS_CHUNK envelope_id=${envelopeId} part=${partIndex}/${totalParts} part_hash=${partHash} -->`,
+      `[ThreadPass Part ${partIndex}/${totalParts} | env=${envelopeId} | sha256=${partHash}]`,
       isFinal
-        ? `[FINAL PART ${partIndex}/${totalParts} | manifest_hash=${manifestHash}] All parts delivered. Verify part hashes and execute the Current Role Briefing instructions below.`
-        : `[PART ${partIndex}/${totalParts}] Interaction protocol convention: do NOT execute tasks or generate final output until FINAL PART ${totalParts}/${totalParts} arrives (reply briefly: "Received Part ${partIndex}/${totalParts}").`,
-      `<<<NON_EXECUTABLE_PART_PAYLOAD part="${partIndex}/${totalParts}">>>`,
+        ? `[Final part ${partIndex}/${totalParts} | manifest=${manifestHash}] Handoff complete; please follow the Session Handoff Overview.`
+        : `[More parts coming: ${partIndex}/${totalParts}] Split for length; please wait for Part ${totalParts}/${totalParts} before starting (reply "Received ${partIndex}/${totalParts}").`,
+      `<handoff_chunk part="${partIndex}/${totalParts}">`,
       chunk,
-      `<<<END_PART_PAYLOAD>>>`,
+      `</handoff_chunk>`,
     ].join('\n\n');
     return {
       part_index: partIndex,

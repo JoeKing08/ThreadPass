@@ -153,10 +153,13 @@ function renderHtmlPage(
       <label class="file-label">可选：上传 Web 端原始会话文件备份（脱敏存入本地 blob）<input id="adoptUploadFile" type="file" accept=".md,.txt,.json,.jsonl,text/plain,text/markdown" /></label>
     </div>
     <div class="row" style="justify-content:space-between; margin-top:10px;">
-      <label style="margin:0;">粘贴源 AI 回复或原始对话全文（自动跨块脱敏 + 防重复收编反查，支持拖放 .md/.txt）</label>
-      <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('adoptText', this)" /></label>
+      <label style="margin:0;">粘贴源 AI 回复或原始对话全文（支持按顺序粘贴/追加多段分片 JSON，自动脱敏 + 防重复收编反查，支持拖放 .md/.txt）</label>
+      <div class="row" style="gap:10px;">
+        <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('adoptText', this)" /></label>
+        <label class="file-label">+ 追加分片文件<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="appendFileInto('adoptText', this)" /></label>
+      </div>
     </div>
-    <textarea id="adoptText" placeholder="在此粘贴或拖放外部 AI 输出的 JSON 交接块或原始聊天记录..."></textarea>
+    <textarea id="adoptText" placeholder="在此粘贴、拖放或追加外部 AI 输出的单段/多段 JSON 交接块或原始聊天记录..."></textarea>
     <div class="row" style="margin-top:8px;">
       <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--fg);">
         <input id="adoptConfirm" type="checkbox" /> 我已审阅上述确切原文并签发哈希绑定人类授权凭证（human_authority）
@@ -178,10 +181,13 @@ function renderHtmlPage(
     </div>
     <div id="recParts"></div>
     <div class="row" style="justify-content:space-between; margin-top:12px;">
-      <label style="margin:0;">粘贴合并 AI 返回的 ReconciliationReceipt（或纯文本总结，支持拖放文件）</label>
-      <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('recReceipt', this)" /></label>
+      <label style="margin:0;">粘贴合并 AI 返回的 ReconciliationReceipt（支持多段分片 JSON 或纯文本总结，支持拖放文件）</label>
+      <div class="row" style="gap:10px;">
+        <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('recReceipt', this)" /></label>
+        <label class="file-label">+ 追加分片文件<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="appendFileInto('recReceipt', this)" /></label>
+      </div>
     </div>
-    <textarea id="recReceipt" placeholder="粘贴或拖放 JSON ReconciliationReceipt 或总结文本"></textarea>
+    <textarea id="recReceipt" placeholder="粘贴、拖放或追加单段/多段 JSON ReconciliationReceipt 或总结文本"></textarea>
     <div class="row" style="margin-top:8px;">
       <div style="flex:2; min-width:200px;"><label>合并 AI 原生会话文件路径（可选）</label><input id="recTranscriptPath" type="text" placeholder="可选本地日志路径" /></div>
       <div style="flex:1; min-width:140px;"><label>云端宿主（可选）</label><input id="recCloudHost" type="text" placeholder="如 claude_web" /></div>
@@ -206,10 +212,13 @@ function renderHtmlPage(
       <div style="align-self:flex-end;"><button class="sec" onclick="runUiAction('hoOut', () => copyCheckpointPrompt(this))">复制已纳管流备份 Prompt</button></div>
     </div>
     <div class="row" style="justify-content:space-between; margin-top:8px;">
-      <label style="margin:0;">粘贴 AI 返回的检查点 JSON（或这段新对话原文，支持拖放文件）</label>
-      <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('ckptText', this)" /></label>
+      <label style="margin:0;">粘贴 AI 返回的检查点 JSON（支持多段分片 JSON 或这段新对话原文，支持拖放文件）</label>
+      <div class="row" style="gap:10px;">
+        <label class="file-label">选择文件导入<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="loadFileInto('ckptText', this)" /></label>
+        <label class="file-label">+ 追加分片文件<input type="file" accept=".md,.txt,.json,text/plain,text/markdown" style="display:none;" onchange="appendFileInto('ckptText', this)" /></label>
+      </div>
     </div>
-    <textarea id="ckptText" placeholder="粘贴或拖放检查点 JSON 或新阶段对话原文..."></textarea>
+    <textarea id="ckptText" placeholder="粘贴、拖放或追加单段/多段检查点 JSON 或新阶段对话原文..."></textarea>
     <div class="row" style="margin-top:8px;">
       <div style="flex:2; min-width:200px;"><label>当前 AI 原生会话文件路径（可选）</label><input id="ckptTranscriptPath" type="text" placeholder="可选本地日志路径" /></div>
       <div style="flex:1; min-width:140px;"><label>云端宿主（可选）</label><input id="ckptCloudHost" type="text" placeholder="如 devin_cloud" /></div>
@@ -334,6 +343,15 @@ async function loadFileInto(textareaId, inputEl) {
   if (file) {
     document.getElementById(textareaId).value = await file.text();
   }
+}
+
+async function appendFileInto(textareaId, inputEl) {
+  const file = inputEl && inputEl.files && inputEl.files[0];
+  if (!file) return;
+  const ta = document.getElementById(textareaId);
+  const next = await file.text();
+  ta.value = ta.value.trim() ? (ta.value.trimEnd() + '\n\n' + next) : next;
+  inputEl.value = '';
 }
 
 async function api(path, body) {
