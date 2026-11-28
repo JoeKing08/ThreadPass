@@ -1429,6 +1429,9 @@ export async function startThreadPassWeb(
         if (reqUrl.pathname === '/api/device/show') {
           sendJson(res, 200, {
             device_id: svc.engine.identity.device_id,
+            machine_fingerprint: svc.engine.machine.machine_fingerprint,
+            machine_hostname: svc.engine.machine.hostname,
+            fingerprint_source: svc.engine.machine.fingerprint_source,
             public_key_spki_b64: svc.engine.identity.public_key_spki_b64,
             home_dir: svc.engine.homeDir,
             trusted_keys: loadTrustedDeviceKeys(svc.engine.homeDir).keys,

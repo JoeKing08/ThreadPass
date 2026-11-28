@@ -347,7 +347,12 @@ export type HostTranscriptKind =
   | 'cloud_remote'
   | 'placeholder_unavailable';
 
-export type HostTranscriptSourceOrigin = 'operator_verified' | 'model_reported';
+export type HostTranscriptSourceOrigin =
+  | 'operator_verified'
+  | 'system_prompt_provided'
+  | 'model_probed'
+  | 'unknown_null'
+  | 'model_reported';
 
 export interface HostTranscriptLocator {
   locator_id: string;
@@ -358,6 +363,10 @@ export interface HostTranscriptLocator {
   locator_origin?: HostTranscriptSourceOrigin;
   machine_hostname?: string;
   machine_device_id?: string;
+  machine_fingerprint?: string;
+  recorded_by_hostname?: string;
+  recorded_by_device_id?: string;
+  recorded_by_machine_fingerprint?: string;
   file_path?: string;
   cloud_provider?: string;
   host_session_id?: string;

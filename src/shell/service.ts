@@ -24,6 +24,7 @@ import {
   type EventRecord,
   type GrantIssuedData,
   type HostTranscriptLocator,
+  type HostTranscriptSourceOrigin,
   type InputDependencyManifest,
   type JournalEventRecord,
   type LineageAnchor,
@@ -126,6 +127,7 @@ export class StaleCheckpointBaselineError extends Error {
 export interface TranscriptInputOptions {
   transcriptFilePath?: string;
   machineHostname?: string;
+  machineFingerprint?: string;
   cloudProvider?: string;
   remoteUri?: string;
   uploadedTranscriptText?: string;
@@ -246,8 +248,9 @@ export class ThreadPassService {
   ): TranscriptLocatorFormatContext {
     const layout = this.engine.getLayout(projectId, threadId);
     return {
-      currentHostname: os.hostname(),
+      currentHostname: this.engine.machine.hostname,
       currentDeviceId: this.engine.identity.device_id,
+      currentMachineFingerprint: this.engine.machine.machine_fingerprint,
       threadRootDir: layout.rootDir,
       transcriptIndexPath: layout.transcriptIndexJsonPath,
       checkFileExists: (p: string) => fs.existsSync(p),
@@ -263,7 +266,9 @@ export class ThreadPassService {
     operatorOptions?: TranscriptInputOptions & { hostSessionId?: string };
     modelOptions?: {
       transcriptFilePath?: string;
+      transcriptPathOrigin?: HostTranscriptSourceOrigin;
       machineHostname?: string;
+      machineFingerprint?: string;
       cloudProvider?: string;
       remoteUri?: string;
       hostSessionId?: string;
@@ -282,9 +287,13 @@ export class ThreadPassService {
 
     const op = params.operatorOptions ?? {};
     const mod = params.modelOptions ?? {};
+    const localMach = this.engine.machine;
 
     const opFilePath = normalizeOptionalMetaString(op.transcriptFilePath);
-    const opHostname = normalizeOptionalMetaString(op.machineHostname) ?? os.hostname();
+    const opHostname = normalizeOptionalMetaString(op.machineHostname) ?? localMach.hostname;
+    const opExplicitFp = normalizeOptionalMetaString(op.machineFingerprint);
+    const opSameHostname = opHostname.toLowerCase() === localMach.hostname.toLowerCase();
+    const opMachineFp = opSameHostname ? (opExplicitFp ?? localMach.machine_fingerprint) : opExplicitFp;
     const opCloudProvider = normalizeOptionalMetaString(op.cloudProvider);
     const opRemoteUri = normalizeOptionalMetaString(op.remoteUri);
     const opHostSessionId = normalizeOptionalMetaString(op.hostSessionId);
@@ -292,13 +301,25 @@ export class ThreadPassService {
 
     const modFilePath = normalizeOptionalMetaString(mod.transcriptFilePath);
     const modHostname = normalizeOptionalMetaString(mod.machineHostname);
+    const modFingerprint = normalizeOptionalMetaString(mod.machineFingerprint);
     const modCloudProvider = normalizeOptionalMetaString(mod.cloudProvider);
     const modRemoteUri = normalizeOptionalMetaString(mod.remoteUri);
     const modHostSessionId = normalizeOptionalMetaString(mod.hostSessionId);
+    const modUnverifiedOrigin: HostTranscriptSourceOrigin =
+      mod.transcriptPathOrigin && mod.transcriptPathOrigin !== 'operator_verified'
+        ? mod.transcriptPathOrigin
+        : 'model_reported';
     const effectiveHostSessionId = opHostSessionId ?? modHostSessionId;
 
     const pushLocator = (loc: HostTranscriptLocator) => {
-      locators.push(loc);
+      const stamped: HostTranscriptLocator = {
+        ...loc,
+        recorded_by_hostname: loc.recorded_by_hostname ?? localMach.hostname,
+        recorded_by_device_id: loc.recorded_by_device_id ?? this.engine.identity.device_id,
+        recorded_by_machine_fingerprint:
+          loc.recorded_by_machine_fingerprint ?? localMach.machine_fingerprint,
+      };
+      locators.push(stamped);
       controls.push({
         schema_version: SCHEMA_VERSION,
         kind: 'control',
@@ -306,7 +327,7 @@ export class ThreadPassService {
         stream_id: params.streamId,
         commit_txn_id: 'pending',
         created_at: params.nowIso,
-        payload: { type: 'transcript_locator', locator: loc },
+        payload: { type: 'transcript_locator', locator: stamped },
       });
     };
 
@@ -322,6 +343,7 @@ export class ThreadPassService {
         locator_origin: 'operator_verified',
         machine_hostname: opHostname,
         machine_device_id: this.engine.identity.device_id,
+        ...(opMachineFp ? { machine_fingerprint: opMachineFp } : {}),
         file_path: fpRes.sanitized,
         ...(opCloudProvider ? { cloud_provider: opCloudProvider } : {}),
         ...(effectiveHostSessionId ? { host_session_id: effectiveHostSessionId } : {}),
@@ -351,6 +373,7 @@ export class ThreadPassService {
         locator_origin: 'operator_verified',
         machine_hostname: opHostname,
         machine_device_id: this.engine.identity.device_id,
+        ...(opMachineFp ? { machine_fingerprint: opMachineFp } : {}),
         uploaded_blob_sha256: blobSha,
         uploaded_blob_rel: blobRel,
         ...(filename ? { uploaded_filename: filename } : {}),
@@ -370,6 +393,8 @@ export class ThreadPassService {
         source_label: params.sourceLabel,
         host_kind: 'cloud_remote',
         locator_origin: 'operator_verified',
+        machine_hostname: localMach.hostname,
+        machine_fingerprint: localMach.machine_fingerprint,
         ...(opCloudProvider ? { cloud_provider: opCloudProvider } : {}),
         ...(effectiveHostSessionId ? { host_session_id: effectiveHostSessionId } : {}),
         ...(safeUri ? { remote_uri: safeUri } : {}),
@@ -378,18 +403,21 @@ export class ThreadPassService {
       });
     }
 
-    // Model-reported path/cloud hints are stored as unverified metadata and NEVER promoted to local machine bindings
+    // Model-reported path/cloud hints (system_prompt_provided / model_probed / model_reported) are stored as unverified metadata and NEVER promoted to local machine bindings
     if (!opFilePath && modFilePath) {
       const mFpRes = this.engine.redactor.sanitizeText(modFilePath);
       redactedCount += mFpRes.redactedCount;
+      const effectiveModOrigin: HostTranscriptSourceOrigin =
+        modUnverifiedOrigin === 'unknown_null' ? 'model_reported' : modUnverifiedOrigin;
       pushLocator({
         locator_id: newId('tloc', 8),
         stream_id: params.streamId,
         anchor_id: params.anchorId,
         source_label: params.sourceLabel,
         host_kind: 'local_file',
-        locator_origin: 'model_reported',
+        locator_origin: effectiveModOrigin,
         ...(modHostname ? { machine_hostname: modHostname } : {}),
+        ...(modFingerprint ? { machine_fingerprint: modFingerprint } : {}),
         file_path: mFpRes.sanitized,
         ...(modCloudProvider ? { cloud_provider: modCloudProvider } : {}),
         ...(modHostSessionId ? { host_session_id: modHostSessionId } : {}),
@@ -406,7 +434,9 @@ export class ThreadPassService {
         anchor_id: params.anchorId,
         source_label: params.sourceLabel,
         host_kind: 'cloud_remote',
-        locator_origin: 'model_reported',
+        locator_origin: modUnverifiedOrigin,
+        ...(modHostname ? { machine_hostname: modHostname } : {}),
+        ...(modFingerprint ? { machine_fingerprint: modFingerprint } : {}),
         ...(modCloudProvider ? { cloud_provider: modCloudProvider } : {}),
         ...(modHostSessionId ? { host_session_id: modHostSessionId } : {}),
         ...(safeModUri ? { remote_uri: safeModUri } : {}),
@@ -416,18 +446,21 @@ export class ThreadPassService {
     }
 
     if (params.requirePlaceholderIfEmpty && locators.length === 0) {
+      const phOrigin: HostTranscriptSourceOrigin | undefined = opHostSessionId
+        ? 'operator_verified'
+        : mod.transcriptPathOrigin && mod.transcriptPathOrigin !== 'operator_verified'
+          ? mod.transcriptPathOrigin
+          : undefined;
       pushLocator({
         locator_id: newId('tloc', 8),
         stream_id: params.streamId,
         anchor_id: params.anchorId,
         source_label: params.sourceLabel,
         host_kind: 'placeholder_unavailable',
-        ...(effectiveHostSessionId
-          ? {
-              locator_origin: opHostSessionId ? 'operator_verified' : 'model_reported',
-              host_session_id: effectiveHostSessionId,
-            }
-          : {}),
+        ...(phOrigin ? { locator_origin: phOrigin } : {}),
+        machine_hostname: modHostname ?? localMach.hostname,
+        machine_fingerprint: modFingerprint ?? localMach.machine_fingerprint,
+        ...(effectiveHostSessionId ? { host_session_id: effectiveHostSessionId } : {}),
         ...(opNote ? { note: opNote } : {}),
         recorded_at: params.nowIso,
       });
@@ -587,6 +620,9 @@ export class ThreadPassService {
       const layout = this.engine.getLayout(projectId, threadId);
       return {
         device_id: this.engine.identity.device_id,
+        machine_fingerprint: this.engine.machine.machine_fingerprint,
+        machine_hostname: this.engine.machine.hostname,
+        fingerprint_source: this.engine.machine.fingerprint_source,
         project_id: projectId,
         thread,
         streams,
@@ -948,7 +984,9 @@ export class ThreadPassService {
       operatorOptions: params,
       modelOptions: {
         transcriptFilePath: pkg.transcript_file_path,
+        transcriptPathOrigin: pkg.transcript_path_origin,
         machineHostname: pkg.machine_hostname,
+        machineFingerprint: pkg.machine_fingerprint,
         cloudProvider: pkg.cloud_provider,
         remoteUri: pkg.remote_uri,
         hostSessionId: pkg.host_session_id,
@@ -1970,7 +2008,9 @@ export class ThreadPassService {
       operatorOptions: params,
       modelOptions: {
         transcriptFilePath: pkg.transcript_file_path,
+        transcriptPathOrigin: pkg.transcript_path_origin,
         machineHostname: pkg.machine_hostname,
+        machineFingerprint: pkg.machine_fingerprint,
         cloudProvider: pkg.cloud_provider,
         remoteUri: pkg.remote_uri,
         hostSessionId: pkg.host_session_id,

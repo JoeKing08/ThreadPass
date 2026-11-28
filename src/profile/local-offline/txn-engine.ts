@@ -51,9 +51,11 @@ import {
   loadOrCreateDeviceIdentity,
   loadTrustedDeviceKeys,
   pinTrustedDeviceKey,
+  resolveMachineFingerprint,
   signCommitIntentProof,
   verifyCommitIntentProofSignature,
   type LocalDeviceIdentity,
+  type LocalMachineIdentity,
 } from './crypto-keys.js';
 import { isOpaqueBinary, redactRemoteUrlCredentials, SlidingWindowRedactor } from './redaction.js';
 import { GlobalConfirmationNonceStore, StateStore, SystemClock } from './state-store.js';
@@ -287,6 +289,7 @@ export class LocalOfflineEngine {
   public readonly homeDir: string;
   public readonly clock: ClockPort;
   public readonly identity: LocalDeviceIdentity;
+  public readonly machine: LocalMachineIdentity;
   public readonly redactor: SlidingWindowRedactor;
   private readonly verifiedAclDirs = new Set<string>();
   private readonly probedHardLinkDirs = new Set<string>();
@@ -301,6 +304,7 @@ export class LocalOfflineEngine {
     this.clock = options.clock ?? new SystemClock();
     this.ensureDirAclCached(this.homeDir);
     this.identity = loadOrCreateDeviceIdentity(this.homeDir);
+    this.machine = resolveMachineFingerprint();
     this.redactor = new SlidingWindowRedactor(options.customSecrets);
   }
 
@@ -2069,8 +2073,10 @@ export class LocalOfflineEngine {
       schema_version: SCHEMA_VERSION,
       generated_at: generatedAt,
       current_machine: {
-        hostname: os.hostname(),
+        hostname: this.machine.hostname,
         device_id: this.identity.device_id,
+        machine_fingerprint: this.machine.machine_fingerprint,
+        fingerprint_source: this.machine.fingerprint_source,
       },
       total_locators: locators.length,
       locators,

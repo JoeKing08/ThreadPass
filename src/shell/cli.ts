@@ -147,6 +147,7 @@ function readTranscriptOptions(
   return {
     transcriptFilePath: strFlag(flags, 'transcript-file'),
     machineHostname: strFlag(flags, 'machine'),
+    machineFingerprint: strFlag(flags, 'machine-fingerprint'),
     cloudProvider: strFlag(flags, 'cloud-host'),
     remoteUri: strFlag(flags, 'remote-uri'),
     hostSessionId: strFlag(flags, 'host-session-id'),
@@ -426,6 +427,9 @@ async function main(): Promise<void> {
         JSON.stringify(
           {
             device_id: svc.engine.identity.device_id,
+            machine_fingerprint: svc.engine.machine.machine_fingerprint,
+            machine_hostname: svc.engine.machine.hostname,
+            fingerprint_source: svc.engine.machine.fingerprint_source,
             public_key_spki_b64: svc.engine.identity.public_key_spki_b64,
             home_dir: svc.engine.homeDir,
           },

@@ -515,10 +515,17 @@ export class StateStore {
             : loc.recorded_at >= existing.recorded_at;
         const newer = isLocNewerOrEqual ? loc : existing;
         const older = newer === loc ? existing : loc;
+        const originRank = (origin?: HostTranscriptLocator['locator_origin']): number => {
+          if (origin === 'operator_verified') return 5;
+          if (origin === 'system_prompt_provided') return 4;
+          if (origin === 'model_probed') return 3;
+          if (origin === 'model_reported') return 2;
+          if (origin === 'unknown_null') return 1;
+          return 0;
+        };
         const resolvedOrigin =
-          newer.locator_origin === 'operator_verified' ||
-          older.locator_origin === 'operator_verified'
-            ? ('operator_verified' as const)
+          originRank(older.locator_origin) > originRank(newer.locator_origin)
+            ? older.locator_origin
             : (newer.locator_origin ?? older.locator_origin);
         merged = {
           ...older,
@@ -527,6 +534,11 @@ export class StateStore {
           anchor_id: newer.anchor_id ?? older.anchor_id,
           machine_hostname: newer.machine_hostname ?? older.machine_hostname,
           machine_device_id: newer.machine_device_id ?? older.machine_device_id,
+          machine_fingerprint: newer.machine_fingerprint ?? older.machine_fingerprint,
+          recorded_by_hostname: newer.recorded_by_hostname ?? older.recorded_by_hostname,
+          recorded_by_device_id: newer.recorded_by_device_id ?? older.recorded_by_device_id,
+          recorded_by_machine_fingerprint:
+            newer.recorded_by_machine_fingerprint ?? older.recorded_by_machine_fingerprint,
           file_path: newer.file_path ?? older.file_path,
           cloud_provider: newer.cloud_provider ?? older.cloud_provider,
           host_session_id: newer.host_session_id ?? older.host_session_id,

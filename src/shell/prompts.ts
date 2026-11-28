@@ -65,7 +65,8 @@ export function renderAdoptExtractPrompt(sourceLabel = 'source_ai'): string {
     ``,
     `Extraction rules:`,
     `- Preserve the conversation's working language (e.g., keep Chinese technical prose in Chinese while keeping code, file paths, and identifiers exact).`,
-    `- Do NOT fabricate any ThreadPass IDs (\`thr_*\`, \`strm_*\`, \`anc_*\`) if none were provided; leave \`"host_session_id": null\`, \`"transcript_file_path": null\`, and \`"cloud_provider": null\` unless genuine values are explicitly known to you (never copy placeholder words).`,
+    `- Do NOT fabricate any ThreadPass IDs (\`thr_*\`, \`strm_*\`, \`anc_*\`) if none were provided; leave \`"host_session_id": null\` and \`"cloud_provider": null\` unless genuine values are explicitly known to you (never copy placeholder words).`,
+    `- Session locator rules: never guess paths. If your host system prompt provides your conversation ID or transcript path (e.g. \`<conversation_transcript>\`), populate \`"transcript_file_path"\` and set \`"transcript_path_origin": "system_prompt_provided"\`. If you verified a local log file with read-only tools, populate it and set \`"transcript_path_origin": "model_probed"\`. Only when you genuinely cannot observe any local transcript path (e.g. cloud/web chat), leave \`"transcript_file_path": null\` and set \`"transcript_path_origin": "unknown_null"\`. Whenever \`"transcript_file_path"\` is non-null or your host hostname/machine tag is known, populate \`"machine_hostname"\` (and \`"machine_fingerprint"\` if known, else \`null\`).`,
     `- Usually output valid RFC-8259 JSON inside ONE \`\`\`json code block (no extra prose outside; escape newlines/quotes properly; avoid raw triple-backtick \`\`\` inside JSON strings).`,
     `- **Multipart option for long outputs:** If the export approaches your single-turn output limit, never cut a JSON object mid-brace. Instead, split across multiple standalone valid \`\`\`json objects, adding \`"part_group_id": "<short_id>"\`, \`"part_index": 1\`, \`"total_parts": N\` (or \`null\` until known), and \`"is_final": false\` (\`true\` on the final part), and ask the user to reply \`continue\` for the next part.`,
     ``,
@@ -76,6 +77,9 @@ export function renderAdoptExtractPrompt(sourceLabel = 'source_ai'): string {
     `  "source_label": "${sourceLabel}",`,
     `  "host_session_id": null,`,
     `  "transcript_file_path": null,`,
+    `  "transcript_path_origin": "unknown_null",`,
+    `  "machine_hostname": null,`,
+    `  "machine_fingerprint": null,`,
     `  "cloud_provider": null,`,
     `  "summary_text": "Concise summary of problem statement, architecture/conclusions reached, and current progress",`,
     `  "decisions_made": ["Locked decision + short rationale (so the next AI does not re-litigate settled choices)"],`,
@@ -118,7 +122,7 @@ export function renderCheckpointPrompt(params: {
     `- **base_anchor_id:** \`${params.anchorId}\``,
     `- **available_event_ids (cite ONLY from this list or omit):** ${params.recentEventIds.length > 0 ? params.recentEventIds.join(', ') : '(none yet)'}`,
     ``,
-    `Formatting rules: preserve the conversation's working language (e.g., Chinese narrative + exact English code/identifiers), avoid raw triple-backticks inside JSON string values, and normally output ONE valid RFC-8259 \`\`\`json block. If the checkpoint is too long for one reply, emit multiple standalone valid \`\`\`json objects (never truncate mid-JSON) using \`"part_group_id"\`, \`"part_index"\`, \`"total_parts"\` (or \`null\`), and \`"is_final"\`, asking the user to reply \`continue\` for the next part.`,
+    `Formatting rules: preserve the conversation's working language (e.g., Chinese narrative + exact English code/identifiers), avoid raw triple-backticks inside JSON string values, fill \`"transcript_file_path"\` + \`"transcript_path_origin"\` (\`"system_prompt_provided"\` | \`"model_probed"\` | \`"unknown_null"\`) + \`"machine_hostname"\` when known instead of guessing, and normally output ONE valid RFC-8259 \`\`\`json block. If the checkpoint is too long for one reply, emit multiple standalone valid \`\`\`json objects (never truncate mid-JSON) using \`"part_group_id"\`, \`"part_index"\`, \`"total_parts"\` (or \`null\`), and \`"is_final"\`, asking the user to reply \`continue\` for the next part.`,
     ``,
     '```json',
     `{`,
@@ -127,6 +131,9 @@ export function renderCheckpointPrompt(params: {
     `  "source_label": "${params.streamId}",`,
     `  "base_anchor_id": "${params.anchorId}",`,
     `  "transcript_file_path": null,`,
+    `  "transcript_path_origin": "unknown_null",`,
+    `  "machine_hostname": null,`,
+    `  "machine_fingerprint": null,`,
     `  "cloud_provider": null,`,
     `  "referenced_ids": ${JSON.stringify(params.recentEventIds.slice(-4))},`,
     `  "summary_text": "Exact progress summary since base_anchor_id and current verification status",`,
@@ -188,11 +195,23 @@ export const MAX_INLINE_TRANSCRIPT_LOCATORS = 12;
 export interface TranscriptLocatorFormatContext {
   currentHostname: string;
   currentDeviceId: string;
+  currentMachineFingerprint?: string;
   threadRootDir: string;
   transcriptIndexPath: string;
   maxInline?: number;
   checkFileExists?: (filePath: string) => boolean;
   resolveThreadPath?: (relPath: string) => string;
+}
+
+function isModelUnverifiedLocatorOrigin(
+  origin?: HostTranscriptLocator['locator_origin'],
+): boolean {
+  return (
+    origin === 'system_prompt_provided' ||
+    origin === 'model_probed' ||
+    origin === 'model_reported' ||
+    origin === 'unknown_null'
+  );
 }
 
 export function formatTranscriptLocatorsSection(params: {
@@ -218,19 +237,53 @@ export function formatTranscriptLocatorsSection(params: {
   const formattedEntries = locators.map((loc) => {
     let tag = '';
     let detail = '';
+    const originStr =
+      loc.locator_origin ?? (loc.host_kind === 'placeholder_unavailable' ? 'unspecified' : 'operator_verified');
+    const recordedMach =
+      loc.recorded_by_machine_fingerprint ??
+      context.currentMachineFingerprint ??
+      loc.recorded_by_device_id ??
+      'local';
+    const recordedHost = loc.recorded_by_hostname ?? context.currentHostname;
 
     if (loc.host_kind === 'local_file' && loc.file_path) {
-      if (loc.locator_origin === 'model_reported') {
+      if (isModelUnverifiedLocatorOrigin(loc.locator_origin)) {
         placeholders += 1;
         const reportedHost = loc.machine_hostname ?? 'unknown_host';
-        tag = `MODEL_REPORTED_PATH_UNVERIFIED (host=${reportedHost})`;
-        detail = `"${loc.file_path}" (reported by model; not verified on this machine)`;
+        const fpSuffix = loc.machine_fingerprint ? `/${loc.machine_fingerprint}` : '';
+        if (loc.locator_origin === 'system_prompt_provided') {
+          tag = `SYSTEM_PROMPT_PATH_UNVERIFIED (host=${reportedHost}${fpSuffix})`;
+        } else if (loc.locator_origin === 'model_probed') {
+          tag = `MODEL_PROBED_PATH_UNVERIFIED (host=${reportedHost}${fpSuffix})`;
+        } else {
+          tag = `MODEL_REPORTED_PATH_UNVERIFIED (host=${reportedHost}${fpSuffix})`;
+        }
+        const mismatchNote =
+          loc.machine_fingerprint &&
+          context.currentMachineFingerprint &&
+          loc.machine_fingerprint !== context.currentMachineFingerprint
+            ? `; claimed machine ${loc.machine_fingerprint} differs from current ${context.currentMachineFingerprint}`
+            : '';
+        detail = `"${loc.file_path}" (origin=${originStr}; not operator-verified on this machine${mismatchNote})`;
       } else {
-        const sameDevice =
-          (!loc.machine_device_id || loc.machine_device_id === context.currentDeviceId) &&
-          (!loc.machine_hostname ||
-            loc.machine_hostname.toLowerCase() === context.currentHostname.toLowerCase());
-        const hostTag = `${loc.machine_hostname ?? context.currentHostname} (${loc.machine_device_id ?? 'local'})`;
+        const fpMatch =
+          loc.machine_fingerprint && context.currentMachineFingerprint
+            ? loc.machine_fingerprint === context.currentMachineFingerprint
+            : true;
+        const devMatch =
+          !loc.machine_device_id ||
+          loc.machine_device_id === context.currentDeviceId ||
+          Boolean(
+            loc.machine_fingerprint &&
+              context.currentMachineFingerprint &&
+              loc.machine_fingerprint === context.currentMachineFingerprint,
+          );
+        const hostMatch =
+          !loc.machine_hostname ||
+          loc.machine_hostname.toLowerCase() === context.currentHostname.toLowerCase();
+        const sameDevice = fpMatch && devMatch && hostMatch;
+        const machTag = loc.machine_fingerprint ?? loc.machine_device_id ?? 'local';
+        const hostTag = `${loc.machine_hostname ?? context.currentHostname} (${machTag})`;
         if (sameDevice) {
           if (existsFn(loc.file_path)) {
             localGreppable += 1;
@@ -272,11 +325,22 @@ export function formatTranscriptLocatorsSection(params: {
         `stream=${loc.stream_id}`,
         loc.host_session_id ? `session_id=${loc.host_session_id}` : '',
       ].filter(Boolean);
-      tag = `NO_TRANSCRIPT_FILE / PLACEHOLDER | ${parts.join(' | ')}`;
+      tag =
+        loc.locator_origin === 'unknown_null'
+          ? `NO_TRANSCRIPT_FILE / UNKNOWN_NULL | ${parts.join(' | ')}`
+          : `NO_TRANSCRIPT_FILE / PLACEHOLDER | ${parts.join(' | ')}`;
       detail = loc.note ?? 'Raw host transcript not attached or unobservable';
     }
 
-    const line = `- [${tag}] stream=\`${loc.stream_id}\` source=\`${loc.source_label}\` -> ${detail}`;
+    const targetMach =
+      loc.host_kind === 'local_file' && loc.locator_origin === 'operator_verified'
+        ? `${loc.machine_hostname ?? context.currentHostname}/${loc.machine_fingerprint ?? recordedMach}`
+        : `recorded_on:${recordedHost}/${recordedMach}${
+            loc.machine_hostname && loc.machine_hostname !== recordedHost
+              ? `|claimed:${loc.machine_hostname}${loc.machine_fingerprint ? '/' + loc.machine_fingerprint : ''}`
+              : ''
+          }`;
+    const line = `- [${tag}] stream=\`${loc.stream_id}\` source=\`${loc.source_label}\` origin=\`${originStr}\` machine=\`${targetMach}\` -> ${detail}`;
     return { line, hostKind: loc.host_kind, priorityBoost: loc.host_kind === 'cloud_remote' || loc.host_kind === 'web_uploaded_blob' };
   });
 
@@ -298,10 +362,11 @@ export function formatTranscriptLocatorsSection(params: {
 
   const totalLocalReadable = localGreppable + uploadedBlobs;
   const totalNonLocalOrUnavailable = cloudOnly + otherMachine + placeholders + localMissing;
+  const currentMachDesc = `${context.currentHostname}/${context.currentMachineFingerprint ?? context.currentDeviceId} (device=${context.currentDeviceId})`;
   const visibilityNote =
     totalNonLocalOrUnavailable > 0
-      ? `REACHABILITY NOTICE (current_machine=${context.currentHostname}/${context.currentDeviceId}): ${totalLocalReadable} source(s) directly greppable on this machine, while ${totalNonLocalOrUnavailable} source(s) are cloud-only/other-machine/missing/placeholder. A local AI on this machine has PARTIAL raw transcript visibility and CANNOT grep CLOUD_ONLY sessions (and vice versa unless your host accesses that provider/session_id). Rely on canonical ThreadPass summaries/events above for unreachable streams.`
-      : `REACHABILITY NOTICE (current_machine=${context.currentHostname}/${context.currentDeviceId}): All ${totalLocalReadable} recorded transcript source(s) are directly readable/greppable on this machine if deeper line-level grep is needed.`;
+      ? `REACHABILITY NOTICE (current_machine=${currentMachDesc}): ${totalLocalReadable} source(s) directly greppable on this machine, while ${totalNonLocalOrUnavailable} source(s) are cloud-only/other-machine/missing/placeholder. A local AI on this machine has PARTIAL raw transcript visibility and CANNOT grep CLOUD_ONLY sessions (and vice versa unless your host accesses that provider/session_id). Rely on canonical ThreadPass summaries/events above for unreachable streams.`
+      : `REACHABILITY NOTICE (current_machine=${currentMachDesc}): All ${totalLocalReadable} recorded transcript source(s) are directly readable/greppable on this machine if deeper line-level grep is needed.`;
 
   const lines = [
     visibilityNote,

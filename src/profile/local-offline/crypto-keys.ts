@@ -1,4 +1,6 @@
+import { execFileSync } from 'node:child_process';
 import {
+  createHash,
   createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
@@ -6,10 +8,117 @@ import {
   verify as cryptoVerify,
 } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { canonicalJson, newId } from '../../core/canonical.js';
 import type { CommitIntentProof, DeviceKeyStatus, TrustedDeviceKey } from '../../core/types.js';
 import { ensureExclusiveAcl } from './acl-and-fs.js';
+
+export type MachineFingerprintSource =
+  | 'win_machine_guid'
+  | 'linux_machine_id'
+  | 'macos_platform_uuid'
+  | 'host_fallback'
+  | 'env_override';
+
+export interface LocalMachineIdentity {
+  machine_fingerprint: string;
+  hostname: string;
+  platform: string;
+  fingerprint_source: MachineFingerprintSource;
+}
+
+let cachedDefaultMachineIdentity: LocalMachineIdentity | undefined;
+
+function hashMachineSeed(source: MachineFingerprintSource, rawSeed: string): string {
+  const hex = createHash('sha256')
+    .update(`threadpass-machine-v1|${source}|${rawSeed.trim()}`, 'utf8')
+    .digest('hex');
+  return `mach_${hex.slice(0, 12)}`;
+}
+
+/**
+ * Resolves a stable, privacy-preserving OS-installation machine fingerprint (`mach_<12hex>`),
+ * invariant across distinct `THREADPASS_HOME` directories on the same host machine.
+ */
+export function resolveMachineFingerprint(): LocalMachineIdentity {
+  const envSeed = process.env.THREADPASS_MACHINE_ID_SEED?.trim();
+  const hostname = process.env.THREADPASS_HOSTNAME_OVERRIDE?.trim() || os.hostname();
+  const platform = os.platform();
+  if (envSeed) {
+    return {
+      machine_fingerprint: hashMachineSeed('env_override', envSeed),
+      hostname,
+      platform,
+      fingerprint_source: 'env_override',
+    };
+  }
+  if (cachedDefaultMachineIdentity && cachedDefaultMachineIdentity.hostname === hostname) {
+    return cachedDefaultMachineIdentity;
+  }
+
+  let source: MachineFingerprintSource = 'host_fallback';
+  let rawId = '';
+
+  try {
+    if (platform === 'win32') {
+      const out = execFileSync(
+        'reg.exe',
+        ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'],
+        { encoding: 'utf8', timeout: 2000, windowsHide: true },
+      );
+      const m = out.match(/MachineGuid\s+REG_\w+\s+([^\r\n]+)/i);
+      if (m && m[1]?.trim()) {
+        source = 'win_machine_guid';
+        rawId = m[1].trim().toLowerCase();
+      }
+    } else if (platform === 'linux') {
+      for (const candidate of ['/etc/machine-id', '/var/lib/dbus/machine-id']) {
+        if (fs.existsSync(candidate)) {
+          const val = fs.readFileSync(candidate, 'utf8').trim();
+          if (val) {
+            source = 'linux_machine_id';
+            rawId = val.toLowerCase();
+            break;
+          }
+        }
+      }
+    } else if (platform === 'darwin') {
+      const out = execFileSync(
+        'ioreg',
+        ['-rd1', '-c', 'IOPlatformExpertDevice'],
+        { encoding: 'utf8', timeout: 2000 },
+      );
+      const m = out.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/i);
+      if (m && m[1]?.trim()) {
+        source = 'macos_platform_uuid';
+        rawId = m[1].trim().toLowerCase();
+      }
+    }
+  } catch {
+    // Fall back deterministically to host OS characteristics below
+  }
+
+  if (!rawId) {
+    source = 'host_fallback';
+    let user = '';
+    try {
+      user = os.userInfo().username;
+    } catch {
+      user = '';
+    }
+    rawId = `${platform}|${os.arch()}|${hostname}|${os.cpus()?.[0]?.model ?? ''}|${user}`;
+  }
+
+  const identity: LocalMachineIdentity = {
+    machine_fingerprint: hashMachineSeed(source, rawId),
+    hostname,
+    platform,
+    fingerprint_source: source,
+  };
+  cachedDefaultMachineIdentity = identity;
+  return identity;
+}
 
 export interface LocalDeviceIdentity {
   device_id: string;

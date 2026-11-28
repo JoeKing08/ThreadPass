@@ -3221,3 +3221,239 @@ test('thp web rendered HTML inline <script> parses cleanly as valid JavaScript (
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('4-tier locator origins (operator_verified / system_prompt_provided / model_probed / unknown_null) and mandatory OS machine_fingerprint', async () => {
+  const homeA = makeTempHome('mach-fp-a');
+  const homeB = makeTempHome('mach-fp-b');
+  const prevSeed = process.env.THREADPASS_MACHINE_ID_SEED;
+  const prevHost = process.env.THREADPASS_HOSTNAME_OVERRIDE;
+  delete process.env.THREADPASS_MACHINE_ID_SEED;
+  delete process.env.THREADPASS_HOSTNAME_OVERRIDE;
+
+  const svcA = new ThreadPassService({ homeDir: homeA });
+  const svcB = new ThreadPassService({ homeDir: homeB });
+  const webA = await startThreadPassWeb({ service: svcA, idleTimeoutMs: 60_000 });
+  const diskFile = path.join(homeA, 'agent_sys_prompt.jsonl');
+  fs.writeFileSync(diskFile, '{"role":"assistant","text":"sys prompt trace"}\n', 'utf8');
+
+  try {
+    // 1. Separate THREADPASS_HOME dirs on same OS get distinct device_id but IDENTICAL OS machine_fingerprint
+    assert.notEqual(svcA.engine.identity.device_id, svcB.engine.identity.device_id);
+    assert.match(svcA.engine.machine.machine_fingerprint, /^mach_[0-9a-f]{12}$/);
+    assert.equal(svcA.engine.machine.machine_fingerprint, svcB.engine.machine.machine_fingerprint);
+
+    // Web /api/device/show exposes machine_fingerprint, machine_hostname, fingerprint_source
+    const devRes = await fetch(`http://127.0.0.1:${webA.port}/api/device/show`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-ThreadPass-Token': webA.token },
+      body: '{}',
+    });
+    assert.equal(devRes.status, 200);
+    const devJson = (await devRes.json()) as {
+      device_id: string;
+      machine_fingerprint: string;
+      machine_hostname: string;
+      fingerprint_source: string;
+    };
+    assert.equal(devJson.machine_fingerprint, svcA.engine.machine.machine_fingerprint);
+    assert.ok(devJson.machine_hostname.length > 0);
+    assert.ok(devJson.fingerprint_source.length > 0);
+
+    // Prompts advertise 4-tier locator schema cleanly without red-flag phrasing
+    const adoptPrompt = svcA.getAdoptExtractPrompt('local_ide');
+    assert.ok(adoptPrompt.includes('"transcript_path_origin": "unknown_null"'));
+    assert.ok(adoptPrompt.includes('system_prompt_provided'));
+    assert.ok(adoptPrompt.includes('model_probed'));
+    assert.ok(adoptPrompt.includes('"machine_fingerprint": null'));
+
+    const init = svcA.initThread({ projectId: 'proj_4tier', threadId: 'thr_4tier', mainStreamId: 'strm_main' });
+    const ckptPrompt = svcA.getCheckpointPrompt('proj_4tier', 'thr_4tier', init.main_stream_id).prompt;
+    assert.ok(ckptPrompt.includes('transcript_path_origin'));
+    assert.ok(ckptPrompt.includes('machine_fingerprint'));
+
+    // 2. system_prompt_provided keeps origin & mandatory recorded_by_machine_fingerprint, never promotes to LOCAL_GREPPABLE
+    const sysRes = svcA.adoptExternal({
+      projectId: 'proj_4tier',
+      threadId: 'thr_4tier',
+      sourceLabel: 'ide_sys',
+      streamId: 'strm_sys',
+      rawText: JSON.stringify({
+        threadpass_handoff: true,
+        transcript_file_path: diskFile,
+        transcript_path_origin: 'system_prompt_provided',
+        machine_hostname: svcA.engine.machine.hostname,
+        summary_text: 'Agent read path from system prompt.',
+      }),
+    });
+    assert.equal(sysRes.transcript_locators[0]?.locator_origin, 'system_prompt_provided');
+    assert.equal(sysRes.transcript_locators[0]?.machine_device_id, undefined);
+    assert.equal(
+      sysRes.transcript_locators[0]?.recorded_by_machine_fingerprint,
+      svcA.engine.machine.machine_fingerprint,
+    );
+
+    // 3. model_probed keeps origin & mandatory recorded_by_machine_fingerprint
+    const probeRes = svcA.adoptExternal({
+      projectId: 'proj_4tier',
+      threadId: 'thr_4tier',
+      sourceLabel: 'ide_probe',
+      streamId: 'strm_probe',
+      rawText: JSON.stringify({
+        threadpass_handoff: true,
+        transcript_file_path: diskFile,
+        transcript_path_origin: 'model_probed',
+        machine_hostname: svcA.engine.machine.hostname,
+        machine_fingerprint: svcA.engine.machine.machine_fingerprint,
+        summary_text: 'Agent probed file path via read-only check.',
+      }),
+    });
+    assert.equal(probeRes.transcript_locators[0]?.locator_origin, 'model_probed');
+    assert.equal(
+      probeRes.transcript_locators[0]?.recorded_by_machine_fingerprint,
+      svcA.engine.machine.machine_fingerprint,
+    );
+
+    // 4. unknown_null explicitly records null path with mandatory machine stamp
+    const nullRes = svcA.adoptExternal({
+      projectId: 'proj_4tier',
+      threadId: 'thr_4tier',
+      sourceLabel: 'cloud_unknown',
+      streamId: 'strm_unknown',
+      rawText: JSON.stringify({
+        threadpass_handoff: true,
+        transcript_file_path: null,
+        transcript_path_origin: 'unknown_null',
+        summary_text: 'Pure cloud chat without disk path.',
+      }),
+    });
+    assert.equal(nullRes.transcript_locators[0]?.host_kind, 'placeholder_unavailable');
+    assert.equal(nullRes.transcript_locators[0]?.locator_origin, 'unknown_null');
+    assert.equal(
+      nullRes.transcript_locators[0]?.recorded_by_machine_fingerprint,
+      svcA.engine.machine.machine_fingerprint,
+    );
+
+    // 5. Adversarial self-asserted operator_verified & contradictory unknown_null+path are downgraded with warnings
+    const spoofedRes = svcA.adoptExternal({
+      projectId: 'proj_4tier',
+      threadId: 'thr_4tier',
+      sourceLabel: 'spoof_try',
+      streamId: 'strm_spoof',
+      rawText: JSON.stringify({
+        threadpass_handoff: true,
+        transcript_file_path: diskFile,
+        transcript_path_origin: 'operator_verified',
+        summary_text: 'Model attempted to claim operator_verified.',
+      }),
+    });
+    assert.equal(spoofedRes.transcript_locators[0]?.locator_origin, 'model_reported');
+    assert.ok(spoofedRes.warnings.some((w) => w.includes('downgraded to model_reported')));
+
+    const contraRes = svcA.adoptExternal({
+      projectId: 'proj_4tier',
+      threadId: 'thr_4tier',
+      sourceLabel: 'contra_try',
+      streamId: 'strm_contra',
+      rawText: JSON.stringify({
+        threadpass_handoff: true,
+        transcript_file_path: diskFile,
+        transcript_path_origin: 'unknown_null',
+        summary_text: 'Contradictory unknown_null with path.',
+      }),
+    });
+    assert.equal(contraRes.transcript_locators[0]?.locator_origin, 'model_reported');
+    assert.ok(contraRes.warnings.some((w) => w.includes('downgraded to model_reported')));
+
+    // 6. Operator-verified path on same physical machine across DIFFERENT dev_* IDs stays LOCAL_GREPPABLE,
+    //    whereas a simulated second machine (same hostname, different THREADPASS_MACHINE_ID_SEED) yields OTHER_MACHINE
+    const opRes = svcA.adoptExternal({
+      projectId: 'proj_4tier',
+      threadId: 'thr_4tier',
+      sourceLabel: 'op_verified',
+      streamId: 'strm_op',
+      rawText: 'assistant: Operator verified local trace.',
+      transcriptFilePath: diskFile,
+    });
+    assert.equal(opRes.transcript_locators[0]?.locator_origin, 'operator_verified');
+    assert.equal(opRes.transcript_locators[0]?.machine_fingerprint, svcA.engine.machine.machine_fingerprint);
+
+    const recPack = svcA.packReconcile({ projectId: 'proj_4tier', threadId: 'thr_4tier' });
+    assert.ok(recPack.full_markdown.includes('[SYSTEM_PROMPT_PATH_UNVERIFIED'));
+    assert.ok(recPack.full_markdown.includes('[MODEL_PROBED_PATH_UNVERIFIED'));
+    assert.ok(recPack.full_markdown.includes('[NO_TRANSCRIPT_FILE / UNKNOWN_NULL'));
+    assert.ok(recPack.full_markdown.includes('[MODEL_REPORTED_PATH_UNVERIFIED'));
+    assert.ok(recPack.full_markdown.includes(`[LOCAL_GREPPABLE on ${svcA.engine.machine.hostname} (${svcA.engine.machine.machine_fingerprint})]`));
+    assert.ok(recPack.full_markdown.includes(`origin=\`system_prompt_provided\``));
+    assert.ok(recPack.full_markdown.includes(`origin=\`model_probed\``));
+    assert.ok(recPack.full_markdown.includes(`origin=\`unknown_null\``));
+    assert.ok(recPack.full_markdown.includes(`origin=\`operator_verified\``));
+
+    // Verify different device_id on SAME machine_fingerprint still resolves LOCAL_GREPPABLE
+    const sameMachineCrossDev = svcA.getStatus('proj_4tier', 'thr_4tier').transcript_locators;
+    const statusIdx = JSON.parse(
+      fs.readFileSync(svcA.engine.getLayout('proj_4tier', 'thr_4tier').transcriptIndexJsonPath, 'utf8'),
+    ) as { current_machine: { machine_fingerprint: string; device_id: string } };
+    assert.equal(statusIdx.current_machine.machine_fingerprint, svcA.engine.machine.machine_fingerprint);
+
+    // Simulated other physical machine with SAME hostname but different OS fingerprint sees OTHER_MACHINE
+    process.env.THREADPASS_MACHINE_ID_SEED = 'simulated-other-pc-seed-999';
+    process.env.THREADPASS_HOSTNAME_OVERRIDE = svcA.engine.machine.hostname;
+    const homeOther = makeTempHome('mach-fp-other');
+    const svcOther = new ThreadPassService({ homeDir: homeOther });
+    try {
+      assert.notEqual(svcOther.engine.machine.machine_fingerprint, svcA.engine.machine.machine_fingerprint);
+      // Same-machine cross-device check (matching machine_fingerprint, different device_id) -> LOCAL_GREPPABLE
+      const samePcRendered = (await import('../src/shell/prompts.js')).formatTranscriptLocatorsSection({
+        locators: sameMachineCrossDev.filter((l) => l.stream_id === 'strm_op'),
+        context: {
+          currentHostname: svcB.engine.machine.hostname,
+          currentDeviceId: svcB.engine.identity.device_id,
+          currentMachineFingerprint: svcB.engine.machine.machine_fingerprint,
+          threadRootDir: homeB,
+          transcriptIndexPath: path.join(homeB, 'transcript-index.json'),
+          checkFileExists: (p) => fs.existsSync(p),
+        },
+      });
+      assert.ok(samePcRendered.includes('[LOCAL_GREPPABLE on'));
+
+      // Different physical machine_fingerprint (even same hostname) -> OTHER_MACHINE
+      const otherPcRendered = (await import('../src/shell/prompts.js')).formatTranscriptLocatorsSection({
+        locators: sameMachineCrossDev.filter((l) => l.stream_id === 'strm_op'),
+        context: {
+          currentHostname: svcOther.engine.machine.hostname,
+          currentDeviceId: svcOther.engine.identity.device_id,
+          currentMachineFingerprint: svcOther.engine.machine.machine_fingerprint,
+          threadRootDir: homeOther,
+          transcriptIndexPath: path.join(homeOther, 'transcript-index.json'),
+          checkFileExists: (p) => fs.existsSync(p),
+        },
+      });
+      assert.ok(otherPcRendered.includes('[OTHER_MACHINE:'));
+    } finally {
+      fs.rmSync(homeOther, { recursive: true, force: true });
+      delete process.env.THREADPASS_MACHINE_ID_SEED;
+      delete process.env.THREADPASS_HOSTNAME_OVERRIDE;
+    }
+
+    // 7. fsck --rebuild preserves all 4-tier locator origins & machine fingerprints
+    const rebuilt = svcA.runFsck('proj_4tier', 'thr_4tier', { rebuildSqlite: true });
+    assert.equal(rebuilt.ok, true);
+    assert.equal(rebuilt.rebuilt, true);
+    const afterRebuild = svcA.getStatus('proj_4tier', 'thr_4tier').transcript_locators;
+    assert.equal(afterRebuild.find((l) => l.stream_id === 'strm_sys')?.locator_origin, 'system_prompt_provided');
+    assert.equal(afterRebuild.find((l) => l.stream_id === 'strm_probe')?.locator_origin, 'model_probed');
+    assert.equal(afterRebuild.find((l) => l.stream_id === 'strm_unknown')?.locator_origin, 'unknown_null');
+    assert.equal(
+      afterRebuild.find((l) => l.stream_id === 'strm_op')?.machine_fingerprint,
+      svcA.engine.machine.machine_fingerprint,
+    );
+  } finally {
+    if (prevSeed !== undefined) process.env.THREADPASS_MACHINE_ID_SEED = prevSeed;
+    else delete process.env.THREADPASS_MACHINE_ID_SEED;
+    if (prevHost !== undefined) process.env.THREADPASS_HOSTNAME_OVERRIDE = prevHost;
+    else delete process.env.THREADPASS_HOSTNAME_OVERRIDE;
+    await webA.close();
+    fs.rmSync(homeA, { recursive: true, force: true });
+    fs.rmSync(homeB, { recursive: true, force: true });
+  }
+});

@@ -4,6 +4,7 @@ import {
   type ContinuityLevel,
   type EventRecord,
   type HandoffMode,
+  type HostTranscriptSourceOrigin,
   type InvocationRecord,
   type ProvenanceChain,
   type TrustTier,
@@ -38,7 +39,9 @@ export interface ParsedAdoptPackage {
   base_anchor_id?: string;
   host_session_id?: string;
   transcript_file_path?: string;
+  transcript_path_origin?: HostTranscriptSourceOrigin;
   machine_hostname?: string;
+  machine_fingerprint?: string;
   cloud_provider?: string;
   remote_uri?: string;
   claimed_user_quotes: string[];
@@ -141,7 +144,9 @@ export const ADOPT_CONTINUATION_KEYS: readonly string[] = [
   'base_anchor_id',
   'host_session_id',
   'transcript_file_path',
+  'transcript_path_origin',
   'machine_hostname',
+  'machine_fingerprint',
   'cloud_provider',
   'remote_uri',
   'source_label',
@@ -636,7 +641,9 @@ export function parseExternalConversationInput(
     let baseAnchorId: string | undefined;
     let hostSessionId: string | undefined;
     let transcriptFilePath: string | undefined;
+    let transcriptPathOrigin: HostTranscriptSourceOrigin | undefined;
     let machineHostname: string | undefined;
+    let machineFingerprint: string | undefined;
     let cloudProvider: string | undefined;
     let remoteUri: string | undefined;
 
@@ -683,7 +690,31 @@ export function parseExternalConversationInput(
       }
       hostSessionId ??= normalizeHostSessionId(obj.host_session_id);
       transcriptFilePath ??= normalizeOptionalMetaString(obj.transcript_file_path);
+      if (transcriptPathOrigin === undefined) {
+        const rawOrigin = normalizeOptionalMetaString(obj.transcript_path_origin);
+        if (rawOrigin) {
+          if (rawOrigin === 'operator_verified') {
+            parseWarnings.push(
+              'Model output cannot self-assign transcript_path_origin=operator_verified; downgraded to model_reported.',
+            );
+            transcriptPathOrigin = 'model_reported';
+          } else if (
+            rawOrigin === 'system_prompt_provided' ||
+            rawOrigin === 'model_probed' ||
+            rawOrigin === 'unknown_null' ||
+            rawOrigin === 'model_reported'
+          ) {
+            transcriptPathOrigin = rawOrigin;
+          } else {
+            parseWarnings.push(
+              `Unrecognized transcript_path_origin (${rawOrigin}); downgraded to model_reported.`,
+            );
+            transcriptPathOrigin = 'model_reported';
+          }
+        }
+      }
       machineHostname ??= normalizeOptionalMetaString(obj.machine_hostname);
+      machineFingerprint ??= normalizeOptionalMetaString(obj.machine_fingerprint);
       cloudProvider ??= normalizeOptionalMetaString(obj.cloud_provider);
       remoteUri ??= normalizeOptionalMetaString(obj.remote_uri);
 
@@ -742,6 +773,22 @@ export function parseExternalConversationInput(
       }
     }
 
+    if (transcriptFilePath) {
+      if (transcriptPathOrigin === 'unknown_null') {
+        parseWarnings.push(
+          'Model supplied non-null transcript_file_path with transcript_path_origin=unknown_null; downgraded to model_reported.',
+        );
+        transcriptPathOrigin = 'model_reported';
+      } else if (!transcriptPathOrigin) {
+        transcriptPathOrigin = 'model_reported';
+      }
+      if (!machineHostname && !machineFingerprint) {
+        parseWarnings.push(
+          'Model supplied transcript_file_path without machine_hostname or machine_fingerprint; recorded host verification still required.',
+        );
+      }
+    }
+
     return {
       mode,
       structured_json: true,
@@ -751,7 +798,9 @@ export function parseExternalConversationInput(
       ...(baseAnchorId ? { base_anchor_id: baseAnchorId } : {}),
       host_session_id: hostSessionId,
       transcript_file_path: transcriptFilePath,
+      ...(transcriptPathOrigin ? { transcript_path_origin: transcriptPathOrigin } : {}),
       machine_hostname: machineHostname,
+      ...(machineFingerprint ? { machine_fingerprint: machineFingerprint } : {}),
       cloud_provider: cloudProvider,
       remote_uri: remoteUri,
       claimed_user_quotes: claimedUserQuotes,
