@@ -430,7 +430,7 @@ async function appendFileInto(textareaId, inputEl) {
   if (!file) return;
   const ta = document.getElementById(textareaId);
   const next = await file.text();
-  ta.value = ta.value.trim() ? (ta.value.trimEnd() + '\n\n' + next) : next;
+  ta.value = ta.value.trim() ? (ta.value.trimEnd() + '\\n\\n' + next) : next;
   inputEl.value = '';
 }
 

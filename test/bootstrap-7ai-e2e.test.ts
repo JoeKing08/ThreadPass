@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import vm from 'node:vm';
 import { sha256Hex } from '../src/core/canonical.js';
 import { BudgetExceededError, packBudgetedEnvelope, splitIntoLineAwareChunks } from '../src/shell/budget.js';
 import {
@@ -3194,6 +3195,27 @@ test('Web GUI & API full CLI parity: init confirm, peek, grant issue/revoke + ne
       })
     ).json()) as { trusted_keys: Array<{ device_id: string; status: string }> };
     assert.equal(devShow2.trusted_keys.find((k) => k.device_id === 'dev_peer_web')?.status, 'revoked');
+  } finally {
+    await web.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('thp web rendered HTML inline <script> parses cleanly as valid JavaScript (vm.Script regression guard)', async () => {
+  const home = makeTempHome('web-script-syntax');
+  const svc = new ThreadPassService({ homeDir: home });
+  const web = await startThreadPassWeb({ service: svc, idleTimeoutMs: 60_000 });
+  try {
+    const res = await fetch(web.url);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+    assert.ok(scriptMatch && scriptMatch[1], 'Rendered HTML must contain an inline <script> block');
+    const scriptBody = scriptMatch[1];
+    // Must compile cleanly without SyntaxError (guards against unescaped template literal newlines)
+    assert.doesNotThrow(() => new vm.Script(scriptBody, { filename: 'thp-web-inline.js' }));
+    assert.ok(scriptBody.includes("'\\n\\n'"), 'appendFileInto must emit escaped \\n\\n separator in JS');
+    assert.ok(scriptBody.includes('function runUiAction('));
   } finally {
     await web.close();
     fs.rmSync(home, { recursive: true, force: true });
